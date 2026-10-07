@@ -1,4 +1,34 @@
-# Scope Recall 3.7 autonomous memory
+# Rune Scope Recall 适配维护 fork
+
+本仓库是 [Genion/rune](https://github.com/Genion/rune) 使用的 Scope Recall 源码维护 fork，上游为 [410979729/scope-recall-hermes](https://github.com/410979729/scope-recall-hermes)。Rune 通过自己的宿主桥接使用 Core；更新方式是审查上游、完成宿主适配、验证后固定源码快照。
+
+**Rune 的更新入口不是 `pip install -U hermes-scope-recall`，也不是上游的 `setup` / `apply-install`。** 这些命令面向下文的 Hermes、Codex 等独立插件安装。不要把它们用于 Rune，不要向 Rune 写入其他宿主的 wrapper、MCP、hooks、安装回执或共享记忆登记。
+
+## Rune 集成边界
+
+- 此 fork 保存完整上游源码及必要维护修复。Rune 固定快照位于 `engine/scope-recall/`，来源提交、真实 Git tree、下载包 SHA-256 和逐文件校验保存在 `engine/scope-recall-source.json`。
+- Rune 适配层保留在 Rune 仓库：`engine/scripts/scope-recall-bridge.py` 负责 Core 身份、范围与操作映射；`engine/src/scope-recall.mjs` 负责进程、模型调用、预算与调度。不能把 Rune 的业务规则塞入通用 Core，不能把 Hermes/Codex 的宿主适配器直接当作 Rune 入口。
+- 当前 Core 仍使用 schema 1110。Rune 记忆按宿主登记的项目 ID / 工作区 ID 隔离；升级源码不能自动导入历史聊天、合并记忆库、修复真实数据或启用 Embedding。存量数据维护必须先核对当前资料目录和所需动作，再按单独授权执行。
+- Core 源码版本与 Python 依赖环境版本是不同记录。源码更新先核对基础依赖锁；锁未变化时复用已验证的依赖环境。不能仅为让版本号一致而重新安装上游包或改写运行环境回执。
+
+## 维护与更新顺序
+
+1. 在独立源码仓库核对 `main`、已有修改、`origin` 与 `upstream`；固定准备审查的上游完整提交，不在 Rune 内克隆嵌套仓库。
+2. 阅读上游差异与升级说明，检查 Rune 消费的 Core 接口、身份和证据可见性、事件来源、捕获状态、召回包、失败重试、预算、队列、删除与恢复契约；先复现相关问题，再实现必要的最小适配。
+3. 按实际变动验证 Core 与宿主边界。在临时测试资料中验收捕获、提炼、跨会话召回、跨项目隔离、预算持久化、失败处理、归档/删除和恢复；测试包安装只能用于独立验收环境，不能替代 Rune 的源码更新。新增依赖或真实资料维护须另行说明并确认。
+4. 在此 fork 的 `main` 提交必要修复与文档，正常推送并读回完整提交号；不强推、不重写上游历史。
+5. 在 Rune 仓库用既有同步脚本同步这个已验证的 fork 提交，校验源码及来源清单；同步前发现快照内有修改时停止，先把修复转入 fork，不强制覆盖。
+6. 同步 Rune 的运行版本说明、记忆管理文档和适用回归；最后按已确认时机用 Rune 的正常开发入口启动并验证实际加载。源码同步通过不等于普通用户窗口已加载更新。
+
+本轮审查基线为上游 `3.8.0`，提交 `323a4ec7dcc650158a17393206ef9675e16d196b`。Rune 实际固定的 fork 提交以其来源清单为准，不把上游版本号、fork HEAD、依赖环境回执或进程实际加载版本混为一谈。
+
+Rune 的具体命令和验证边界见 [源码同步与适配](https://github.com/Genion/rune/blob/main/docs/scope-recall-sync.md)、[记忆管理](https://github.com/Genion/rune/blob/main/docs/memory-management.md) 和 [运行环境](https://github.com/Genion/rune/blob/main/docs/runtime-environments.md)。
+
+---
+
+以下保留上游的通用说明与独立宿主安装文档；其安装、迁移与部署步骤不用于 Rune 的源码集成。
+
+# Scope Recall 3.8 autonomous memory
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, Codex and Claude Code (the last two share one adapter of hooks and an MCP server), with the MCP tools when the optional `codex` extra is installed. The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 WorkBuddy runs that same hook adapter and MCP server, as an entry of a shared store, and so does DeepSeek Harness (dsh), through a plugin.
