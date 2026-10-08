@@ -4,6 +4,49 @@ All notable changes to `scope-recall` will be documented in this file.
 
 ## [Unreleased]
 
+## [3.9.0] - 2026-10-07
+
+3.9.0 changes no behaviour. It is the first part of a clean-up: stored content, recall results, hook and CLI output, configuration formats and the modules installed hosts run are those of 3.8.2.
+
+- **One format and a quality check.** `ruff format` (line length 120) formats the tree, tests included; `git blame --ignore-revs-file .git-blame-ignore-revs` skips that commit. CI's `lint` job runs `scripts/quality.py`: formatting, and no more ruff or pyright findings per file and rule than `scripts/quality.baseline.json` records; a function over a size limit may not grow. ruff and pyright are pinned in the `dev` extra and `uv.lock` (CONTRIBUTING.md).
+- **The hook and MCP clients live in `adapters/clients`.** Codex, Claude Code, WorkBuddy, dsh and the remote client share that layer; `adapters/codex` keeps only the five modules installed configurations run (`hook_entry`, `mcp_entry`, `remote_client`, `remote_server`, `resident_entry`), so installed hooks keep their trust and MCP servers their approval. A script that imported another module of `scope_recall.adapters.codex` imports it from `scope_recall.adapters.clients`.
+- **The hook handler and the Hermes adapter are split by what they do**: a prompt's recall, reading a session record and each hook event; a capture, its retry, a turn, a turn's recall and the session binding. No file of either is over 600 lines, and no function of either is over complexity 25.
+
+### Upgrading from 3.8.2
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110), and so are the hook and MCP server commands the installers write.
+
+## [3.8.2] - 2026-10-07
+
+3.8.2 lets a Hermes agent on Gemini use its memory tools (#216, reported by @momolee-deep).
+
+### Fixes
+
+- **Gemini accepts Hermes's memory tools.** `revise` declared its new value as any type, an array among them without `items`, and Gemini refuses a request when any tool it carries does: through Hermes's own Gemini client every request with the tools failed with HTTP 400. The new value is now declared as what the core takes: the new value's text, an object of the fact's fields, or null to withdraw it. The core refused a number, true or false and a list anyway.
+- **`revise` with a null value withdraws a fact through the MCP server too** (Codex, Claude Code, WorkBuddy, dsh). The server dropped every argument left empty, a null new value included, and the core refused the call; the person's request was kept, but nothing was withdrawn. A capture still withdraws on its own a fact the person's request names alone; the tool is for a request that fits more than one.
+
+### Tests
+
+- The storage tier runs a known-answer check of three memory invariants on a fresh synthetic store: a fact needs a person's source and a worker pass, revise and forget need the person's own request in the same session naming the exact version, and nothing forgotten comes back, also after the vector companion is rebuilt. It also runs on its own against an installed release (`tests/known_answer/`, #213, by @Adam13y).
+
+### Upgrading from 3.8.1
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways. The schema is unchanged (1110).
+
+## [3.8.1] - 2026-10-07
+
+3.8.1 keeps a worker up until the candidates of a conversation's last messages settle (#214, reported and measured by @849506054).
+
+### Fixes
+
+- **A worker waits for a settling candidate.** A candidate inside its 15-minute quiet window is in no queue, so the pass after a channel's last message found nothing due and its supervisor stood down before the window closed; the candidate waited for the channel's next session. The wake plan now names the moment it becomes ready (`candidate_settle_window`), also for evidence that came while an earlier question about it waited. The supervisor records the last pass whose sweep saw every ready candidate (`last_pass_at`), so a candidate with nothing new to ask, or whose last question held all its evidence, does not wake the worker again; a pass that could not sweep holds that wake for 15 minutes.
+- **The doctor names work, and candidates still marked with new evidence, that have waited a day in any partition of the store** (`due_work_unreached`, attention). Its other work-queue figures still cover its own audience only.
+- **Outside Windows, `autostart plan` prints the wake as a systemd user timer and a cron line**, and `enable` writes the control file the wake reads (`docs/install.md`, section 7).
+
+### Upgrading from 3.8.0
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). On Linux and macOS a wake needs the timer of `docs/install.md` section 7. Right after the upgrade the doctor may name work that has long waited (`due_work_unreached`, attention).
+
 ## [3.8.0] - 2026-10-06
 
 3.8.0 re-embeds a store into a new embedding space when an operator asks for it, and the doctor says when embeddings have waited a day.

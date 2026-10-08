@@ -1,4 +1,6 @@
-"""Reviewable Windows logon/periodic wake registration for one bound runtime."""
+"""Reviewable periodic wake for one bound runtime: a Windows logon/5-minute task, or elsewhere the same wake for the
+operator's own timer (systemd or cron) to run."""
+
 from __future__ import annotations
 
 import argparse
@@ -7,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,42 @@ import xml.etree.ElementTree as ET
 
 from ..runtime.resume_entry import control_path, read_control
 from ..runtime.worker_entry import _atomic_metadata, load_config
+
+#: How the wake runs outside Windows: from the operator's timer.  Nothing here registers one.
+OPERATOR_TIMER = "operator_timer"
+_TIMER_FIELDS = ("wake_command", "systemd_service", "systemd_timer", "cron")
+
+
+def _windows() -> bool:
+    return os.name == "nt"
+
+
+def _posix_wake(name: str, config_path: Path, python: Path) -> dict:
+    """The wake as a command, and as a systemd user timer and a crontab line running it every 5 minutes.  It needs
+    no working directory: its paths are absolute, and the worker it launches sets its own."""
+    # A line break ends a unit's line and a crontab's, and cron reads a backslash before ``%`` as its own escape: no
+    # path holding either can be written so that both read it back.
+    if any(character in str(path) or "\\%" in str(path) for path in (config_path, python) for character in "\r\n\x00"):
+        raise ValueError("autostart_path_unsupported")
+    command = [str(python), "-I", "-B", "-m", "scope_recall.runtime.resume_entry", "--config", str(config_path)]
+    line = shlex.join(command)
+    # The wake launches a detached worker and exits at once.  With the default ``KillMode=control-group`` systemd
+    # would end the worker with the unit, and a oneshot has no start timeout of its own (the Windows task allows a
+    # minute).  In ``ExecStart`` a backslash is an escape and ``%`` a specifier, and ``$`` a variable in the arguments
+    # but not in the program's path; ``%`` is a line break in a crontab.
+    program, *arguments = (shlex.quote(word).replace("\\", "\\\\").replace("%", "%%") for word in command)
+    executed = " ".join([program, *(word.replace("$", "$$") for word in arguments)])
+    service = (
+        f"[Unit]\nDescription=Scope Recall wake ({name})\n\n[Service]\nType=oneshot\nKillMode=process\n"
+        f"TimeoutStartSec=120\nExecStart={executed}\n"
+    )
+    timer = (
+        f"[Unit]\nDescription=Scope Recall wake every 5 minutes ({name})\n\n[Timer]\nOnBootSec=1min\n"
+        "OnUnitActiveSec=5min\n\n[Install]\nWantedBy=timers.target\n"
+    )
+    # The wake prints a line each run; from cron it would be mailed every 5 minutes.
+    cron = f"*/5 * * * * {line} >/dev/null 2>&1".replace("%", "\\%")
+    return dict(wake_command=command, systemd_service=service, systemd_timer=timer, cron=cron)
 
 
 def plan(config_path, python_executable, *, user_id, env_file=None):
@@ -24,20 +63,36 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     if config_path.resolve().parent != config.binding.data_directory.resolve():
         raise ValueError("autostart_config_outside_binding")
     from ..core.storage import SQLiteStorage
+
     with SQLiteStorage(config.binding).read(config.context()) as tx:
         tx.status()
     if env_file and (not Path(env_file).is_absolute() or not Path(env_file).is_file()):
         raise ValueError("autostart_environment_missing")
-    if not user_id or any(c in user_id for c in '\r\n\x00'):
-        raise ValueError("autostart_user_required")
     name = "ScopeRecall-" + hashlib.sha256(config.binding.installation_id.encode()).hexdigest()[:20]
+    if not _windows():
+        # No task to register and no principal to run it as: the operator's timer runs the wake as its own user.
+        return dict(
+            installation_id=config.binding.installation_id,
+            enabled=True,
+            task_name=name,
+            config_path=str(config_path.resolve()),
+            python_executable=str(python),
+            env_file=str(Path(env_file).resolve()) if env_file else None,
+            trigger="every_5_minutes_from_the_operator_timer",
+            registration=OPERATOR_TIMER,
+            **_posix_wake(name, config_path.resolve(), python),
+        )
+    if not user_id or any(c in user_id for c in "\r\n\x00"):
+        raise ValueError("autostart_user_required")
     namespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
     ET.register_namespace("", namespace)
+
     def node(parent, tag, text=None, **attrs):
-        elem = ET.SubElement(parent, "{"+namespace+"}"+tag, attrs)
+        elem = ET.SubElement(parent, "{" + namespace + "}" + tag, attrs)
         elem.text = text
         return elem
-    task = ET.Element("{"+namespace+"}Task", version="1.2")
+
+    task = ET.Element("{" + namespace + "}Task", version="1.2")
     triggers = node(task, "Triggers")
     logon = node(triggers, "LogonTrigger")
     node(logon, "Enabled", "true")
@@ -46,47 +101,79 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     repeat = node(timer, "Repetition")
     node(repeat, "Interval", "PT5M")
     node(repeat, "StopAtDurationEnd", "false")
-    node(timer, "StartBoundary", (datetime.now(timezone.utc)+timedelta(minutes=1)).isoformat(timespec="seconds"))
+    node(timer, "StartBoundary", (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(timespec="seconds"))
     node(timer, "Enabled", "true")
     principal = node(node(task, "Principals"), "Principal", id="Author")
     node(principal, "UserId", user_id)
     node(principal, "LogonType", "InteractiveToken")
     node(principal, "RunLevel", "LeastPrivilege")
     settings = node(task, "Settings")
-    for key, value in (("MultipleInstancesPolicy","IgnoreNew"), ("DisallowStartIfOnBatteries","false"),
-                       ("StopIfGoingOnBatteries","false"), ("StartWhenAvailable","true"),
-                       ("Enabled","true"), ("Hidden","true"), ("ExecutionTimeLimit","PT1M")):
+    for key, value in (
+        ("MultipleInstancesPolicy", "IgnoreNew"),
+        ("DisallowStartIfOnBatteries", "false"),
+        ("StopIfGoingOnBatteries", "false"),
+        ("StartWhenAvailable", "true"),
+        ("Enabled", "true"),
+        ("Hidden", "true"),
+        ("ExecutionTimeLimit", "PT1M"),
+    ):
         node(settings, key, value)
     action = node(node(task, "Actions", Context="Author"), "Exec")
     # pythonw plus hidden task avoids console windows after logon.
     pythonw = python.with_name("pythonw.exe") if os.name == "nt" else python
     executable = pythonw if pythonw.is_file() else python
     node(action, "Command", str(executable))
-    node(action, "Arguments", subprocess.list2cmdline(["-I", "-B", "-m", "scope_recall.runtime.resume_entry", "--config", str(config_path.resolve())]))
+    node(
+        action,
+        "Arguments",
+        subprocess.list2cmdline(
+            ["-I", "-B", "-m", "scope_recall.runtime.resume_entry", "--config", str(config_path.resolve())]
+        ),
+    )
     node(action, "WorkingDirectory", str(config.binding.data_directory))
-    return dict(installation_id=config.binding.installation_id, enabled=True, task_name=name,
-                # The interpreter is recorded as given: the task must start the
-                # venv launcher, not the base interpreter its symlink points at.
-                config_path=str(config_path.resolve()), python_executable=str(python),
-                env_file=str(Path(env_file).resolve()) if env_file else None,
-                trigger="user_logon_and_every_5_minutes", xml=ET.tostring(task, encoding="unicode"))
+    return dict(
+        installation_id=config.binding.installation_id,
+        enabled=True,
+        task_name=name,
+        # The interpreter is recorded as given: the task must start the
+        # venv launcher, not the base interpreter its symlink points at.
+        config_path=str(config_path.resolve()),
+        python_executable=str(python),
+        env_file=str(Path(env_file).resolve()) if env_file else None,
+        trigger="user_logon_and_every_5_minutes",
+        xml=ET.tostring(task, encoding="unicode"),
+    )
 
 
 def apply(prepared):
-    if os.name != "nt":
-        raise ValueError("autostart_windows_only")
     config = load_config(prepared["config_path"])
+    if not _windows():
+        # The control file is what the wake reads (``resume_entry``); the operator installs the timer that runs it.
+        control = {key: value for key, value in prepared.items() if key not in _TIMER_FIELDS}
+        _atomic_metadata(control_path(config), control)
+        return dict(
+            control,
+            **{key: prepared[key] for key in _TIMER_FIELDS},
+            next_step="install systemd_service and systemd_timer as user units (or the cron line), then "
+            "enable the timer; this command registers nothing",
+        )
     previous = read_control(config)
-    found = subprocess.run(["schtasks.exe", "/Query", "/TN", prepared["task_name"], "/XML"], capture_output=True, timeout=15)
+    found = subprocess.run(
+        ["schtasks.exe", "/Query", "/TN", prepared["task_name"], "/XML"], capture_output=True, timeout=15
+    )
     if found.returncode == 0 and (previous is None or previous.get("task_name") != prepared["task_name"]):
         raise ValueError("autostart_task_ownership_unverified")
     # Disabled control prevents a trigger racing registration from doing work.
-    control = {k:v for k,v in prepared.items() if k != "xml"}
+    control = {k: v for k, v in prepared.items() if k != "xml"}
     _atomic_metadata(control_path(config), dict(control, enabled=False))
     with tempfile.TemporaryDirectory(prefix="scope-recall-task-") as temp:
-        path = Path(temp)/"task.xml"
+        path = Path(temp) / "task.xml"
         path.write_text(prepared["xml"], encoding="utf-16")
-        result = subprocess.run(["schtasks.exe", "/Create", "/TN", prepared["task_name"], "/XML", str(path), "/F"], capture_output=True, timeout=15)
+        result = subprocess.run(
+            ["schtasks.exe", "/Create", "/TN", prepared["task_name"], "/XML", str(path), "/F"],
+            capture_output=True,
+            timeout=15,
+        )
     if result.returncode:
         if previous is not None:
             _atomic_metadata(control_path(config), previous)
@@ -104,7 +191,21 @@ def disable(config_path, *, remove=False):
         return dict(status="removed", task_name=control["task_name"])
     control["enabled"] = False
     _atomic_metadata(control_path(config), control)
-    args = ["/Delete", "/TN", control["task_name"], "/F"] if remove else ["/Change", "/TN", control["task_name"], "/DISABLE"]
+    if control.get("registration") == OPERATOR_TIMER:
+        # The wake reads the control file and does nothing while it is disabled; the timer is the operator's.
+        if remove:
+            control["registration_state"] = "removed"
+            _atomic_metadata(control_path(config), control)
+        return dict(
+            status="removed" if remove else "paused",
+            task_name=control["task_name"],
+            next_step="disable or remove the timer that runs the wake",
+        )
+    args = (
+        ["/Delete", "/TN", control["task_name"], "/F"]
+        if remove
+        else ["/Change", "/TN", control["task_name"], "/DISABLE"]
+    )
     result = subprocess.run(["schtasks.exe", *args], capture_output=True, timeout=15)
     if result.returncode:
         raise ValueError("autostart_unregister_failed")
@@ -123,10 +224,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("plan", "enable", "pause", "remove"))
     parser.add_argument("--config", required=True)
-    parser.add_argument("--python", default=sys.executable,
-                        help="interpreter the task runs; defaults to the one running this command")
-    parser.add_argument("--user-id", default=_current_user(),
-                        help="task principal; defaults to the current account")
+    parser.add_argument(
+        "--python", default=sys.executable, help="interpreter the wake runs; defaults to the one running this command"
+    )
+    parser.add_argument(
+        "--user-id",
+        default=_current_user(),
+        help="the Windows task's principal; defaults to the current account (a timer elsewhere runs "
+        "as the user who installs it)",
+    )
     parser.add_argument("--env-file")
     args = parser.parse_args(argv)
     try:
