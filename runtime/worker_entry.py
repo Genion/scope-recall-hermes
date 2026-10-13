@@ -12,19 +12,22 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
-import sys
 from typing import Any, TextIO
 
+from ..contracts import ContractError, TrustedContext
+from ..core.failure_retry import retry_class
 from ..core.file_lock import advisory_file_lock
 from ..core.writer_lease import TruthWriterBusyError
-from ..vector.process_store import NativeVectorPathError
-from ..contracts import ContractError, TrustedContext
-from .instance import RuntimeInstanceConfig, build_runtime_instance
+from ..vector.process_store import NativeVectorPathError, ProcessLanceVectorStore
+from .instance import build_runtime_instance
+from .instance_config import RuntimeInstanceConfig
 from .model_budget import pre_request_refusals, provider_refusals
 from .validation import strict_float, utc_now
 
@@ -56,6 +59,50 @@ def load_config(path: str | Path) -> RuntimeInstanceConfig:
     return RuntimeInstanceConfig.from_mapping(raw)
 
 
+def credential_environment(config, env_file):
+    """Read only the configured credential keys; never execute/interpolate dotenv."""
+    names = {
+        route.credential_env
+        for route in (getattr(config.auxiliary, "embedding", None), getattr(config.auxiliary, "consolidation", None))
+        if route is not None
+    }
+    if not env_file or not names:
+        return {}
+    path = Path(env_file)
+    if not path.is_absolute() or path.is_symlink() or path.stat().st_size > 1048576:
+        raise ValueError("autostart_environment_invalid")
+    result = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        match = re.fullmatch(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*", line)
+        if match is None or match[1] not in names:
+            continue
+        value = match[2]
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        if value and "\x00" not in value and len(value) <= 8192:
+            result[match[1]] = value
+    return result
+
+
+def host_process_credential_environment(runtime_config_path, env_file):
+    """Credential variables for a process the host launches with its own environment.
+
+    The worker receives them through its autostart control file (``resume_once``);
+    a Codex-launched MCP server or hook starts with Codex's environment, which carries
+    none of the configured credential names, so it is given the same two paths and
+    reads them under the same contract: only the names the trusted runtime config
+    declares, never an interpolated dotenv.  Raises ``ValueError`` for an unusable
+    env file and ``OSError``/``ValueError`` for an unreadable config; the caller
+    decides whether a process may run without credentials.
+    """
+    config_path = Path(runtime_config_path)
+    if not config_path.is_absolute():
+        raise ValueError("runtime_config_path_not_absolute")
+    return credential_environment(load_config(config_path), str(env_file))
+
+
 def _is_actionable(error_code: object) -> bool:
     """Whether an operator could still clear this failure.
 
@@ -64,14 +111,13 @@ def _is_actionable(error_code: object) -> bool:
     """
     if not error_code:
         return False
-    from ..core.failure_retry import retry_class
 
     return retry_class(error_code) != "terminal"
 
 
 def _ingress_report(ingress) -> tuple[dict[str, int], list[str]]:
-    """What a pass says of the capture inbox rows it replayed.  A row put off (``capture_inbox._DEFERRED``) is not
-    stored yet, and one given up (``capture_inbox._GAVE_UP``) waits for ``retry-failures --apply``: each is a gap."""
+    """What a pass says of the capture inbox rows it replayed.  A row put off (``inbox_rules.DEFERRED``) is not
+    stored yet, and one given up (``inbox_rules.GAVE_UP``) waits for ``retry-failures --apply``: each is a gap."""
     counts = {
         "ingress_deferred": sum(r.error_code == "DEFERRED" for r in ingress),
         "ingress_given_up": sum(r.error_code == "GAVE_UP" for r in ingress),
@@ -141,7 +187,7 @@ def _is_reparse_point(path: Path) -> bool:
     return path.exists() and bool(getattr(path.stat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def _metadata_path(config: RuntimeInstanceConfig, name: str) -> Path:
+def worker_metadata_path(config: RuntimeInstanceConfig, name: str) -> Path:
     root = config.binding.data_directory
     if any(_is_reparse_point(path) for path in (root, *root.parents)):
         raise ValueError("worker_metadata_reparse_path")
@@ -172,7 +218,7 @@ def _beside_another_process(action):
             time.sleep(_SHARING_PAUSE_SECONDS)
 
 
-def _read_metadata(path: Path) -> dict[str, Any]:
+def read_worker_metadata(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
 
@@ -187,7 +233,7 @@ def _read_metadata(path: Path) -> dict[str, Any]:
     return value
 
 
-def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
+def write_worker_metadata(path: Path, value: dict[str, Any]) -> None:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > METADATA_LIMIT_BYTES:
         raise ValueError("worker_metadata_oversized")
@@ -213,7 +259,7 @@ def persist_worker_status(
     exit_code: int,
     worker_pid: int | None = None,
 ) -> None:
-    lock = _metadata_path(config, "runtime-worker-status.lock")
+    lock = worker_metadata_path(config, "runtime-worker-status.lock")
     with advisory_file_lock(lock, timeout_seconds=0.2):
         _persist_worker_status_unlocked(
             config, payload, started_at=started_at, exit_code=exit_code, worker_pid=worker_pid
@@ -229,8 +275,8 @@ def _persist_worker_status_unlocked(
     worker_pid: int | None = None,
 ) -> None:
     """Bounded metadata only. Never retain model text, stderr, or credentials."""
-    path = _metadata_path(config, "runtime-worker-status.json")
-    previous = _read_metadata(path)
+    path = worker_metadata_path(config, "runtime-worker-status.json")
+    previous = read_worker_metadata(path)
     if previous.get("installation_id") not in (None, config.binding.installation_id):
         raise ValueError("worker_status_binding_mismatch")
     if str(previous.get("started_at", "")) > started_at:
@@ -283,7 +329,7 @@ def _persist_worker_status_unlocked(
         worker_pid=worker_pid if worker_pid is not None else os.getpid(),
         last_success_at=finished if int(payload.get("completed", 0)) > 0 else previous.get("last_success_at"),
     )
-    _atomic_metadata(path, safe)
+    write_worker_metadata(path, safe)
 
 
 def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, Any], int]:
@@ -292,8 +338,8 @@ def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, 
     This cap complements, and never resets or expands, the auxiliary ledger's
     call/token/currency budget.
     """
-    path = _metadata_path(config, "runtime-worker-day.json")
-    prior = _read_metadata(path)
+    path = worker_metadata_path(config, "runtime-worker-day.json")
+    prior = read_worker_metadata(path)
     if prior.get("installation_id") not in (None, config.binding.installation_id):
         raise ValueError("worker_budget_binding_mismatch")
     day = utc_now()[:10]
@@ -309,7 +355,7 @@ def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, 
         else min(config.max_items, max(0, config.daily_work_limit - used))
     )
     state = dict(installation_id=config.binding.installation_id, day=day, used=used + count)
-    _atomic_metadata(path, state)
+    write_worker_metadata(path, state)
     return path, state, count
 
 
@@ -387,7 +433,6 @@ def _vector_preflight_gap(config: RuntimeInstanceConfig) -> str | None:
     """A native path Lance cannot open is reported by name, whatever fails later."""
     if config.vector is None or config.vector.backend != "lancedb":
         return None
-    from ..vector.process_store import ProcessLanceVectorStore
 
     vector = config.vector
     check = ProcessLanceVectorStore(
@@ -415,7 +460,7 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     # Purge never spends the optional enrichment budget.
     used = sum(item.work_type != "purge" for item in receipt.items)
     budget_state["used"] -= max(0, reserved - used)
-    _atomic_metadata(budget_path, budget_state)
+    write_worker_metadata(budget_path, budget_state)
     background_gaps = tuple(instance.background_gaps)
     # A held provider is the one refusal that does steer the pass: its work
     # types were not claimed at all (runtime/model_budget.py provider_holds).
@@ -430,7 +475,7 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     payload = _receipt_payload(config, receipt, gaps)
     payload.update(counts)
     # The gap names the fault (``vector_unavailable:RuntimeError:worker_failed``); this line, which the doctor
-    # shows, says why the helper could not start (runtime/instance.py ``_helper_start_failure``, #176).
+    # shows, says why the helper could not start (runtime/instance.py ``_helper_start_failure``).
     helper_error = getattr(instance, "vector_helper_error", None)
     if isinstance(helper_error, str) and helper_error:
         payload["worker_error"] = f"vector helper: {helper_error}"
@@ -448,10 +493,10 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
 def _apply_queue_status(
     payload: dict[str, Any], gaps: list[str], queue: Any, receipt: Any, background_gaps: tuple[str, ...]
 ) -> None:
-    """Fold the queue's standing into the pass status, with the same
-    classification the doctor uses.  Never degraded without saying why: an
-    empty gap list is what sent a watcher hunting through two-day-old logs."""
-    terminal_failed = sum(count for code, count in queue.work_error_counts if not _is_actionable(code))
+    """Fold the queue's standing into the pass status.  The terminal count is the store's
+    (``StoreStatus.terminal_failed_work``), the one the doctor reads too, and a degraded status
+    always carries the gap that says why."""
+    terminal_failed = queue.terminal_failed_work
     actionable_failed = max(0, queue.failed_work - terminal_failed)
     payload.update(
         pending_work=queue.pending_work,
@@ -508,7 +553,7 @@ def run_worker(config_path: str | Path, *, output: TextIO | None = None, deadlin
         preflight_gap = _vector_preflight_gap(config)
         instance = build_runtime_instance(config)
         instance.memory_epoch()  # Validate the bound database before writing metadata.
-        lock_path = _metadata_path(config, "runtime-worker.lock")
+        lock_path = worker_metadata_path(config, "runtime-worker.lock")
         try:
             with advisory_file_lock(lock_path, timeout_seconds=max(0, deadline - time.monotonic())):
                 if deadline_epoch is not None and time.monotonic() >= deadline:
@@ -655,8 +700,6 @@ def load_credential_environment(config_path: str | Path, env_file: str | Path) -
     overwriting a variable this process was already given, so the wake's own
     environment always wins.  Returns how many names were set, never their values.
     """
-    from .resume_entry import credential_environment
-
     added = 0
     for name, value in credential_environment(load_config(config_path), str(env_file)).items():
         if name not in os.environ:

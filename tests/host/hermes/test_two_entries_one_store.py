@@ -8,23 +8,21 @@ Sources are synthetic; nothing here is a person's memory.
 
 from __future__ import annotations
 
-from contextlib import closing
 import json
 import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, bind_hermes_identity
 from scope_recall.adapters.hermes.identity import switch_hermes_identity
-from scope_recall.adapters.hermes.installation import (
+from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
+from scope_recall.adapters.hermes.shared_entries import (
     attach_shared_entry,
-    build_installation_manifest,
     load_binding_for_home,
     new_shared_payload,
     read_shared_payload,
-    write_installation_manifest,
     write_shared_payload,
 )
 

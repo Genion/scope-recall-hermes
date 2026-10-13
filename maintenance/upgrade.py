@@ -7,24 +7,30 @@ All writes here target a new job directory and an installer-bound destination.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from contextlib import closing
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
 import uuid
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
 
-from ..contracts import TrustedContext
-from ..core.storage import SQLiteStorage
+from ..contracts import ContractError, TrustedContext
 from ..core.file_lock import advisory_file_lock
-from .backup import _atomic_json as _write, _safe_path, _sha256, backup_sqlite
+from ..core.storage import SQLiteStorage
+from .backup import atomic_json as _write
+from .backup import backup_sqlite, safe_path, sha256
+from .legacy_v2_compat import (
+    build_completed_bridge_archive,
+    build_import_ledger_archive,
+)
 from .migrate_v2 import (
     MigrationError,
     build_legacy_catalog,
     migrate_legacy,
-    _load_installation_handoff,
 )
+from .migration_activation import load_installation_handoff
+from .migration_index import queue_index_page
 
 FORMAT = "scope-recall.upgrade-job/1"
 _PLAN_FIELDS = (
@@ -51,15 +57,15 @@ def _source_stamp(path: Path) -> dict:
     # WAL is part of the source identity. A main-file-only hash misses committed
     # changes, so a changed/vanished WAL invalidates a prepared live snapshot.
     return {
-        suffix: _sha256(p) if p.exists() and p.stat().st_size else None
+        suffix: sha256(p) if p.exists() and p.stat().st_size else None
         for suffix in ("", "-wal", "-journal")
         if (p := Path(str(path) + suffix))
     }
 
 
 def _load(job: str | Path, *, verify_snapshot: bool = False) -> tuple[Path, dict]:
-    root = _safe_path(job, must_exist=True)
-    path = _safe_path(root / "job.json", must_exist=True)
+    root = safe_path(job, must_exist=True)
+    path = safe_path(root / "job.json", must_exist=True)
     if path.stat().st_size > 1024 * 1024:
         raise MigrationError("job metadata too large")
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -69,15 +75,33 @@ def _load(job: str | Path, *, verify_snapshot: bool = False) -> tuple[Path, dict
         {k: value[k] for k in _PLAN_FIELDS}
     ):
         raise MigrationError("migration plan changed")
-    if verify_snapshot and _sha256(root / "source.sqlite3") != value["snapshot_sha256"]:
+    if verify_snapshot and sha256(root / "source.sqlite3") != value["snapshot_sha256"]:
         raise MigrationError("source snapshot changed")
     return root, value
 
 
+def _check_destination(binding) -> None:
+    """The destination's store opens under its manifest and holds nothing yet."""
+    context = TrustedContext(binding, "upgrade-preflight", binding.scope_ids, "host_generated")
+    try:
+        with SQLiteStorage(binding).read(context) as tx:
+            if tx.status().sources:
+                raise MigrationError("destination must be a new inactive installation")
+    except ContractError as exc:
+        if (exc.code, exc.field) != ("IDENTITY_UNBOUND", "scope_binding"):
+            raise
+        # A store keeps the scopes it was created with, so a manifest that names others, written after the store
+        # was made, never opens it.
+        raise MigrationError(
+            "destination store holds other scopes than its manifest names: write the complete manifest, every "
+            "audience and preserved scope, before anything creates the store (install_hermes_scope_recall does both)"
+        ) from exc
+
+
 def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=None) -> dict:
-    source = _safe_path(source, must_exist=True)
-    root = _safe_path(job)
-    binding, target, manifest, audiences, resolved_host = _load_installation_handoff(installation_manifest, host)
+    source = safe_path(source, must_exist=True)
+    root = safe_path(job)
+    binding, target, manifest, audiences, resolved_host = load_installation_handoff(installation_manifest, host)
     if (
         root.is_relative_to(source.parent)
         or root.is_relative_to(target)
@@ -87,10 +111,7 @@ def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=
         raise MigrationError("source, job and target must be separate")
     if root.exists():
         raise MigrationError("job already exists; use migrate status or run to resume")
-    context = TrustedContext(binding, "upgrade-preflight", binding.scope_ids, "host_generated")
-    with SQLiteStorage(binding).read(context) as tx:
-        if tx.status().sources:
-            raise MigrationError("destination must be a new inactive installation")
+    _check_destination(binding)
     root.mkdir(parents=True)
     before = _source_stamp(source)
     backup = backup_sqlite(source, root / "source.sqlite3", manifest=root / "backup.json")
@@ -107,9 +128,12 @@ def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=
     missing = [s for s in scopes if s not in mapping]
     unknown = [s for s in mapping if s not in scopes]
     resolved = {s: audiences.get(t, t) for s, t in mapping.items()}
-    invalid = unknown or [s for s, t in resolved.items() if t not in binding.scope_ids]
-    if len(set(resolved.values())) != len(resolved):
-        invalid = ["non_injective_scope_map"]
+    invalid = [*unknown, *(s for s, t in resolved.items() if s not in unknown and t not in binding.scope_ids)]
+    # Old scopes that share one target, each named: merging them would give every audience of one the others' memory.
+    targets = list(resolved.values())
+    colliding = sorted(s for s, t in resolved.items() if targets.count(t) > 1)
+    if colliding:
+        invalid = [*invalid, "non_injective_scope_map"]
     reasons = []
     if not catalog["is_supported"]:
         reasons.append("legacy_format_unsupported")
@@ -126,7 +150,7 @@ def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=
         snapshot_sha256=backup["backup_sha256"],
         catalog_sha256=catalog["catalog_sha256"],
         manifest=str(manifest),
-        manifest_sha256=_sha256(manifest),
+        manifest_sha256=sha256(manifest),
         target_directory=str(target),
         installation_id=binding.installation_id,
         host=resolved_host,
@@ -135,6 +159,7 @@ def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=
         blockers=reasons,
         missing_scope_ids=missing,
         invalid_scope_ids=invalid,
+        colliding_scope_ids=colliding,
         created_at=datetime.now(timezone.utc).isoformat(),
         history_reextraction=False,
         host_validation="agent_required",
@@ -147,10 +172,10 @@ def prepare_upgrade(source, job, *, installation_manifest, host=None, scope_map=
 
 
 def _binding(root, job):
-    manifest = _safe_path(job["manifest"], must_exist=True)
-    if _sha256(manifest) != job["manifest_sha256"]:
+    manifest = safe_path(job["manifest"], must_exist=True)
+    if sha256(manifest) != job["manifest_sha256"]:
         raise MigrationError("target audience manifest changed; prepare a new job")
-    binding, target, _, _, _ = _load_installation_handoff(manifest, job["host"])
+    binding, target, _, _, _ = load_installation_handoff(manifest, job["host"])
     if str(target) != job["target_directory"] or binding.installation_id != job["installation_id"]:
         raise MigrationError("target binding changed")
     return binding
@@ -167,7 +192,7 @@ def run_upgrade(job, *, source_quiesced=False, legacy_reader_contract=None) -> d
             return value
         if source_quiesced is not True:
             raise MigrationError("agent must quiesce the source host before migration")
-        source = _safe_path(value["source_database"], must_exist=True)
+        source = safe_path(value["source_database"], must_exist=True)
         if _source_stamp(source) != value["source_stamp"]:
             raise MigrationError("source changed since preparation; refresh the snapshot before cutover")
         # Reserve the old SQLite writer while checking freshness and converting.
@@ -187,10 +212,6 @@ def run_upgrade(job, *, source_quiesced=False, legacy_reader_contract=None) -> d
                 kwargs = {}
                 if legacy_reader_contract is not None:
                     kwargs["legacy_memory_reader_contract"] = legacy_reader_contract
-                from .legacy_v2_compat import (
-                    build_completed_bridge_archive,
-                    build_import_ledger_archive,
-                )
 
                 with closing(
                     sqlite3.connect(
@@ -218,7 +239,7 @@ def run_upgrade(job, *, source_quiesced=False, legacy_reader_contract=None) -> d
                 )
                 value["state"] = "converted" if report["completion_status"] == "complete" else "blocked"
                 value["blockers"] = [] if value["state"] == "converted" else ["conversion_incomplete"]
-                value["report_sha256"] = _sha256(report_path)
+                value["report_sha256"] = sha256(report_path)
                 value["counts"] = report["counts"]
                 _write(root / "job.json", value)
             except Exception as exc:
@@ -244,7 +265,7 @@ def _verify_upgrade(job) -> dict:
     if value["state"] not in {"converted", "verified"}:
         raise MigrationError("conversion is not complete")
     report = Path(value["conversion_report"])
-    if _sha256(report) != value["report_sha256"]:
+    if sha256(report) != value["report_sha256"]:
         raise MigrationError("conversion report changed")
     context = TrustedContext(binding, "upgrade:" + value["operation_id"], binding.scope_ids, "host_generated")
     with SQLiteStorage(binding).read(context) as tx:
@@ -280,8 +301,6 @@ def upgrade_status(job) -> dict:
 
 
 def queue_upgrade_index(job, *, limit=128) -> dict:
-    from .migration_index import queue_index_page
-
     root, value = _load(job)
     with advisory_file_lock(root / "operation.lock", timeout_seconds=0):
         # Indexing reads target truth. Do not rehash a potentially multi-GB

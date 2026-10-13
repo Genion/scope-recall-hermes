@@ -27,11 +27,14 @@ a question already answered.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
-from typing import Iterable, Mapping
 import unicodedata
+from dataclasses import dataclass
+from typing import Iterable, Mapping
+
+from .claims import AUTHORITY_ORIGINS, HUMAN_ONLY_KINDS, VALUE_FREE_KINDS
+from .source_qualification import bound_literal
 
 #: Origins that count as somebody testifying rather than the system observing
 #: itself.  ``core/corroboration.py`` uses the same notion for promotion; kept
@@ -71,8 +74,8 @@ def question_digest(evidence: object) -> str:
 
 # --- questions no answer could settle ----------------------------------------
 #
-# A new question is still not always a question worth a model call.  On one instance
-# (2026-09-17) 2,019 evaluations in one day promoted 7 facts, and 54% of them
+# A new question is still not always a question worth a model call.  Measured
+# in one store, 2,019 evaluations in one day promoted 7 facts, and 54% of them
 # carried evidence on which no verdict could pass ``claims.qualify``: the
 # candidate's value appeared in none of the supplied sources, or no supplied
 # source could lend the authority its kind needs.  Of all 10,602 evaluations the
@@ -83,7 +86,7 @@ def question_digest(evidence: object) -> str:
 # verdict was already decided:
 #
 # * authority -- ``_cite`` keeps complete, gap-free roots and ``_authority``
-#   needs a human, tool or document one (a human one for ``_HUMAN_ONLY_KINDS``);
+#   needs a human, tool or document one (a human one for ``HUMAN_ONLY_KINDS``);
 # * value -- ``_value_preserved`` needs ``value_text`` inside the quotes for every
 #   kind but procedure, intention and alias, and a quote is an exact slice of a
 #   supplied source.  Compared here on letters and digits only, after NFKC and
@@ -116,7 +119,7 @@ def evidence_text(source) -> EvidenceText:
     return EvidenceText(origin, complete, str(source.event.get("content") or ""))
 
 
-def _letters_and_digits(value: object) -> str:
+def nfkc_letters_and_digits(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
     return "".join(character for character in text if character.isalnum())
 
@@ -124,19 +127,18 @@ def _letters_and_digits(value: object) -> str:
 def unanswerable_reason(payload: Mapping, evidence: Iterable[EvidenceText]) -> str | None:
     """Why no verdict on ``evidence`` could promote this candidate, or ``None``."""
     # The qualification rules own these sets; importing them keeps the two in step.
-    from .claims import _AUTHORITY_ORIGINS, _HUMAN_ONLY_KINDS, _VALUE_FREE_KINDS
 
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     if kind not in _CLAIM_KINDS:
         return None
     items = tuple(evidence)
-    needed = ("human_direct",) if kind in _HUMAN_ONLY_KINDS else _AUTHORITY_ORIGINS
+    needed = ("human_direct",) if kind in HUMAN_ONLY_KINDS else AUTHORITY_ORIGINS
     if not any(item.complete and item.origin in needed for item in items):
         return "no_authoritative_evidence"
-    value = _letters_and_digits(payload.get("value_text"))
-    if kind in _VALUE_FREE_KINDS or not value:
+    value = nfkc_letters_and_digits(payload.get("value_text"))
+    if kind in VALUE_FREE_KINDS or not value:
         return None
-    if not any(value in _letters_and_digits(item.content) for item in items):
+    if not any(value in nfkc_letters_and_digits(item.content) for item in items):
         return "value_not_in_evidence"
     return None
 
@@ -173,9 +175,6 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
     carries nothing.  Kinds proved without a value (intention, alias) need the root quote
     alone; ``qualify`` already asks a person of them.
     """
-    from .claims import _VALUE_FREE_KINDS
-    from .source_qualification import bound_literal
-
     roots = [(text, quote) for text, quote in quoted if text.complete and text.origin in DERIVATION_ROOT_ORIGINS]
     if not roots:
         return False
@@ -184,7 +183,7 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
         method = (proposal.get("procedure") or {}).get("method") or ()
         return bool(method) and all(any(step in text.content for text, _quote in roots) for step in method)
     value = str(proposal.get("value_text") or "")
-    if kind in _VALUE_FREE_KINDS or not value.strip():
+    if kind in VALUE_FREE_KINDS or not value.strip():
         return True
     return any(bound_literal(quote, value) for _text, quote in roots)
 
@@ -192,13 +191,13 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
 # --- questions worth asking at most so often ---------------------------------
 #
 # Even an answerable question is not worth asking again and again.  Replayed over
-# one instance's 10,650 evaluations (2026-09-13..17), the candidate loop cost 81-97% of
+# one store's 10,650 evaluations of five days, the candidate loop cost 81-97% of
 # every day's model tokens, 60-96% of each day's evaluations re-asked a candidate
 # already judged, and 307 candidates were asked ten times or more.  Of the 27
 # verdicts that promoted a fact, 19 came from a candidate's first verdict, 4 from
 # its second, and 4 from the fifth or later.  Two rules follow:
 #
-# * a kind only a person can establish (``claims._HUMAN_ONLY_KINDS``) that was
+# * a kind only a person can establish (``claims.HUMAN_ONLY_KINDS``) that was
 #   proposed from sources where no person spoke is not a candidate at all: 2,034
 #   of those evaluations promoted nothing, and when the person does say it, the
 #   consolidation of their own words proposes it with the authority it needs;
@@ -223,11 +222,9 @@ def needs_absent_person(payload: Mapping, cited_origins: Iterable[str]) -> bool:
     ``cited_origins`` are the effective origins of the sources the proposal
     cites.  An empty or unknown origin set is never judged absent.
     """
-    from .claims import _HUMAN_ONLY_KINDS
-
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     origins = frozenset(cited_origins)
-    return kind in _HUMAN_ONLY_KINDS and bool(origins) and origins <= IMPERSONAL_ORIGINS
+    return kind in HUMAN_ONLY_KINDS and bool(origins) and origins <= IMPERSONAL_ORIGINS
 
 
 def restatement_needle(payload: Mapping) -> str:
@@ -236,13 +233,11 @@ def restatement_needle(payload: Mapping) -> str:
     The value for kinds whose promotion quotes it; the subject for the kinds
     proved otherwise.  Empty when neither has a letter or digit.
     """
-    from .claims import _VALUE_FREE_KINDS
-
     if not isinstance(payload, Mapping):
         return ""
-    value = _letters_and_digits(payload.get("value_text"))
-    if payload.get("kind") in _VALUE_FREE_KINDS or not value:
-        return _letters_and_digits(payload.get("subject"))
+    value = nfkc_letters_and_digits(payload.get("value_text"))
+    if payload.get("kind") in VALUE_FREE_KINDS or not value:
+        return nfkc_letters_and_digits(payload.get("subject"))
     return value
 
 
@@ -251,7 +246,7 @@ def restates(payload: Mapping, contents: Iterable[str]) -> bool:
     needle = restatement_needle(payload)
     if not needle:
         return True
-    return any(needle in _letters_and_digits(content) for content in contents)
+    return any(needle in nfkc_letters_and_digits(content) for content in contents)
 
 
 __all__ = [

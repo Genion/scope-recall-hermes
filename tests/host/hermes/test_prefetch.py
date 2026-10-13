@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import timedelta, timezone
 import json
 import sys
 import types
+from datetime import timedelta, timezone
 
 from scope_recall.adapters.hermes import bind_hermes_identity
 from scope_recall.adapters.hermes.gating import is_trivial_prompt
@@ -14,6 +14,7 @@ from scope_recall.core import MemoryCore
 from scope_recall.core.background_context import BACKGROUND_PREFIX
 from scope_recall.core.episodes import source_watermark
 from scope_recall.core.retrieval import RetrievalResult
+
 from tests.v11_support import source_event
 
 _UNRELATED_QUERY = "紫色海豚量子温泉"
@@ -118,7 +119,7 @@ def test_explicit_resume_recall_still_returns_the_grounded_task(adapter):
         "source_watermark": source_watermark(refs),
         "evidence_refs": refs,
     }
-    episode = core.accept_consolidation(
+    episode = core.records.accept_consolidation(
         identity.trusted_context(mutation=True),
         {
             "protocol_version": "1.1",
@@ -224,7 +225,9 @@ def _active_preference(provider) -> str:
         "resume_proposals": [],
         "reference_proposals": [],
     }
-    receipt = core.accept_claim_proposals(context, proposal, scope_id=identity.local_scope_id, remaining_seconds=5)
+    receipt = core.records.accept_claim_proposals(
+        context, proposal, scope_id=identity.local_scope_id, remaining_seconds=5
+    )
     return receipt.items[0].ref
 
 

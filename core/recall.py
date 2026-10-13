@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from itertools import islice
+import inspect
 import sqlite3
 import time
+from dataclasses import replace
+from itertools import islice
 from typing import Protocol
 
 from ..contracts import ContractError
@@ -14,6 +15,7 @@ from .claims import canonical_time
 from .coverage import note_truncation
 from .duplicate_collapse import DistinctContent, note_duplicates
 from .events import lexical_terms
+from .owner_view import OwnerView, owner_names, owner_view
 from .recall_budget import estimate_tokens, event_admission_order
 from .recall_needs import CHOICE_MARKERS, directed_followup_query, evidence_roots, mentions, unmet_needs
 from .recall_policy import (
@@ -55,23 +57,24 @@ MINIMUM_HYDRATION_CAP = 16
 CLAIM_CANDIDATES = 16
 #: Share of its fusion score context-only evidence keeps in live modes: a bare
 #: question, or a reply restating what a recall tool returned in its turn.
-#: Asked again, one instance returned five earlier questions like the query ahead of
-#: the reply that answered one, and another instance's recall test report came back ahead
-#: of the evidence it quoted.  At 0.6 a first-ranked one falls below a reply that
+#: Asked again, a question can return five earlier questions like it ahead of the
+#: reply that answered one, and a report of a recall test can come back ahead of
+#: the evidence it quoted.  At 0.6 a first-ranked one falls below a reply that
 #: ranked in the mid-teens, and still ranks as context when nothing answers.
 CONTEXT_ONLY_WEIGHT = 0.6
 #: Meaningful terms a query needs before an older copy of it leads to what that copy was told
 #: (``RetrievalPipeline._expand``).  A short command sent again asks nothing an old turn answered.  Chinese terms
 #: are overlapping character pairs, so "继续执行" holds three and "按你说的做" four, and three let both bring back
-#: every old turn they had opened (review of 3.4.4); five is about six characters.  Of the owner's prompts over
+#: every old turn they had opened; five is about six characters.  Of the owner's prompts over
 #: two weeks, 33 of the 115 with fewer had an exact older copy; of the owner's real questions, 167 of 173 have five.
 ECHO_TURN_MIN_TERMS = 5
 #: SQLite virtual-machine steps between two looks at the recall's deadline while a candidate statement runs: one
 #: every 10-60 ms of statement time.  Each look takes the GIL back from the statement, and beside a busy thread (the
-#: MCP server's hook threads, a gateway's) waits for it: one every 10,000 steps made a 25 ms statement take 1.4 s
-#: (review of 3.4.5).
+#: MCP server's hook threads, a gateway's) waits for it: one every 10,000 steps made a 25 ms statement take 1.4 s.
 _INTERRUPT_STEPS = 1_000_000
-_CHANNELS = ("scoped", "exact", "lexical", "claim", "recent", "vector")
+#: ``vector_owner`` is the vector channel's search for a question that names the owner, asked in their first person
+#: (``core/owner_view.py``); it has slots of its own, so the question as asked keeps all of the channel's.
+_CHANNELS = ("scoped", "exact", "lexical", "claim", "recent", "vector", "vector_owner")
 #: Messages the scoped channel offers: a day of one entry, for a question that asks what was said then
 #: (``recall_scope``).
 SCOPED_CANDIDATES = 12
@@ -86,6 +89,22 @@ _VECTOR_REJECTION_GAPS = {
     "vector_threshold_unconfigured": "vector_threshold_unconfigured",
 }
 _VECTOR_SILENT_REJECTIONS = frozenset({"vector_below_threshold", "vector_id_missing", "vector_score_invalid"})
+
+
+def _takes_also(prefetch) -> bool:
+    """Whether a vector port's ``prefetch_query`` asks for other readings of the question in the same request."""
+    try:
+        parameters = inspect.signature(prefetch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "also" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+
+
+def _asked_early(prefetched) -> tuple[str, ...]:
+    """The questions an embedding asked for as the recall started holds: one, or several asked together."""
+    if prefetched is None:
+        return ()
+    return tuple(getattr(prefetched, "queries", None) or (prefetched.query,))
 
 
 class RetrievalClock(Protocol):
@@ -108,6 +127,7 @@ class ChannelBudget:
             "claim": min(CLAIM_CANDIDATES, limits.candidate_pool),
             "recent": limits.recent_items,
             "vector": limits.vector_limit,
+            "vector_owner": limits.vector_limit,
         }
         self.total = sum(self.left.values())
         self.reserve = dict.fromkeys(_CHANNELS, 0)
@@ -190,27 +210,60 @@ class RetrievalPipeline:
         """Ask the vector port for the query's embedding before the SQLite channels run, if it can take one early.
 
         Asked for after them, the embedding had three quarters of what they left (runtime/instance.py
-        ``_QueryEmbedding``).  A port that cannot start one early, or fails to, embeds in its search as before.
+        ``_QueryEmbedding``).  A port that cannot start one early, or fails to, embeds in its search as before.  A
+        question that names the owner is asked for in their first person as well, in the same request where the port
+        takes several (``also``): one after the other, the second waited for the first.
         """
         if self.vector_port is None or context.limits.vector_limit == 0:
             return None
         prefetch = getattr(self.vector_port, "prefetch_query", None)
         if not callable(prefetch):
             return None
+        view = self._owner_view(context)
         try:
+            if view is not None and _takes_also(prefetch):
+                return prefetch(context, also=(view.first,))
             return prefetch(context)
         except Exception:
             return None
 
+    def _owner_view(self, context: SearchContext) -> OwnerView | None:
+        """The question as the store's owner would ask it, when it names them and asks something besides
+        (``core/owner_view.py``); a question about the name alone ("Joy 是谁？") is read as asked."""
+        names = owner_names(self.policy.owner_names, context.trusted_context.source_principal)
+        view = owner_view(context.query, names) if names else None
+        return view if view is not None and meaningful_query_terms(view.bare) else None
+
+    def _admission_query(self, context: SearchContext) -> str:
+        """The question coverage reads: without the owner's name, which their own words never carry, so that it is no
+        word an answer in them is short of."""
+        view = self._owner_view(context)
+        return view.bare if view is not None else context.query
+
+    def _lexically_admitted(self, candidate: CandidateRef, context: SearchContext) -> bool:
+        """Admitted by the question as asked, which a reply naming the owner beside its other words still meets, or
+        without the owner's name: their own words never carry it, and in a short question it was one of the two words
+        a candidate had to match.  The name alone admits nothing either way."""
+        if self.policy.lexical_admission(candidate, context.query, exact=False)[0]:
+            return True
+        view = self._owner_view(context)
+        return view is not None and self.policy.lexical_admission(candidate, view.bare, exact=False)[0]
+
     def _vector_candidates(
-        self, context: SearchContext, gaps: list[str], *, budget: ChannelBudget | None = None, prefetched=None
+        self,
+        context: SearchContext,
+        gaps: list[str],
+        *,
+        budget: ChannelBudget | None = None,
+        prefetched=None,
+        channel: str = "vector",
     ) -> tuple[CandidateRef, ...]:
         if self.vector_port is None or context.limits.vector_limit == 0:
             gaps.append("vector_unavailable")
             return ()
-        limit = (
-            context.limits.vector_limit if budget is None else budget.allowance("vector", context.limits.vector_limit)
-        )
+        limit = context.limits.vector_limit
+        if budget is not None:
+            limit = budget.allowance(channel, limit)
         if limit <= 0:
             return ()
         remaining = self._remaining(context)
@@ -221,7 +274,7 @@ class RetrievalPipeline:
         # packet's final authority checks if the optional vector call times out.
         vector_context = replace(context, deadline=context.deadline - remaining * 0.25)
         # The embedding asked for when the recall started is this round's only if the round kept its query.
-        early = {"prefetched": prefetched} if prefetched is not None and prefetched.query == context.query else {}
+        early = {"prefetched": prefetched} if context.query in _asked_early(prefetched) else {}
         try:
             raw = tuple(
                 islice(
@@ -240,7 +293,7 @@ class RetrievalPipeline:
             gaps.append(f"vector_error:{vector_failure_label(exc)}")
             return ()
         if budget is not None:
-            budget.spend("vector", len(raw))
+            budget.spend(channel, len(raw))
         admitted = []
         for rank, candidate in enumerate(raw, 1):
             if candidate.rank != rank:
@@ -265,7 +318,7 @@ class RetrievalPipeline:
             # A claim candidate already passed its own statement rule in storage; a scoped one is a message of
             # the day and entry the question names.
             return True
-        return self.policy.lexical_admission(candidate, context.query, exact=False)[0]
+        return self._lexically_admitted(candidate, context)
 
     def _fuse_candidates(
         self, admitted: list[CandidateRef], seen: set[tuple[str, str, int]] | None
@@ -363,6 +416,16 @@ class RetrievalPipeline:
             gaps.append("deadline_exceeded_collect")
             return admitted()
         raw.extend(self._vector_candidates(context, gaps, budget=budget, prefetched=prefetched))
+        view = self._owner_view(context)
+        searchable = self.vector_port is not None and context.limits.vector_limit > 0
+        if view is not None and searchable and self._remaining(context) > 0:
+            # The question as the owner would ask it, beside the question as asked: their own words answer it and never
+            # carry their name, while the question as asked finds what names them.  One candidate the two searches
+            # agree on ranks by both.
+            owned = replace(context, query=view.first)
+            raw.extend(
+                self._vector_candidates(owned, gaps, budget=budget, prefetched=prefetched, channel="vector_owner")
+            )
         return admitted()
 
     # -- hydration and admission ----------------------------------------------
@@ -599,7 +662,7 @@ class RetrievalPipeline:
         # Explicit historical lookups keep their original ordering.
         if context is None or context.mode in {"history", "as_of"}:
             return ranked
-        query_terms = set(meaningful_query_terms(context.query))
+        query_terms = set(meaningful_query_terms(self._admission_query(context)))
         if not query_terms:
             return ranked
         matched = {
@@ -698,13 +761,12 @@ class RetrievalPipeline:
         only what was said or done then; any other question has no scope.
 
         Reading the scope never fails a recall: a question it cannot read is recalled as if it named no day, and the
-        gap says so.  A prompt grown past the search's length by normalisation emptied the whole recall (review of
-        3.4.6).
+        gap says so.  A prompt grown past the search's length by normalisation would empty the whole recall.
         """
         scope = None
         try:
             if query_scope(working.query, now=working.now, zone=working.zone, entries={}) is not None:
-                entries = getattr(tx, "entries", None)
+                entries = getattr(getattr(tx, "registry", None), "entries", None)
                 names = (
                     {entry_id: str(value.get("name") or entry_id) for entry_id, value in entries().items()}
                     if callable(entries)
@@ -794,19 +856,19 @@ class RetrievalPipeline:
         """What the same question was told the last time it was asked goes before the best candidate of its time.
 
         Reached as any seed's turn is, at a first rank's fixed score, it fell below every candidate two channels agreed
-        on: with vectors on, the owner's questions asked again lost about 25 of 124 answers (the threshold sweep of
-        2026-09-30).  Only the latest copy's turn is raised, so an answer that changed since is not raised beside the
+        on: with vectors on, one person's questions asked again lost about 25 of 124 answers (a threshold sweep).
+        Only the latest copy's turn is raised, so an answer that changed since is not raised beside the
         one that replaced it.  Of that turn at most half the packet is: the replies a channel ranked highest, which say
         what was asked, then the turn's last reply, which answers it, when the turn was read to its end.  An agent's
         turn opens with what it is about to do, and raising every reply let an old turn's first messages fill the
-        packet, as raising every reply a channel found let its narration of the subject do (reviews of its first and
-        second versions); the last reply read of a turn cut by the window was narration too.  Raising only the best
+        packet, as raising every reply a channel found let its narration of the subject do; the last reply read of a
+        turn cut by the window was narration too.  Raising only the best
         found reply lost 6 of the owner's 173 questions asked again with vectors on, where more replies are found and
         the answer is not always the best of them.  They go above the best
         candidate said up to that turn, the turn's other replies included, and not above what was said after it and
         ranks higher still, which may say the answer changed.  Kept below every such candidate outranking the best of
         the turn's time, the answer fell out of the packet for 5 of the owner's 173 questions asked again: a store keeps
-        growing, and something said since matches most questions (review of its second version).
+        growing, and something said since matches most questions.
         """
         latest_turn = getattr(self.storage_reader, "latest_turn", None)
         if not echoes or not callable(latest_turn):

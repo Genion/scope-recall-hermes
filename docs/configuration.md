@@ -213,6 +213,53 @@ configs hold `0.653`, set `0.70` in each entry's runtime config. A store in
 another space, or one whose threshold was calibrated on it, keeps its own.
 `attach` copies the attached instance's value as it is.
 
+## `owner_names`
+
+A top-level list of the names the store's owner goes by, at most eight, each 2 to
+64 printable characters with no space at either end: `"owner_names": ["Joy", "乔伊"]`.
+Optional; no installer writes it.
+
+An agent asks its memory about the owner by name ("Joy 对动画的运镜有什么要求？",
+"What does Joy prefer?"), while the owner's own messages say "I" and never their
+name. Such a question is searched by meaning twice: as asked, which finds what
+names the owner, and as the owner would ask it ("我对动画的运镜有什么要求？",
+"What does I prefer?"), which finds their own words, each search with the vector
+channel's slots. Both are embedded in one request where the embedding route takes
+several texts in one (the Gemini and OpenAI-compatible routes do): measured on the
+shipped route, one text took 420 ms at the median, both together 488 ms, and two
+requests one after the other 818 ms, too long for a recall tool's 2 s. By its
+words, a candidate is admitted by the question as asked or by the question without
+the name, so a short question's other words are enough for an answer in the
+owner's own words. A question that names no listed name, or asks nothing besides
+the name ("Joy 是谁？"), is recalled as asked.
+
+Besides this list, recall reads the name a host attests for the person asking, in
+reads only, never in a capture: a Hermes gateway passes the user's name for a
+verified person (Telegram's first and last name, `Joy Joy`), which gives the whole
+name and, when it has several words, the first: a middle name or a surname is as
+often someone else's. A name that looks like an account id (12 or more letters and
+digits with a digit among them) is not taken. Claude Code, Codex, WorkBuddy, dsh
+and the remote clients attest no name: list it here in each of their runtime
+configs.
+
+A Latin-letter name is matched as a word of its own and with its case, so
+`Joyce`, `joy-hub`, `/opt/Joy`, `C:\Joy` and the word "joy" are not the name, nor
+is the first word of another person's name (`Joy Smith`, `Joy SMITH`) unless the
+next word is a listed name too. Chinese runs words together, so a Chinese name is
+matched where what follows it goes on with a question about the person (a
+particle, a preposition, a common verb or adverb, a time: `王芳对…`, `王芳喜欢…`,
+`王芳的…`), and not where more characters run it on into someone's longer name
+(`王芳芳`, `王芳林`); a name followed by a word outside that list is recalled as
+asked. List the name as it is written. A name of one character is never matched.
+
+Measured on a copy of a shared store of nine entries (2026-10-11, against 3.9.7):
+of 52 questions agents ask about the owner by name, each answered by one of the
+owner's own messages, 16 came back in the top five before and 27 after, none
+lost; asked as the recall tool asks them, 16 and 24 of the 48 that both runs
+searched by meaning; the same questions about a configured Chinese name (`王芳`),
+19 and 24 of 45. The owner's own 173 questions, which name no one, came back
+exactly as before.
+
 ## `auxiliary`
 
 External model routes. Omit the block entirely and it defaults to
@@ -276,10 +323,11 @@ C:\path\to\python.exe -c "import json, pathlib; from scope_recall.runtime import
 |-----|------|---------|---------|
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | **Name** of the environment variable holding the API key. The key itself never appears in this file. |
 | `model` | string, 1–200 chars | absent | Model name sent on the wire. |
-| `endpoint` | `https://` URL, ≤ 2048 chars | absent | Full request URL. Not a base URL: no path is appended. |
+| `endpoint` | URL, ≤ 2048 chars | absent | Full request URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host (a local model server), or to a non-loopback host only with `allow_insecure_endpoint`. User-info, fragments, and credential-bearing query keys (including encoded aliases) are refused on both HTTP and HTTPS; safe parameters such as `api-version` are allowed. Configure credentials through `credential_env`, never in the URL. |
 | `dimensions` | int, 8–16384 | absent | Vector width. It is sent in the request and the response length is checked against it. |
 | `dialect` | `"gemini"` or `"openai"` | absent | Wire shape. See the next section. |
 | `dimensions_field` | string, a JSON field name | `"dimensions"` | The request field the `openai` dialect sends the width in. Voyage calls it `output_dimension` and refuses `dimensions`. A wire detail: it does not change the embedding space. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback — a container reaching a model server on its host, over a bridge address that is not loopback. **The text being embedded, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust, and leave it off otherwise.** A local model server on a loopback host needs no opt-in. Only the literal boolean opens it: a quoted `"true"` is refused, so a string cannot grant it. On a plaintext connection the credential-bearing headers (`authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, …) are stripped before the request leaves, so a server that needs a key is reachable only over HTTPS. |
 
 `model`, `endpoint`, `dimensions` and `dialect` move together. Omit all four and
 the route addresses the shipped Gemini space, so an existing installation keeps

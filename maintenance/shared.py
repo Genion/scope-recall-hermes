@@ -21,55 +21,52 @@ from __future__ import annotations
 
 import argparse
 import copy
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import shutil
 import sqlite3
 import sys
-import tempfile
-import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ..adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
 from ..adapters.hermes.installation import (
-    CLIENT_HOSTS,
-    ENTRY_HOSTS,
     MANIFEST_FILENAME,
     HermesIdentityError,
+    build_installation_manifest,
+    load_archived_installation,
+)
+from ..adapters.hermes.shared_entries import (
+    CLIENT_HOSTS,
+    ENTRY_HOSTS,
     attach_shared_entry,
     attach_shared_record,
     attachment_path,
-    build_installation_manifest,
     client_entry_record,
-    load_archived_installation,
     new_shared_payload,
     read_attachment,
     read_shared_payload,
     shared_entry_record,
     write_shared_payload,
 )
-from ..adapters.runtime_wiring import RUNTIME_CONFIG_FILENAME
 from ..contracts import ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
-from ..runtime.instance import RuntimeInstanceConfig
+from ..runtime.instance_config import RuntimeInstanceConfig
 from ..runtime.model_budget import initialize_auxiliary_budget_ledger
+from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from .install_common import RUNTIME_CONFIG_LIMIT
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
+from .shared_import import import_entry
+from .shared_run import Run, SharedStoreError, encoded, write_json
 
-RECEIPTS_DIRNAME = "receipts"
 #: The shared worker's own names in its runtime config.  Hosts replace the
 #: session with theirs; the worker keeps these.
 WORKER_SESSION = "shared-background"
 WORKER_OWNER = "shared-scope-recall-worker"
 #: What a runtime config these commands read or write may weigh.
 _CONFIG_LIMIT = RUNTIME_CONFIG_LIMIT
-
-
-class SharedStoreError(RuntimeError):
-    """A shared store command refused; the message says why and what to do."""
 
 
 def _now() -> str:
@@ -97,55 +94,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _encoded(value: dict[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-
-
 def _fits(config: dict[str, Any] | None, what: str) -> None:
     """Refuse, before anything is written, a runtime config these commands could not read back."""
-    if config is not None and len(_encoded(config).encode("utf-8")) > _CONFIG_LIMIT:
+    if config is not None and len(encoded(config).encode("utf-8")) > _CONFIG_LIMIT:
         raise SharedStoreError(f"the {what} runtime config would pass {_CONFIG_LIMIT} bytes")
-
-
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}-", suffix=".json", delete=False
-    )
-    with handle:
-        handle.write(_encoded(value))
-    for attempt in range(40):
-        try:
-            os.replace(handle.name, path)
-            return
-        except PermissionError:
-            # Windows refuses while a worker or host reads the file for a moment.
-            if attempt == 39:
-                Path(handle.name).unlink(missing_ok=True)
-                raise
-            time.sleep(0.05)
-
-
-class _Run:
-    """One write command: the copies it keeps and the receipt it leaves."""
-
-    def __init__(self, root: Path, command: str, now: str) -> None:
-        self.root, self.command, self.now = root, command, now
-        stamp = now.replace("-", "").replace(":", "")
-        self.folder = root / RECEIPTS_DIRNAME / f"{stamp}-{command}"
-        self.backups: list[str] = []
-
-    def keep(self, path: Path, label: str) -> None:
-        if path.is_file():
-            self.folder.mkdir(parents=True, exist_ok=True)
-            target = self.folder / f"{label}-{path.name}"
-            shutil.copy2(path, target)
-            self.backups.append(str(target))
-
-    def receipt(self, body: dict[str, Any]) -> str:
-        path = self.folder.with_suffix(".json")
-        _write_json(path, {"command": self.command, "at": self.now, "backups": self.backups, **body})
-        return str(path)
 
 
 def _space(raw: dict[str, Any]) -> str:
@@ -202,8 +154,8 @@ def _entry_config(
     """An entry's config: its model routes, bound to its scopes, searching the store's vector table.
 
     The table is the worker's: the routes may come from a store that named its
-    table otherwise, and a query then searches a table the worker never fills
-    (one agent's did, from its own 3.1 store, 2026-09-24).  The spend ledger lives
+    table otherwise (a store of an older release can), and a query would then search a
+    table the worker never fills.  The spend ledger lives
     beside the entry's pointer, where ``detach`` takes it from.  A client's routes
     come from another home, so the names its runtime reports are made its own.
     """
@@ -305,7 +257,7 @@ def init_shared(
             )
     payload = new_shared_payload(root, agent_id=agent_id, test_mode=test_mode)
     write_shared_payload(root, payload)
-    receipt = _Run(root, "init", now).receipt({"root": str(root), "installation_id": payload["installation_id"]})
+    receipt = Run(root, "init", now).receipt({"root": str(root), "installation_id": payload["installation_id"]})
     return {
         "status": "initialized",
         "root": str(root),
@@ -414,7 +366,7 @@ def attach(
     _fits(entry_config, "entry's")
     _fits(worker_config, "shared worker's")
 
-    run = _Run(root, f"attach-{record['entry_id']}", now)
+    run = Run(root, f"attach-{record['entry_id']}", now)
     run.keep(root / MANIFEST_FILENAME, "store")
     run.keep(worker_path, "worker")
     run.keep(attachment_path(instance_root), "entry")
@@ -428,7 +380,7 @@ def attach(
     ledgers = []
     for path, config in ((entry_path, entry_config), (worker_path, worker_config)):
         if config is not None:
-            _write_json(path, config)
+            write_json(path, config)
             ledgers += _ledger_made(config)
     result = {
         "status": "attached",
@@ -462,7 +414,7 @@ def detach(*, instance_root: Path, now: str | None = None) -> dict[str, Any]:
     record = next((entry for entry in payload["entries"] if entry["entry_id"] == attachment.entry_id), None)
     if record is None:
         raise SharedStoreError("the shared store has no record of this entry")
-    run = _Run(root, f"detach-{attachment.entry_id}", now)
+    run = Run(root, f"detach-{attachment.entry_id}", now)
     entry_dir = attachment_path(instance_root).parent
     pointer, entry_config = attachment_path(instance_root), entry_dir / RUNTIME_CONFIG_FILENAME
     # The entry's spend ledger lives beside its pointer (attach made it); it is
@@ -509,7 +461,7 @@ def adopt(*, root: Path, now: str | None = None) -> dict[str, Any]:
     if not payload["scope_ids"]:
         raise SharedStoreError("the store has no entries yet; there is nothing to adopt")
     binding = _store_binding(payload, root, frozenset(payload["scope_ids"]))
-    run = _Run(root, "adopt", now)
+    run = Run(root, "adopt", now)
     worker_path = root / RUNTIME_CONFIG_FILENAME
     worker_now = _read_json(worker_path) if worker_path.is_file() else None
     worker_config = _bound(worker_now, binding) if worker_now is not None else None
@@ -531,7 +483,7 @@ def adopt(*, root: Path, now: str | None = None) -> dict[str, Any]:
     payload["data_directory"] = str(root)
     write_shared_payload(root, payload)
     if worker_config is not None:
-        _write_json(worker_path, worker_config)
+        write_json(worker_path, worker_config)
     result = {
         "status": "adopted",
         "root": str(root),
@@ -555,7 +507,7 @@ def entries(*, root: Path) -> dict[str, Any]:
             with SQLiteStorage(binding).read(
                 TrustedContext(binding, "shared-store-entries", binding.scope_ids, "host_generated")
             ) as tx:
-                seen = tx.entries()
+                seen = tx.registry.entries()
             store = "ok"
         except ContractError as exc:
             store = f"{exc.code}:{exc.field}"
@@ -659,8 +611,6 @@ def main(argv: list[str]) -> int:
         elif args.command == "adopt":
             result = adopt(root=_absolute(args.root, "root"))
         elif args.command == "import-entry":
-            from .shared_import import import_entry
-
             result = import_entry(
                 root=_absolute(args.root, "root"),
                 entry_id=args.entry,

@@ -4,23 +4,19 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import sqlite3
 import time
 from dataclasses import replace
-import pytest
+from pathlib import Path
 
+import pytest
 from scope_recall.contracts import ContractError, InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
-from scope_recall.runtime.instance import (
-    VectorRuntimeConfig,
-    RuntimeInstanceConfig,
-    build_runtime_instance,
-    default_vector_factory,
-)
-from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
-from scope_recall.runtime.worker_launch import launch_worker
 from scope_recall.core.retrieval import SearchContext, SearchLimits
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+from scope_recall.runtime.instance import build_runtime_instance, default_vector_factory
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
+from scope_recall.runtime.worker_launch import launch_worker
 from v11_support import source_event
 
 
@@ -69,8 +65,9 @@ def _write_config(path: Path, payload: dict) -> Path:
 @pytest.mark.skipif(os.name != "nt", reason="Windows native path boundary")
 def test_worker_reports_native_path_gap_without_starting_helper(tmp_path, monkeypatch):
     from io import StringIO
-    from scope_recall.core.recall_policy import SPACE_ID
+
     import scope_recall.vector.process_store as native_store
+    from scope_recall.core.recall_policy import SPACE_ID
     from scope_recall.runtime.worker_entry import run_worker
 
     binding = _binding(tmp_path / "data")
@@ -403,8 +400,8 @@ def test_a_recall_asks_for_its_query_embedding_before_the_sqlite_channels(tmp_pa
     """Asked for after the SQLite channels, the query embedding had three quarters of what they left: on 2026-09-29
     the work computer's server recalled 4 of 9 prompts by words alone that way (AuxiliaryModelError:timeout).  Asked
     for as the recall starts, it runs beside them: here they take 0.8 s of a 1.2 s window, and it takes 0.4 s."""
-    from scope_recall.adapters.models import AuxiliaryModelError
     from scope_recall.core.retrieval_storage import RetrievalStorage
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     class SlowEmbedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -431,10 +428,63 @@ def test_a_recall_asks_for_its_query_embedding_before_the_sqlite_channels(tmp_pa
         instance.close()
 
 
+class _Embeddings:
+    """Records each request, and answers each text with a vector of its own; ``batched`` routes take several queries
+    in one request."""
+
+    def __init__(self, *, batched: bool):
+        self.requests: list[tuple[str, ...]] = []
+        self.vectors: dict[str, tuple[float, float]] = {}
+        if batched:
+            self.embed_queries = self._embed_queries
+
+    def _vector(self, text):
+        return self.vectors.setdefault(text, (0.1 * (len(self.vectors) + 1), 0.2))
+
+    def embed_query(self, text, *, remaining_seconds):
+        self.requests.append((text,))
+        return self._vector(text)
+
+    def _embed_queries(self, texts, *, remaining_seconds):
+        self.requests.append(tuple(texts))
+        return tuple(self._vector(text) for text in texts)
+
+
+class _VectorsSearched(_ScopedStore):
+    def search_scopes(self, vector, *, scope_ids, limit):
+        self.searches.append(tuple(vector))
+        return []
+
+
+@pytest.mark.parametrize("batched", [True, False], ids=["one-request", "one-at-a-time"])
+def test_a_question_naming_the_owner_is_embedded_both_ways_in_one_request(tmp_path, batched):
+    """A question that names the owner is searched as asked and in their first person (``core/owner_view.py``).
+    Embedded one after the other, the second waited for the first on the one persistent connection, and a recall
+    tool's 2 s left it no time (2026-10-11, a copy of the shared store: 26 of 37 questions without vectors).  A route
+    that takes several queries is asked for both at the start, in one request; one that cannot embeds the second in
+    its own search, as before."""
+    embeddings = _Embeddings(batched=batched)
+    store = _VectorsSearched()
+    instance, binding = _vector_instance(tmp_path, store, embeddings)
+    pipeline = instance.core.recall_pipeline
+    pipeline.policy = replace(pipeline.policy, owner_names=("Joy",))
+    try:
+        result = pipeline.search(replace(_search_context(binding, 5.0), query="Joy 对辣的饮食偏好是什么？"))
+        assert not [gap for gap in result.gaps if gap.startswith("vector")], result.gaps
+        asked, first = "Joy 对辣的饮食偏好是什么？", "我对辣的饮食偏好是什么？"
+        assert store.searches == [embeddings.vectors[asked], embeddings.vectors[first]], "each search its own vector"
+        if batched:
+            assert embeddings.requests == [("Joy 对辣的饮食偏好是什么？", "我对辣的饮食偏好是什么？")]
+        else:
+            assert embeddings.requests == [("Joy 对辣的饮食偏好是什么？",), ("我对辣的饮食偏好是什么？",)]
+    finally:
+        instance.close()
+
+
 def test_a_query_embedding_that_fails_while_the_table_opens_leaves_the_table_open(tmp_path):
     """Raised inside the table's open, the embedding's failure closed the helper too, and the next prompt opened the
     table cold again: the work computer's second prompt after its server restarted (2026-09-29 13:55:34)."""
-    from scope_recall.adapters.models import AuxiliaryModelError
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     class OverlapStore(_ScopedStore):
         def __init__(self):
@@ -472,7 +522,7 @@ def test_a_query_embedding_that_fails_while_the_table_opens_leaves_the_table_ope
 def test_a_vector_search_left_no_time_is_a_gap_not_an_empty_answer(tmp_path, prepared):
     """With the embedding back and no time left for the search, the port answered nothing and said nothing: the
     recall looked as if it had searched by meaning and found nothing."""
-    from scope_recall.adapters.lance import LanceVectorPort
+    from scope_recall.runtime.lance_port import LanceVectorPort
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -531,7 +581,7 @@ def test_an_embedding_back_with_no_time_left_to_search_is_a_gap(tmp_path):
 def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     """A kept handler's first prompt opened the table and read the index inside its recall; warmed when the server
     starts, that prompt finds them ready."""
-    from scope_recall.adapters.lance import physical_partition_scope_id
+    from scope_recall.runtime.lance_port import physical_partition_scope_id
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -813,10 +863,11 @@ def test_worker_empty_database_is_idle_and_concurrent_owner_is_busy(tmp_path, mo
     core = MemoryCore(CoreConfig(binding))
     core.initialize()
     lock_path = binding.data_directory / "runtime-worker.lock"
-    from scope_recall.core.file_lock import advisory_file_lock
-    from scope_recall.runtime.worker_entry import run_worker
     from concurrent.futures import ThreadPoolExecutor
     from io import StringIO
+
+    from scope_recall.core.file_lock import advisory_file_lock
+    from scope_recall.runtime.worker_entry import run_worker
 
     config_path = _write_config(tmp_path / "busy.json", _config_payload(binding, drain_seconds=0.05))
     output = StringIO()
@@ -837,6 +888,7 @@ def test_a_handed_deadline_bounds_the_lock_wait_and_the_drain(tmp_path, monkeypa
     its receipt.  The pass now ends its lock wait and drain the finalize margin
     before the deadline it was handed, and its own budget still caps it."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -877,6 +929,7 @@ def test_a_pass_handed_no_window_reports_the_timeout_without_reserving(tmp_path,
     """With less than the finalize margin left, a pass started now could only be
     killed mid-drain, or fail it; the owner's timeout is the honest receipt."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -906,6 +959,7 @@ def test_a_deadline_hit_inside_an_owned_drain_is_the_owner_timeout(tmp_path, mon
     exit 1 it would end a supervisor as failed, where the kill it replaces was a
     timeout the supervisor survives."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -937,6 +991,7 @@ def test_a_pass_its_clock_has_not_ticked_through_asks_for_no_more_than_its_budge
     before about one such pass in ten."""
     from io import StringIO
     from types import SimpleNamespace
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -977,7 +1032,7 @@ def test_worker_session_b_can_apply_evidence_backed_correction(tmp_path):
     )
     old_row = core_a.source(context_a, old.event_refs[0].ref, 1)
     assert old_row is not None
-    old_claim = core_a.accept_claim_proposals(
+    old_claim = core_a.records.accept_claim_proposals(
         context_a,
         {
             "protocol_version": "1.1",
@@ -1103,7 +1158,7 @@ def test_worker_session_b_cannot_promote_stale_proposal_past_newer_human_evidenc
     )
     old_row = core_a.source(context_a, old.event_refs[0].ref, 1)
     assert old_row is not None
-    old_claim = core_a.accept_claim_proposals(
+    old_claim = core_a.records.accept_claim_proposals(
         context_a,
         {
             "protocol_version": "1.1",
@@ -1425,9 +1480,10 @@ def test_a_rate_limited_code_stands_its_work_type_down_for_the_pass():
 
     from scope_recall.core import worker
 
-    source = inspect.getsource(worker)
-    assert 'if str(error_code or "").lower() in _RATE_LIMITED_ERRORS:' in source
+    source = inspect.getsource(worker.drain_worker)
+    assert "if _rate_limited(error_code):" in source
     assert "allowed = allowed - {item.work_type}" in source
+    assert worker._rate_limited("HTTP_429") and not worker._rate_limited(None)
 
 
 def test_the_two_stop_loss_layers_stay_distinct():
@@ -1435,8 +1491,8 @@ def test_the_two_stop_loss_layers_stay_distinct():
     down decides how many of that type are tried in one pass. Neither is an
     instance-wide brake, and a backward-looking ledger window must not become
     one."""
-    from scope_recall.core.worker import _RATE_LIMITED_ERRORS
     from scope_recall.core.work_storage import CAPACITY_REFUSALS
+    from scope_recall.core.worker import _RATE_LIMITED_ERRORS
 
     assert _RATE_LIMITED_ERRORS == CAPACITY_REFUSALS
     assert "http_429" in _RATE_LIMITED_ERRORS
@@ -1446,54 +1502,46 @@ def test_the_two_stop_loss_layers_stay_distinct():
 
 
 class _Queue:
-    def __init__(self, failed_work, work_error_counts, pending_work=0):
+    def __init__(self, failed_work, terminal_failed_work, pending_work=0):
         self.failed_work = failed_work
-        self.work_error_counts = work_error_counts
+        self.terminal_failed_work = terminal_failed_work
         self.pending_work = pending_work
         self.oldest_pending_at = None
 
 
 def _status_from(queue, *, background_gaps=(), source_only=0, gaps=()):
     """The decision `run_worker` makes after the drain, in isolation."""
-    from scope_recall.runtime.worker_entry import _is_actionable
+    from types import SimpleNamespace
 
-    terminal = sum(count for code, count in queue.work_error_counts if not _is_actionable(code))
-    actionable = max(0, queue.failed_work - terminal)
-    out = {"status": "completed", "capability_gaps": sorted(set(gaps))}
-    if actionable or background_gaps or source_only:
-        out["status"] = "degraded"
-        if actionable:
-            out["capability_gaps"] = sorted(set(tuple(gaps) + (f"work_failed:{actionable}",)))
-    elif terminal:
-        out["capability_gaps"] = sorted(set(tuple(gaps) + ("work_failed_terminal_only",)))
-    return out
+    from scope_recall.runtime.worker_entry import _apply_queue_status
+
+    payload = {"status": "completed", "capability_gaps": sorted(set(gaps)), "source_only": source_only}
+    _apply_queue_status(payload, list(gaps), queue, SimpleNamespace(idle=False), tuple(background_gaps))
+    return payload
 
 
 def test_by_design_failures_alone_do_not_make_the_worker_say_degraded():
-    """Measured on alpha: 33 items failed by design, none actionable. The
-    doctor said "attention"; this line said "degraded" with an empty gap list."""
-    status = _status_from(_Queue(33, (("derivation_invalid", 33),)))
+    """33 items failed by design and none needs a look: the doctor says "attention", and the pass names why."""
+    status = _status_from(_Queue(33, 33))
     assert status["status"] != "degraded"
     assert status["capability_gaps"] == ["work_failed_terminal_only"]
 
 
 def test_one_actionable_failure_among_many_terminal_is_still_degraded():
     """The restart that interrupts an in-flight evaluation leaves exactly this."""
-    status = _status_from(_Queue(34, (("derivation_invalid", 33), ("candidate_attempt_interrupted", 1))))
+    status = _status_from(_Queue(34, 33))
     assert status["status"] == "degraded"
     assert "work_failed:1" in status["capability_gaps"]
 
 
 def test_degraded_is_never_reported_without_a_reason():
-    """An empty gap list beside "degraded" is what sent a watcher hunting through
-    two-day-old logs for a cause that was not there."""
-    status = _status_from(_Queue(2, (("http_429", 2),)))
-    assert status["status"] == "degraded" and status["capability_gaps"]
+    """A degraded pass names its cause in the gap list a watcher reads."""
+    status = _status_from(_Queue(2, 0))
+    assert status["status"] == "degraded" and status["capability_gaps"] == ["work_failed:2"]
 
 
 def test_the_two_status_decisions_use_one_classification():
-    """rc15 fixed the pass-level decision and left this one restating the old
-    rule forty lines below it."""
+    """The pass takes the store's terminal count, the one the doctor reads, and classifies no failure itself."""
     import inspect
 
     from scope_recall.runtime import worker_entry
@@ -1501,26 +1549,14 @@ def test_the_two_status_decisions_use_one_classification():
     source = inspect.getsource(worker_entry)
     assert "if queue.failed_work or background_gaps" not in source
     assert "if actionable_failed or background_gaps" in source
-    assert source.count("_is_actionable(") >= 2
+    assert "terminal_failed = queue.terminal_failed_work" in source
 
 
 def test_a_source_only_drain_names_itself_too():
-    """The same empty-gap shape one branch over: source_only alone made the
-    status degraded and nothing in the gap list said so."""
-    from scope_recall.runtime.worker_entry import _is_actionable
-
-    queue = _Queue(0, ())
-    terminal = sum(count for code, count in queue.work_error_counts if not _is_actionable(code))
-    actionable = max(0, queue.failed_work - terminal)
-    gaps = []
-    source_only = 3
-    assert actionable == 0
-    if actionable or () or source_only:
-        if actionable:
-            gaps.append(f"work_failed:{actionable}")
-        if source_only:
-            gaps.append(f"source_only:{source_only}")
-    assert gaps == ["source_only:3"]
+    """source_only alone makes the pass degraded, and the gap list says so."""
+    status = _status_from(_Queue(0, 0), source_only=3)
+    assert status["status"] == "degraded"
+    assert status["capability_gaps"] == ["source_only:3"]
 
 
 def test_every_degraded_branch_appends_a_gap():

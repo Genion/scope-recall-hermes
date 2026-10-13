@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
-
 from scope_recall.adapters.clients import install_codex_scope_recall
 from scope_recall.adapters.runtime_wiring import write_ephemeral_worker_config
+from scope_recall.runtime import worker_launch, worker_watchdog
 from scope_recall.runtime.worker_entry import FINALIZE_MARGIN_SECONDS
 from scope_recall.runtime.worker_launch import launch_worker
-from scope_recall.runtime.worker_watchdog import KILL_GRACE_SECONDS, _OwnedWindowsJob, _kill_tree
-from scope_recall.runtime import worker_watchdog
+from scope_recall.runtime.worker_watchdog import KILL_GRACE_SECONDS, _kill_tree, _OwnedWindowsJob
 
 
 def _alive(pid: int) -> bool:
@@ -66,14 +65,11 @@ def test_owned_watchdog_kills_real_child_tree_after_abrupt_parent_exit(tmp_path:
         parent.stdin.write(b"\x01")
         parent.stdin.close()
         deadline = time.monotonic() + 5.0
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert pid_file.exists()
-        child_pid = int(pid_file.read_text(encoding="ascii"))
-        deadline = time.monotonic() + 5.0
         while parent.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         assert parent.poll() == 17
+        # The parent wrote the child's pid before it exited, so the file holds all of it now.
+        child_pid = int(pid_file.read_text(encoding="ascii"))
         _kill_tree(parent, job)
         assert parent.poll() is not None
         deadline = time.monotonic() + 5.0
@@ -471,9 +467,29 @@ def test_a_pass_that_yielded_to_another_writer_is_not_a_failed_exit(tmp_path: Pa
 
 def test_only_a_traceback_tail_is_kept_as_the_reason():
     assert (
-        worker_watchdog._failure_reason("Traceback (most recent call last):\n  File x\nKeyError: 'k'\n")
-        == "KeyError: 'k'"
+        worker_launch.failure_reason("Traceback (most recent call last):\n  File x\nKeyError: 'k'\n") == "KeyError: 'k'"
     )
-    assert worker_watchdog._failure_reason("just some chatter\n/some/path: not a reason\n") is None
-    assert worker_watchdog._failure_reason("") is None
-    assert worker_watchdog._failure_reason("RuntimeError: token sk-ant-api03-" + "A" * 40 + "\n") is None
+    assert worker_launch.failure_reason("just some chatter\n/some/path: not a reason\n") is None
+    assert worker_launch.failure_reason("") is None
+    assert worker_launch.failure_reason("RuntimeError: token sk-ant-api03-" + "A" * 40 + "\n") is None
+
+
+class _Running:
+    pid = 4321
+
+    @staticmethod
+    def poll():
+        return None
+
+
+def test_a_teardown_starts_taskkill_without_a_console_window(monkeypatch):
+    """The worker's teardown runs ``taskkill`` from a process with no console; started without ``CREATE_NO_WINDOW``
+    it got a console window of its own, which flashed on the desktop at every pass (#222)."""
+    calls = []
+    monkeypatch.setattr(worker_launch.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    worker_launch.taskkill_tree(_Running())
+    ((args, kwargs),) = calls
+    assert args[0][:2] == ["taskkill", "/PID"]
+    assert kwargs["creationflags"] == worker_launch.detached_creationflags()
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert kwargs["creationflags"] & no_window == no_window

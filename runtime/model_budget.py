@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from contextlib import closing
-from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING
 import hashlib
 import json
 import os
 import sqlite3
 import time
+from collections import Counter
+from contextlib import closing
+from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from .validation import nonneg_decimal, nonneg_int, positive_int, text
-
 
 REQUESTS_TABLE = (
     "CREATE TABLE IF NOT EXISTS requests ("
@@ -466,7 +465,7 @@ def embedding_calls(auxiliary, *, hours: float = 24, now: float | None = None) -
     """The embedding model's requests over the last ``hours``: how many, how many it answered, its refusals by code.
 
     ``None`` without an external embedding route or a readable ledger.  A backlog of embeddings beside a provider
-    that refuses most of them is the quiet way recall comes to answer by words alone (reported with #200).
+    that refuses most of them is the quiet way recall comes to answer by words alone.
     """
     ledger_path = getattr(auxiliary, "ledger_path", None)
     if auxiliary is None or ledger_path is None or not getattr(auxiliary, "external_embedding", False):
@@ -534,9 +533,9 @@ def provider_refusals(ledger_path, *, now: float | None = None) -> list[str]:
 
 #: How long a model that just refused is left alone: doubling with each refusal
 #: in a row, from a minute to half an hour, and over at the first answer.  Each
-#: pass already stood a refused work type down, but the next pass asked again at
-#: once: through a monthly spend cap Google refused every embedding for seven
-#: hours while a third instance, one instance and another instance kept asking about 5,000 times a day.
+#: pass already stands a refused work type down, but the next pass would ask
+#: again at once: through a monthly spend cap a provider can refuse every
+#: embedding for hours while the installations keep asking thousands of times a day.
 #: Half an hour between asks is still quick to notice the cap was raised.
 PROVIDER_HOLD_FIRST_SECONDS = 60.0
 PROVIDER_HOLD_LONGEST_SECONDS = 1800.0
@@ -553,7 +552,8 @@ _SAME_WAVE_NS = 1_000_000_000
 
 def _held_refusal(status: object) -> bool:
     """Whether a settled row is the provider declining to serve: capacity or account."""
-    from ..core.work_storage import ACCOUNT_REFUSALS, CAPACITY_REFUSALS
+    from ..core.failure_retry import ACCOUNT_REFUSALS
+    from ..core.work_storage import CAPACITY_REFUSALS
 
     code = str(status or "").split(":", 1)[0].split("_usage", 1)[0]
     return code in CAPACITY_REFUSALS or code in ACCOUNT_REFUSALS
@@ -638,7 +638,7 @@ def pre_request_refusals(auxiliary) -> list[str]:
 
     ``reserve`` raises before the request leaves the process, so a refused
     reservation writes no row and every ledger-based measurement, including
-    ``provider_refusals``, is blind to it.  ``adapters.models`` folds the
+    ``provider_refusals``, is blind to it.  ``runtime.models`` folds the
     refusal into ``budget_unavailable``, the worker defers the item for an hour
     without burning an attempt, and a deterministic fault (a model missing
     from ``approved_models``, a ledger file that was moved) therefore stalls

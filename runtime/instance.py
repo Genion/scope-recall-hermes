@@ -13,269 +13,39 @@ no lock and opens no store.
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, field, fields, replace
-from functools import partial
 import math
-from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Mapping
+from dataclasses import dataclass, field, replace
+from functools import partial
+from typing import Any, Callable, Mapping, Sequence
 
-from ..contracts import ContractError, InstanceBinding, Origin, TrustedContext
+from ..contracts import ContractError, TrustedContext
+from ..core.capture_filters import redact_private_paths
 from ..core.composition import CoreConfig, MemoryCore
-from ..core.storage import SQLiteStorage
-from ..core.retrieval import SearchContext
 from ..core.deadline import RequestDeadline, using_request_deadline
 from ..core.index_rebuild import IMPORT_EMBED_QUEUE_CEILING
-from .auxiliary import AuxiliaryRuntimeConfig, build_auxiliary_runtime
+from ..core.retrieval import SearchContext
+from ..core.storage import SQLiteStorage
+from ..vector.lance_native import helper_start_failure
+from ..vector.process_store import NativeVectorPathError
+from ..vector.store import build_vector_store
+from .auxiliary import build_auxiliary_runtime
+from .codex_cli import CodexCliConsolidationAdapter
 from .embedding_retry import embed_with_one_retry
+from .instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
+from .lance_port import LanceEmbedPort, LancePurgePort, LanceVectorPort, search_partitions
+from .model_budget import provider_holds
+from .models import AuxiliaryModelError
 from .running_code import record_running_code
 from .validation import (
-    absolute_path,
-    identifier,
-    mapping,
-    member,
-    strict_bool,
     strict_float,
-    strict_int,
     utc_now,
 )
 from .vector_retention import expire_if_due
 from .vector_upkeep import backfill_if_due, compact_if_due, index_if_due, respace_if_due
-
-
-_RUNTIME_ORIGINS: frozenset[Origin] = frozenset({"human_direct", "tool_observation", "external_document", "imported"})
-#: Claude Code runs the Codex adapter as an entry of a shared store (``adapters/clients/config.py``).
-_HOST_ADAPTERS = frozenset({"hermes", "codex", "claude-code", "workbuddy", "dsh"})
-_VECTOR_BACKENDS = frozenset({"lancedb", "sqlite-bruteforce"})
-
-
-@dataclass(frozen=True)
-class VectorRuntimeConfig:
-    backend: str
-    storage_dir: Path
-    table_name: str
-    dimensions: int
-    metric: str = "cosine"
-    #: Low-dimensional stores are permitted only for an explicitly injected
-    #: test seam; formal configuration is fixed to the approved embedding space.
-    test_injection_override: bool = False
-    #: Days a tool output's vector is kept after its source entered the store;
-    #: 0 keeps every vector (``runtime/vector_retention.py``).  The text, the
-    #: lexical index and everything derived from the source are never expired.
-    tool_output_retention_days: int = 180
-
-    def __post_init__(self) -> None:
-        member("vector_backend", self.backend, _VECTOR_BACKENDS)
-        if not self.storage_dir.is_absolute():
-            raise ValueError("vector_storage_dir_must_be_absolute")
-        identifier("vector_table_name", self.table_name)
-        strict_int("vector_dimensions", self.dimensions, minimum=1, maximum=8192)
-        member("vector_metric", self.metric, ("cosine",))
-        strict_bool("vector_test_injection_override", self.test_injection_override)
-        strict_int("vector_tool_output_retention_days", self.tool_output_retention_days, minimum=0, maximum=36500)
-
-    @classmethod
-    def from_mapping(cls, raw: object) -> "VectorRuntimeConfig":
-        raw = mapping("vector_mapping_required", raw)
-        return cls(
-            backend=raw.get("backend", "lancedb"),
-            storage_dir=absolute_path("vector_storage_dir", raw.get("storage_dir")),
-            table_name=raw.get("table_name"),
-            dimensions=raw.get("dimensions"),
-            metric=raw.get("metric", "cosine"),
-            test_injection_override=raw.get("test_injection_override", False),
-            tool_output_retention_days=raw.get("tool_output_retention_days", 180),
-        )
-
-
-#: Closed bounds per field.  Seconds accept ``int`` or ``float``; counts reject ``bool``.
-_SECONDS_BOUNDS = {
-    "request_seconds": (0.001, 45.0),
-    "drain_seconds": (0.001, 120.0),
-    "auto_recall_seconds": (0.001, 5.0),
-    "hook_processing_seconds": (0.001, 6.0),
-    "auto_retry_cooldown_seconds": (60, 86400),
-    "worker_min_interval_seconds": (1, 3600),
-    "supervisor_seconds": (1, 86400),
-}
-_COUNT_BOUNDS = {
-    # A pass's own bound, matching the core's (``core/worker.py``: 1..1000).  Held
-    # at 32 while every embedding was its own request and every vector its own
-    # commit; now that a group shares both, what a bigger pass amortises is the
-    # cost of starting a pass at all -- measured at 8 of the 18 seconds a pass of
-    # two hundred took.  Model-bound work keeps its own per-pass bounds
-    # (``candidate_batch_limit``, and the deadline for consolidation), so this
-    # number decides how much cheap work shares one start, not how much money one
-    # pass may spend.
-    "max_items": (1, 1000),
-    "daily_work_limit": (0, 1_000_000),
-    "max_auto_recoveries": (0, 4),
-    "supervisor_max_drains": (1, 1024),
-    "storage_budget_bytes": (0, 1 << 50),
-}
-#: Fields assembled from nested mappings rather than copied from the top level.
-_COMPOSED_FIELDS = frozenset({"binding", "allowed_scope_ids", "auxiliary", "vector"})
-#: ``resident_recall_minutes``: none kept, up to a day.
-RESIDENT_RECALL_MINUTES_BOUNDS = (0, 1440)
-
-
-@dataclass(frozen=True)
-class RuntimeInstanceConfig:
-    binding: InstanceBinding
-    session_id: str
-    allowed_scope_ids: frozenset[str]
-    actor_origin: Origin = "human_direct"
-    project_id: str | None = None
-    branch_id: str | None = None
-    host_adapter: str | None = None
-    owner_id: str = "scope-recall-worker"
-    request_seconds: float = 45.0
-    drain_seconds: float = 120.0
-    auto_recall_seconds: float = 5.0
-    hook_processing_seconds: float = 6.0
-    max_items: int = 32
-    lease_seconds: float = 60.0
-    auxiliary: AuxiliaryRuntimeConfig | None = None
-    vector: VectorRuntimeConfig | None = None
-    vector_threshold: float | None = None
-    #: Queue items a day may attempt; 0 means no cap.  This is not the spend
-    #: guard: money, calls and tokens are governed by the auxiliary ledger
-    #: (``runtime/model_budget.py``) before every request.  A cap below the
-    #: arrival rate is not conservative, it is a permanent leak.  Measured on a
-    #: 3.1 instance: 1.4 work items per captured source (an embed and, for
-    #: most, a consolidation) plus 1.2 evaluations per candidate, so even the
-    #: old 256 default could not drain a busy day's output.
-    daily_work_limit: int = 0
-    auto_retry_cooldown_seconds: float = 3600.0
-    max_auto_recoveries: int = 2
-    worker_min_interval_seconds: float = 30.0
-    supervisor_enabled: bool = True
-    supervisor_seconds: float = 21600.0
-    supervisor_max_drains: int = 256
-    #: Bytes the store and its vectors may occupy before the doctor reports
-    #: ``storage_budget_exceeded``; 0 sets no budget.  Nothing is deleted for it.
-    storage_budget_bytes: int = 0
-    #: Minutes the resident prompt recall server of a client attached to a shared store stays up without a recall
-    #: (``adapters/clients/resident_entry``); 0 keeps none.  Unset, the client's default applies
-    #: (``adapters/clients/local_endpoint.RESIDENT_DEFAULT_MINUTES``).
-    resident_recall_minutes: int | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.binding, InstanceBinding):
-            raise ValueError("binding")
-        identifier("session_id", self.session_id)
-        if (
-            type(self.allowed_scope_ids) is not frozenset
-            or not self.allowed_scope_ids
-            or not self.allowed_scope_ids <= self.binding.scope_ids
-        ):
-            raise ContractError("ACCESS_DENIED")
-        member("actor_origin", self.actor_origin, _RUNTIME_ORIGINS)
-        identifier("project_id", self.project_id, required=False)
-        identifier("branch_id", self.branch_id, required=False)
-        if self.host_adapter is not None:
-            member("host_adapter", self.host_adapter, _HOST_ADAPTERS)
-        identifier("owner_id", self.owner_id)
-        for name, (low, high) in _SECONDS_BOUNDS.items():
-            strict_float(name, getattr(self, name), minimum=low, maximum=high)
-        for name, (low, high) in _COUNT_BOUNDS.items():
-            strict_int(name, getattr(self, name), minimum=low, maximum=high)
-        strict_bool("supervisor_enabled", self.supervisor_enabled)
-        if self.resident_recall_minutes is not None:
-            low, high = RESIDENT_RECALL_MINUTES_BOUNDS
-            strict_int("resident_recall_minutes", self.resident_recall_minutes, minimum=low, maximum=high)
-        if self.hook_processing_seconds < self.auto_recall_seconds:
-            raise ValueError("hook_processing_seconds_must_cover_auto_recall")
-        strict_float("lease_seconds", self.lease_seconds, minimum=self.request_seconds, maximum=3600.0)
-        # The policy ``build_runtime_instance`` constructs, checked while the
-        # config loads: a bad threshold, or an embedding route that describes no
-        # valid space, is an invalid configuration rather than a failed build.
-        self.recall_policy()
-        self._check_vector_binding()
-
-    def _check_vector_binding(self) -> None:
-        vector = self.vector
-        if vector is None:
-            return
-        if vector.test_injection_override:
-            if not self.binding.test_mode:
-                raise ContractError("VECTOR_TEST_OVERRIDE_FORBIDDEN")
-            return
-        if vector.dimensions != self.embedding_space()["dimensions"]:
-            raise ContractError("VECTOR_DIMENSIONS_MISMATCH")
-        expected_root = (self.binding.data_directory / "vectors" / self.embedding_space_id()).resolve()
-        if vector.storage_dir.resolve() != expected_root:
-            raise ContractError("VECTOR_STORAGE_OUTSIDE_BINDING")
-
-    def embedding_space(self) -> dict:
-        """The embedding space this instance uses; the shipped default when no route names one."""
-        from ..core.recall_policy import EMBEDDING_SPACE
-
-        route = getattr(self.auxiliary, "embedding", None) if self.auxiliary is not None else None
-        return route.space() if route is not None else dict(EMBEDDING_SPACE)
-
-    def embedding_space_id(self) -> str:
-        """Digest of the active space, which is also the vector directory name.
-
-        Naming a different model changes this, which moves the store and refuses
-        the old vectors rather than comparing across incompatible geometries.
-        """
-        from ..core.recall_policy import embedding_space_id
-
-        return embedding_space_id(self.embedding_space())
-
-    def recall_policy(self):
-        """The admission policy recall runs with, bound to this instance's embedding space.
-
-        The vector ports search partitions of, and stamp candidates with,
-        ``embedding_space_id()``.  Admission has to compare against that same
-        digest; against the shipped default every hit of a named route is refused.
-        """
-        from ..core.recall_policy import RecallPolicy
-
-        return RecallPolicy(vector_threshold=self.vector_threshold, embedding_space_id=self.embedding_space_id())
-
-    @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any]) -> "RuntimeInstanceConfig":
-        raw = mapping("runtime_config_mapping_required", raw)
-        binding_raw = mapping("binding_mapping_required", raw.get("binding"))
-        binding = InstanceBinding(
-            agent_id=identifier("agent_id", binding_raw.get("agent_id")),
-            installation_id=identifier("installation_id", binding_raw.get("installation_id")),
-            data_directory=absolute_path("data_directory", binding_raw.get("data_directory")),
-            scope_ids=frozenset(binding_raw.get("scope_ids") or ()),
-            test_mode=binding_raw.get("test_mode", False),
-            installation_kind=binding_raw.get("installation_kind", "local"),
-        )
-        aux_raw = raw.get("auxiliary")
-        if aux_raw is None:
-            aux_raw = {"external_embedding": False, "external_consolidation": False}
-        vector_raw = raw.get("vector")
-        plain = {
-            item.name: raw.get(item.name, None if item.default is MISSING else item.default)
-            for item in fields(cls)
-            if item.name not in _COMPOSED_FIELDS
-        }
-        return cls(
-            binding=binding,
-            allowed_scope_ids=frozenset(raw.get("allowed_scope_ids") or ()),
-            auxiliary=AuxiliaryRuntimeConfig.from_mapping(aux_raw),
-            vector=None if vector_raw is None else VectorRuntimeConfig.from_mapping(vector_raw),
-            **plain,
-        )
-
-    def context(self) -> TrustedContext:
-        return TrustedContext(
-            binding=self.binding,
-            session_id=self.session_id,
-            allowed_scope_ids=self.allowed_scope_ids,
-            actor_origin=self.actor_origin,
-            project_id=self.project_id,
-            branch_id=self.branch_id,
-        )
-
+from .worker_launch import failure_reason
 
 #: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
 #: vector search's own: an embedding that took all of it would leave the search nothing.
@@ -283,23 +53,27 @@ QUERY_EMBEDDING_SHARE = 0.7
 
 
 class _QueryEmbedding:
-    """One query's embedding, asked for when its recall starts instead of after the SQLite channels.
+    """A recall's query embeddings, asked for when it starts instead of after the SQLite channels.
 
     Behind the exact, lexical, claim and recent channels the embedding had three quarters of what they left, about
     2.2 s of a prompt's 4 s window: enough on a warm connection, not for the new one a prompt more than 30 s after the
-    last needs (the proxy's tunnel, TLS, then the provider).  On 2026-09-29 the work computer's server recalled 4 of 9
-    prompts by words alone that way (``AuxiliaryModelError:timeout``), and the owner's own prompts after a pause did
-    too.  Asked for as the recall starts, it runs beside those channels with its share of the whole window.
+    last needs (the proxy's tunnel, TLS, then the provider): measured, a remote client's server recalled 4 of 9
+    prompts by words alone that way (``AuxiliaryModelError:timeout``).  Asked for as the recall starts, it runs beside
+    those channels with its share of the whole window.
+
+    ``queries`` is the question and the other ways recall reads it (``core/owner_view.py``), embedded in one request:
+    one after the other, the second waited for the first on the one persistent connection.
     """
 
-    def __init__(self, query: str, deadline: float) -> None:
-        self.query = query
+    def __init__(self, queries: tuple[str, ...], deadline: float) -> None:
+        self.queries = queries
+        self.query = queries[0]
         self.deadline = deadline
         self._done = threading.Event()
-        self._vector: Any = None
+        self._vectors: tuple[Any, ...] = ()
         self._error: BaseException | None = None
 
-    def run(self, embed: Callable[[str, float], Any]) -> None:
+    def run(self, embed: Callable[[tuple[str, ...], float], Sequence[Any]]) -> None:
         try:
             deadline = RequestDeadline.from_absolute(self.deadline, now=time.monotonic())
             with using_request_deadline(deadline):
@@ -308,23 +82,34 @@ class _QueryEmbedding:
                     raise TimeoutError("query embedding stage deadline exhausted")
                 # A connection that failed in milliseconds costs the whole
                 # semantic channel otherwise; a rejected request is not retried.
-                self._vector = embed_with_one_retry(
-                    lambda seconds: embed(self.query, seconds), budget_seconds=budget, remaining=deadline.remaining
+                vectors = tuple(
+                    embed_with_one_retry(
+                        lambda seconds: embed(self.queries, seconds),
+                        budget_seconds=budget,
+                        remaining=deadline.remaining,
+                    )
                 )
+                if len(vectors) != len(self.queries):
+                    raise AuxiliaryModelError("unsupported_response_shape")
+                self._vectors = vectors
         except BaseException as exc:  # the recall that waits for it reports it
             self._error = exc
         finally:
             self._done.set()
 
-    def result(self, deadline: float) -> Any:
-        """The vector; the embedding's own failure; a timeout if it is still out at ``deadline``."""
+    def result(self, deadline: float, query: str | None = None) -> Any:
+        """The vector of ``query`` (the question's own by default); the embedding's own failure; a timeout if it is
+        still out at ``deadline``."""
         if not self._done.wait(max(0.0, deadline - time.monotonic())):
-            from ..adapters.models import AuxiliaryModelError
-
             raise AuxiliaryModelError("timeout")
         if self._error is not None:
             raise self._error
-        return self._vector
+        return self._vectors[self.queries.index(self.query if query is None else query)]
+
+
+def _taken(prefetched: Any, deadline: float, query: str) -> Any:
+    """The vector asked for early for ``query``; one asked for the question alone answers ``result(deadline)``."""
+    return prefetched.result(deadline) if query == prefetched.query else prefetched.result(deadline, query)
 
 
 class _LazyVectorPort:
@@ -340,28 +125,37 @@ class _LazyVectorPort:
     def __init__(self, instance: "RuntimeInstance") -> None:
         self._instance = instance
 
-    def _query_embedder(self) -> Callable[[str, float], Any] | None:
-        from ..adapters.lance import LanceVectorPort
-
+    def _embedding_adapter(self) -> LanceVectorPort | None:
         embedding = getattr(self._instance.auxiliary, "query_embedding", None)
         if embedding is None:
             return None
-        adapter = LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
-        return adapter._embed_query
+        return LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
 
-    def prefetch_query(self, context: SearchContext) -> _QueryEmbedding | None:
-        """Ask for the query's embedding now, beside the SQLite channels; ``search`` takes it from there."""
+    def _query_embedder(self) -> Callable[[str, float], Any] | None:
+        adapter = self._embedding_adapter()
+        return None if adapter is None else adapter._embed_query
+
+    def prefetch_query(self, context: SearchContext, *, also: tuple[str, ...] = ()) -> _QueryEmbedding | None:
+        """Ask for the query's embedding now, beside the SQLite channels; ``search`` takes it from there.  ``also``
+        are other ways the recall reads the question, embedded in the same request where the route can send several;
+        where it cannot, each is embedded in its own search."""
         if not isinstance(context, SearchContext) or self._instance.config.vector is None:
             return None
-        embed = self._query_embedder()
-        if embed is None:
+        adapter = self._embedding_adapter()
+        if adapter is None:
             return None
         now = time.monotonic()
         window = context.deadline - now
         if window <= 0.0:
             return None
-        pending = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
-        threading.Thread(target=pending.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
+        queries = tuple(dict.fromkeys((context.query, *also)))
+        many = adapter._queries_embedder() if len(queries) > 1 else None
+        if many is None:
+            queries = queries[:1]
+            one = adapter._embed_query
+            many = lambda texts, seconds: (one(texts[0], seconds),)  # noqa: E731
+        pending = _QueryEmbedding(queries, now + window * QUERY_EMBEDDING_SHARE)
+        threading.Thread(target=pending.run, args=(many,), name="scope-recall-query-embedding", daemon=True).start()
         return pending
 
     def search(
@@ -373,7 +167,7 @@ class _LazyVectorPort:
             raise ValueError("limit must be between 1 and 200")
         if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)):
             raise ValueError("remaining_seconds must be finite")
-        if prefetched is not None and prefetched.query != context.query:
+        if prefetched is not None and context.query not in getattr(prefetched, "queries", (prefetched.query,)):
             prefetched = None
         now = time.monotonic()
         remaining = min(float(remaining_seconds), context.deadline - now)
@@ -391,7 +185,7 @@ class _LazyVectorPort:
             # come and parked for the next request if not, so a fast failure does not wait for the table either.
             try:
                 if prefetched is not None:
-                    prepared.append((context.query, prefetched.result(effective_deadline)))
+                    prepared.append((context.query, _taken(prefetched, effective_deadline, context.query)))
                     return True
                 embed = self._query_embedder()
                 if embed is None:
@@ -428,7 +222,7 @@ class _LazyVectorPort:
                 # and reported no gap; Claude Code and Codex lost their vector search this way unseen.
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
-                prepared.append((context.query, prefetched.result(effective_deadline)))
+                prepared.append((context.query, _taken(prefetched, effective_deadline, context.query)))
             remaining = min(remaining, deadline.remaining())
             if remaining <= 0.0:
                 # The embedding came back with no time left to search: the search would return nothing and say
@@ -466,20 +260,18 @@ def _close_quietly(resource: Any) -> None:
 def _helper_start_failure(deadline: float) -> str | None:
     """One line saying why the vector helper could not start, from its start-up run once more; or ``None``.
 
-    The helper's stderr is discarded.  On Hermes Desktop it died at ``import jsonschema`` and every pass reported
-    ``vector_unavailable:RuntimeError`` and nothing else (#176).  The run is sent no request, so it holds no memory
+    The helper's stderr is discarded, so a helper that dies at an import (as on Hermes Desktop, at ``import
+    jsonschema``) would leave every pass reporting ``vector_unavailable:RuntimeError`` and nothing else.  The run is
+    sent no request, so it holds no memory
     text; the line is the last of its traceback, chosen as the watchdog chooses a worker's, paths redacted.  It
     takes at most a quarter of what is left of the pass.
     """
     timeout = (deadline - time.monotonic()) / 4
     if timeout < 1.0:
         return None
-    from ..core.capture_filters import redact_private_paths
-    from ..vector.lance_native import helper_start_failure
-    from .worker_watchdog import _failure_reason
 
     stderr = helper_start_failure(timeout)
-    line = _failure_reason(stderr) if stderr else None
+    line = failure_reason(stderr) if stderr else None
     return redact_private_paths(line)[:200] if line else None
 
 
@@ -566,13 +358,12 @@ class RuntimeInstance:
             trusted = self.config.context()
             if not callable(search_scopes) or not trusted.allowed_scope_ids:
                 return True
-            from ..adapters.lance import search_partitions
 
-            # Every partition a recall of this runtime filters on (adapters/lance.py ``_partition_hits``).  The first
+            # Every partition a recall of this runtime filters on (``lance_port._partition_hits``).  The first
             # search of an index reads all of it into the helper's cache whatever the filter; after that a search
             # touches only the codes of the rows its filter keeps.  Filtered on the first scope's partition, which
             # held no rows for any entry of the shared store, the search touched 26 MB of the 306 MB the next recall
-            # paged back in once the helper's memory was trimmed (review of 3.5.0rc2).  What it finds is not looked at.
+            # paged back in once the helper's memory was trimmed.  What it finds is not looked at.
             search_scopes(
                 [1.0] + [0.0] * (self.config.vector.dimensions - 1),
                 scope_ids=list(search_partitions(trusted, self.config.embedding_space_id())),
@@ -585,8 +376,8 @@ class RuntimeInstance:
         worker and its connection.
 
         Warming the vector store alone left them to the first recall: a WorkBuddy entry's server, started cold, lost
-        the vector search of its first two recalls to the embedding's time (``AuxiliaryModelError:timeout``, measured
-        2026-10-03) and answered with it from the third, 12.7 s after its start.  The text is fixed and nothing of what
+        the vector search of its first two recalls to the embedding's time (``AuxiliaryModelError:timeout``, measured)
+        and answered with it from the third, 12.7 s after its start.  The text is fixed and nothing of what
         comes back is kept; it writes nothing."""
         self._ensure_open()
         if self.config.vector is None:
@@ -609,8 +400,6 @@ class RuntimeInstance:
         partitioned native queries; the raw store is never exposed as one.
         Purge is a local native operation and stays available even when both
         embedding routes are disabled."""
-        from ..adapters.lance import LanceEmbedPort, LancePurgePort, LanceVectorPort
-
         binding = self.config.binding
         space_id = self.config.embedding_space_id()
         port = None
@@ -706,8 +495,7 @@ class RuntimeInstance:
                 available_seconds=max(0.0, deadline - time.monotonic()),
             )
         )
-        from ..core.worker import WorkerConfig, drain_worker
-        from .model_budget import provider_holds
+        from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)
         self.provider_holds = {} if purge_only else provider_holds(self.config.auxiliary)
@@ -781,6 +569,7 @@ class RuntimeInstance:
 
     def _replay_ingress(self, budget: float) -> tuple[str, ...]:
         """Persist captured inbox payloads.  Ingress never spends the model-work budget."""
+        # On first use: the worker and the wake start without the inbox's replay.
         from ..core.capture_inbox import INGRESS_PENDING_GAP, replay_inbox, resolve_conflicted_ingress
 
         self.ingress_receipts = ()
@@ -838,8 +627,7 @@ class RuntimeInstance:
         try:
             self._ensure_vector_port(allow_create=True, deadline=vector_deadline)
         except Exception as exc:
-            from ..core.vector_failure import vector_failure_label
-            from ..vector.process_store import NativeVectorPathError
+            from ..core.vector_failure import vector_failure_label  # only when the vector store fails to open
 
             if isinstance(exc, NativeVectorPathError):
                 return (NativeVectorPathError.code,)
@@ -855,8 +643,7 @@ class RuntimeInstance:
         """The pass's bounded consolidation model and, when it offers one, candidate evaluator."""
         model = consolidation
         if model is None:
-            from ..adapters.codex_cli import CodexCliConsolidationAdapter
-            from ..core.worker import build_consolidation_model
+            from ..core.worker import build_consolidation_model  # only a process that drains loads the worker
 
             port = self.core.consolidation
             # One CLI allowance is shared by consolidation and candidate
@@ -913,8 +700,6 @@ class RuntimeInstance:
 
 def default_vector_factory(config: VectorRuntimeConfig) -> Any:
     """Build an existing-companion store without opening or creating it."""
-    from ..vector.store import build_vector_store
-
     return build_vector_store(
         config.backend,
         storage_dir=config.storage_dir,
@@ -968,8 +753,7 @@ class _BoundedEmbed(_Bounded):
     # and publish_source, and each has to be listed here or the worker probes
     # for it, does not find it through this wrapper, and falls back to one
     # document per request and one commit per vector as if the capability did
-    # not exist.  That is exactly how rc40's batching reached production doing
-    # nothing.
+    # not exist, silently.
     methods = (
         "prepare_source",
         "prepare_sources",
@@ -1007,6 +791,9 @@ def build_runtime_instance(
     # A shared store's inbox holds its Hermes entries' captures, whichever
     # process replays them; each is checked against the entry that made it.
     if config.host_adapter == "hermes" or config.binding.installation_kind == "shared":
+        # The worker checks a replayed capture against the host's current installation map, which is the host
+        # adapters' identity code: the one import from runtime up into adapters, kept to the call (it would add
+        # about twenty modules to every worker start).
         from ..adapters.hermes.authorization import build_ingress_authorizer
 
         ingress_authorizer = build_ingress_authorizer(config.binding)

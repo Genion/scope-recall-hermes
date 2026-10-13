@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 
 from ..contracts import ContractError
 from . import lineage
@@ -19,6 +19,7 @@ from .episodes import (
     state_from_sources,
     supported_work_goal,
 )
+from .resume_compaction import resume_evidence_refs
 from .visibility import allowed, allowed_refs
 
 #: A proof whose capture the episode does not hold.
@@ -48,8 +49,6 @@ class Episode:
 
 def _cited_pairs(resume) -> tuple[tuple[str, int], ...]:
     """The source versions a resume cites, once each, in document order."""
-    from .resume_compaction import resume_evidence_refs
-
     pairs = []
     for ref in dict.fromkeys(resume_evidence_refs(resume)):
         try:
@@ -284,9 +283,9 @@ class Episodes:
             return
         series, kind = self._series_for(source)
         segment_index = self._segment_index(series)
-        # A task names its series outright, so a later source of a task whose episode was deleted landed on the
-        # deleted episode and was refused with it: on the pilot every capture after a delete in that Codex thread
-        # failed for good (2026-09-28).  The task goes on in the next segment, a new episode that carries nothing
+        # A task names its series outright, so a later source of a task whose episode was deleted would land on the
+        # deleted episode and be refused with it: every capture after a delete in that thread would fail for good.
+        # The task goes on in the next segment, a new episode that carries nothing
         # of the deleted one.  A session's series already skips a blocked episode (``_series_for``).
         for _ in range(_BLOCKED_SEGMENTS):
             anchor = hashlib.sha256(canonical([series, segment_index]).encode()).hexdigest()
@@ -367,15 +366,7 @@ class Episodes:
 
     def _resume_sources(self, proposal, scope_id):
         """Resolve the cited sources and the single live episode they all belong to."""
-        ctx = self.tx.context
-        sources = [self.tx.source(*parse_source_ref(ref)) for ref in proposal["evidence_refs"]]
-        if any(
-            s is None or (s.scope_id, s.project_id, s.branch_id) != (scope_id, ctx.project_id, ctx.branch_id)
-            for s in sources
-        ):
-            raise ContractError("SOURCE_MISSING")
-        for source in sources:
-            self.tx.claims.require_live_source(source.ref, source.revision)
+        sources = self.tx.claims.live_sources(proposal["evidence_refs"], scope_id)
         episodes: set[str] = set()
         for source in sources:
             episode = self.source_episode(source.ref, source.revision)

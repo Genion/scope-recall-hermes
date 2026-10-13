@@ -7,24 +7,18 @@ route is used; both embedding ports are deterministic TEST dependencies.
 
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib.util
-from pathlib import Path
 import sqlite3
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
-
 from scope_recall.contracts import InstanceBinding, TrustedContext
 from scope_recall.core.recall_policy import RecallPolicy
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
-from scope_recall.runtime.instance import (
-    RuntimeInstanceConfig,
-    VectorRuntimeConfig,
-    build_runtime_instance,
-    default_vector_factory,
-)
+from scope_recall.runtime.instance import build_runtime_instance, default_vector_factory
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 from v11_support import source_event
-
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("lancedb") is None,
@@ -189,6 +183,12 @@ def test_a_drain_s_backfill_makes_room_only_for_evaluations_the_pass_would_take(
         instance.drain(consolidation=Evaluator(), purge_only=True, max_items=8)
         monkeypatch.setattr(
             model_budget,
+            "provider_holds",
+            lambda auxiliary: {"evaluate_candidate": ("TEST-model", "2999-01-01T00:00:00Z")},
+        )
+        # runtime.instance takes provider_holds at import.
+        monkeypatch.setattr(
+            instance_module,
             "provider_holds",
             lambda auxiliary: {"evaluate_candidate": ("TEST-model", "2999-01-01T00:00:00Z")},
         )

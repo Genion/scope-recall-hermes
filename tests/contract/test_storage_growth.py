@@ -5,14 +5,14 @@ sources a day: the copy-forward of episode evidence links produced a hundred
 thousand rows for eight episodes in one day, quadratic in the segment length.
 """
 
-from dataclasses import replace
 import sqlite3
+from dataclasses import replace
 
 from scope_recall.core.episodes import source_watermark
 from scope_recall.core.retrieval import CandidateRef
 from scope_recall.core.schema import SCHEMA_VERSION
-from test_v11_claims import app, capture
-from test_v11_episodes import apply, artifact, ref, resume
+from test_claims import app, capture
+from test_episodes import apply, artifact, ref, resume
 from v11_support import downgrade_store
 
 

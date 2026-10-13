@@ -7,14 +7,12 @@ the refused work type down, and the next pass asked again at once.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
-from scope_recall.adapters.models import AuxiliaryModelError
 from scope_recall.runtime.auxiliary import build_auxiliary_runtime
 from scope_recall.runtime.model_budget import (
     PROVIDER_HOLD_FIRST_SECONDS,
@@ -23,10 +21,12 @@ from scope_recall.runtime.model_budget import (
     provider_hold_until,
     provider_holds,
 )
+from scope_recall.runtime.models import AuxiliaryModelError
+
+from tests.contract.test_claims import app, capture  # noqa: F401  (fixture)
 from tests.contract.test_finite_supervisor import NOW, fixture, queue
 from tests.contract.test_runtime_auxiliary import FakeTransport, _runtime_config, _vector
-from tests.contract.test_v11_claims import app, capture  # noqa: F401  (fixture)
-from tests.contract.test_v11_worker import worker_app  # noqa: F401  (fixture)
+from tests.contract.test_worker import worker_app  # noqa: F401  (fixture)
 
 REFUSED = "http_429_usage_unknown_reserved_charge_retained"
 
@@ -206,10 +206,15 @@ def test_the_planner_sleeps_held_work_until_its_hold_ends(tmp_path, monkeypatch)
         "scope_recall.runtime.model_budget.provider_holds",
         lambda auxiliary, *, now=None: {"rebuild_projection": ("TEST-model", ends.timestamp())},
     )
+    monkeypatch.setattr(
+        "scope_recall.runtime.scheduling.provider_holds",
+        lambda auxiliary, *, now=None: {"rebuild_projection": ("TEST-model", ends.timestamp())},
+    )
     from scope_recall.runtime.scheduling import next_wake
 
     plan = next_wake(cfg, now=NOW)
     assert plan.due_at == ends.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     assert plan.reason == "capability_cooldown"
     monkeypatch.setattr("scope_recall.runtime.model_budget.provider_holds", lambda auxiliary, *, now=None: {})
+    monkeypatch.setattr("scope_recall.runtime.scheduling.provider_holds", lambda auxiliary, *, now=None: {})
     assert next_wake(cfg, now=NOW).due_at == "2026-09-12T00:00:00Z"

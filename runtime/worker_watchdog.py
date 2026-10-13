@@ -3,31 +3,29 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from contextlib import redirect_stdout
-from io import StringIO
 import json
 import os
-from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
 
+from .scheduling import supervise
 from .validation import utc_now
 from .worker_entry import load_config, persist_worker_status
 from .worker_launch import (
     detached_creationflags,
+    failure_reason,
     is_ephemeral_worker_config,
     reap_process,
     taskkill_tree,
     validate_wake_arguments,
 )
-
-#: ``ExceptionClass: message`` -- the last line of a traceback, and nothing else.
-_TRACEBACK_TAIL = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt)\b.*")
 
 #: Seconds an owned child may outlive the deadline it was handed.  A child that
 #: honours that deadline has already written its receipt and exited; one still
@@ -301,22 +299,6 @@ def _wait_for_exit(child: subprocess.Popen[str], deadline: float) -> bool:
     return True
 
 
-def _failure_reason(stderr: str) -> str | None:
-    """The one line of a child's stderr that names why it died, or None.
-
-    Only the last line of a Python traceback qualifies (``ModuleNotFoundError:
-    No module named 'scope_recall'``): bounded, no paths, no model text.  A
-    line that looks like a credential is dropped rather than recorded.
-    """
-    from ..core.secret_patterns import contains_secret_like_text
-
-    for line in reversed(stderr.splitlines()):
-        line = line.strip()
-        if _TRACEBACK_TAIL.match(line) and not contains_secret_like_text(line):
-            return line[:200]
-    return None
-
-
 def _relay_output(stdout: str, stderr: str, result_sink: dict | None) -> None:
     if result_sink is not None and stdout.strip():
         try:
@@ -403,7 +385,7 @@ def _run_once(
                 "owner_id": config.owner_id,
                 "installation_id": config.binding.installation_id,
             }
-            reason = _failure_reason(output.collect(timeout=1.0)[1])
+            reason = failure_reason(output.collect(timeout=1.0)[1])
             if reason:
                 payload["worker_error"] = reason
             return report(payload, 124)
@@ -416,9 +398,9 @@ def _run_once(
         _relay_output(stdout, stderr, result_sink)
         if child.returncode and not stdout.strip():
             # A child that died before its receipt is otherwise a bare exit
-            # code; the reason it printed is the only diagnosis there is (#87).
+            # code; the reason it printed is the only diagnosis there is.
             failure = {"status": "degraded", "capability_gaps": ["worker_process_failed"]}
-            reason = _failure_reason(stderr)
+            reason = failure_reason(stderr)
             if reason:
                 failure["worker_error"] = reason
             save(failure, int(child.returncode))
@@ -450,7 +432,6 @@ def run(
                 config_path, python_executable, cleanup_config=False, after_pid=after_pid, delay_seconds=delay_seconds
             )
         validate_wake_arguments(after_pid, delay_seconds)
-        from .scheduling import supervise
 
         predecessor = after_pid
         latest = {}
@@ -510,8 +491,8 @@ def main(argv: list[str] | None = None) -> int:
     # The interpreter is executed exactly as given.  Resolving it follows a
     # venv's bin/python symlink to the base interpreter, which then starts
     # without the venv on sys.path and cannot import the package it was asked
-    # to run (#87); Windows venvs copy the interpreter, which is why only POSIX
-    # installs saw it.
+    # to run; Windows venvs copy the interpreter, so only POSIX installs meet
+    # this.
     python_executable = python_raw
     if os.name != "nt":
         # WorkerProcess.terminate() signals the watchdog's process group.

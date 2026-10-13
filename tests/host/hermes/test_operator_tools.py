@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 import subprocess
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
 from scope_recall.adapters.hermes.installation import _build_audience_scope_ids
@@ -91,9 +91,9 @@ def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
         "resume_proposals": [],
         "reference_proposals": [],
     }
-    claim = core.accept_claim_proposals(context, proposal, scope_id=identity.local_scope_id, remaining_seconds=5).items[
-        0
-    ]
+    claim = core.records.accept_claim_proposals(
+        context, proposal, scope_id=identity.local_scope_id, remaining_seconds=5
+    ).items[0]
 
     provider.observe_pre_llm(
         session_id="TEST-session-1",

@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 import hashlib
 import json
 import re
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from datetime import datetime
 
-from ..contracts import Basis, ClaimProposal, ContractError, Origin, SourcePrincipal
+from ..contracts import (
+    Basis,
+    ClaimProposal,
+    ContractError,
+    Origin,
+    SourcePrincipal,
+    utc_timestamp,
+    verified_human_principal_ref,
+)
+from .candidate_lifecycle import SELF_SUBJECTS
 from .fact_actions import ClaimDraft, EvidenceReference
 from .fact_evidence import evidence_supports_claim, evidence_supports_relation
 from .fact_temporal_semantics import classify_durable_state_clause
-from .subject_binding import neighbourhood_binds
 from .source_qualification import (
     AUTHORITY_QUESTION,
     RELATIVE_SCOPE,
@@ -22,10 +30,12 @@ from .source_qualification import (
     asserted_marker,
     bound_literal,
     condition_supports_value,
+    in_pasted_text,
     is_transient_request,
     preserves_qualifiers,
     self_report_bound,
 )
+from .subject_binding import neighbourhood_binds
 
 
 @dataclass(frozen=True)
@@ -72,17 +82,7 @@ class ClaimVersion:
 
 
 def canonical_time(value: str | None) -> str | None:
-    if value is None:
-        return None
-    if type(value) is not str:
-        raise ContractError("INPUT_INVALID", "timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ContractError("INPUT_INVALID", "timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ContractError("INPUT_INVALID", "timestamp")
-    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return None if value is None else utc_timestamp(value)
 
 
 def claim_slot(scope_id: str, project_id: str | None, branch_id: str | None, proposal: ClaimProposal) -> str:
@@ -130,17 +130,21 @@ _COMPLETION = re.compile(r"已经完成|已完成|检查完成|完成了|\b(?:co
 _CANCELLATION = re.compile(r"取消|撤销|作废|\b(?:cancel|revoke|withdraw)\b", re.I)
 _NEGATED_COMPLETION = re.compile(r"未完成|没[有]?完成|尚未完成|提醒|\b(?:not done|not completed|remind)\b", re.I)
 _NEGATION = re.compile(r"不是|并非|没有|未曾|不喜欢|讨厌|\b(?:not|never|dislike)\b", re.I)
-_SELF_SUBJECTS = frozenset({"user", "current_user", "用户", "我"})
 
 
-def _principal_ref(root: RootEvidence) -> str | None:
-    principal = root.source_principal
-    if not isinstance(principal, dict):
-        return None
-    if principal.get("kind") != "human" or principal.get("resolution") != "verified":
-        return None
-    value = principal.get("principal_ref")
-    return value if isinstance(value, str) and value else None
+def evidence_refs(proposal: ClaimProposal) -> tuple[str, ...]:
+    refs = [f"{s['source_ref']}@{s['source_revision']}" for s in proposal["evidence_spans"]]
+    intention = proposal.get("intention")
+    if intention is not None:
+        refs.extend(intention["state_evidence_refs"])
+    procedure = proposal.get("procedure")
+    if procedure is not None:
+        refs.extend(procedure["counterexample_refs"])
+    return tuple(dict.fromkeys(refs))
+
+
+def verified_human_ref(root: RootEvidence) -> str | None:
+    return verified_human_principal_ref(root.source_principal)
 
 
 def _unresolved_subject(proposal: ClaimProposal, roots: tuple[RootEvidence, ...]) -> str:
@@ -166,7 +170,7 @@ def bind_claim_subject(
     authority key. Unresolved sources receive a source-specific non-authority
     slot so different speakers in one shared scope cannot collapse together.
     """
-    if proposal["subject"].casefold() not in _SELF_SUBJECTS:
+    if proposal["subject"].casefold() not in SELF_SUBJECTS:
         return proposal, False, None
     relevant = tuple(
         root
@@ -178,21 +182,28 @@ def bind_claim_subject(
         )
     )
     bound = deepcopy(proposal)
+
+    def spans_of(root):
+        return [
+            span
+            for span in proposal["evidence_spans"]
+            if span["source_ref"] == root.ref and span["source_revision"] == root.revision
+        ]
+
+    # The context around a quote can leave out what marks pasted text, a speaker's label above it or the fence around
+    # it: the whole message is asked.
     if not relevant or not any(
         self_report_bound(
-            "\n".join(
-                evidence_context(root.content, span["quote"])
-                for span in proposal["evidence_spans"]
-                if span["source_ref"] == root.ref and span["source_revision"] == root.revision
-            ),
+            "\n".join(evidence_context(root.content, span["quote"]) for span in spans_of(root)),
             proposal["value_text"],
             kind=proposal["kind"],
         )
+        and not any(in_pasted_text(root.content, span["quote"]) for span in spans_of(root))
         for root in relevant
     ):
         bound["subject"] = _unresolved_subject(proposal, roots)
         return bound, False, "subject_not_bound"
-    principals = tuple(_principal_ref(root) for root in relevant)
+    principals = tuple(verified_human_ref(root) for root in relevant)
     if any(principal is None for principal in principals):
         bound["subject"] = _unresolved_subject(proposal, roots)
         return bound, False, "source_identity_unresolved"
@@ -301,7 +312,7 @@ def assertion_clause(content: str, quote: str) -> str:
 
     ``evidence_context`` cuts on real punctuation only, because its job is to
     keep a quote's negation attached to it.  A tool envelope stored as an
-    escaped JSON body has no real punctuation to cut on: measured on one instance,
+    escaped JSON body has no real punctuation to cut on: measured in one store,
     **all 16** claims rejected as ``question_not_asserted`` came from sources
     with zero real newlines and 14 to 46 escaped ones, so the context ran 155 to
     1,581 characters and one ``?`` anywhere inside vetoed the claim.  Twelve of
@@ -327,8 +338,8 @@ def assertion_clause(content: str, quote: str) -> str:
         # A quote whose own last character is the break already ends its
         # clause.  Searching onwards from there finds the *next* sentence's
         # terminator and pulls that whole sentence in -- which is how three
-        # correct assertions on one instance were vetoed by a question standing in
-        # the sentence after them, in a message that said in so many words
+        # correct assertions were vetoed by a question standing in the sentence
+        # after them, in a message that said in so many words
         # "我只是问…这不是确认".  ``evidence_context`` has always had this
         # guard; this is the same one.
         if closes:
@@ -342,11 +353,11 @@ def assertion_clause(content: str, quote: str) -> str:
 
 
 _UNASSERTED_STATEMENTS = frozenset({"request", "proposal", "hypothetical", "quotation", "fictional", "unknown"})
-_HUMAN_ONLY_KINDS = frozenset({"preference", "constraint", "decision", "intention", "alias"})
+HUMAN_ONLY_KINDS = frozenset({"preference", "constraint", "decision", "intention", "alias"})
 #: Origins a cited root may lend authority from; ``_authority`` needs one of them.
-_AUTHORITY_ORIGINS = ("human_direct", "tool_observation", "external_document")
+AUTHORITY_ORIGINS = ("human_direct", "tool_observation", "external_document")
 #: Kinds proved by something other than the value inside a quote (``_value_preserved``).
-_VALUE_FREE_KINDS = frozenset({"procedure", "intention", "alias"})
+VALUE_FREE_KINDS = frozenset({"procedure", "intention", "alias"})
 _POLARITY_KINDS = frozenset({"fact", "preference", "constraint", "decision"})
 
 
@@ -403,7 +414,7 @@ def _cite(
     narrowed = tuple(
         replace(r, content="\n".join(evidence_context(r.content, span["quote"]) for span in cited(r))) for r in roots
     )
-    by_origin = {origin: tuple(r for r in narrowed if effective_origin(r) == origin) for origin in _AUTHORITY_ORIGINS}
+    by_origin = {origin: tuple(r for r in narrowed if effective_origin(r) == origin) for origin in AUTHORITY_ORIGINS}
     return _Cited(
         proposal,
         narrowed,
@@ -458,7 +469,7 @@ def _scope_preserved(c: _Cited) -> str | None:
 def _authority(c: _Cited) -> str | None:
     if not (c.human or c.observed or c.documents):
         return "no_independent_authority"
-    if c.kind in _HUMAN_ONLY_KINDS and not c.human:
+    if c.kind in HUMAN_ONLY_KINDS and not c.human:
         return "requires_human_source"
     if any(not grounded_time(c.proposal[field], c.roots) for field in ("valid_from", "valid_to")):
         return "time_not_grounded"
@@ -471,7 +482,7 @@ def _subject_binds(c: _Cited) -> str | None:
     if c.subject_bound or c.kind == "alias":
         return None
     subject, kind = c.subject, c.kind
-    self_bound = subject.casefold() in _SELF_SUBJECTS and self_report_bound(
+    self_bound = subject.casefold() in SELF_SUBJECTS and self_report_bound(
         c.source_text, c.proposal["value_text"], kind=kind
     )
     if subject in c.quoted and not bound_literal(c.quoted, subject):
@@ -551,7 +562,7 @@ def _fact_entailed(c: _Cited) -> str | None:
                 "direct_user" if effective_origin(root) == "human_direct" else "external_record",
                 root.ref,
                 evidence_context(root.content, span["quote"]),
-                c.subject if c.subject_bound and _principal_ref(root) == c.subject else "",
+                c.subject if c.subject_bound and verified_human_ref(root) == c.subject else "",
             )
             for root in (*c.human, *c.observed, *c.documents)
             for span in c.proposal["evidence_spans"]
@@ -568,18 +579,44 @@ def _fact_entailed(c: _Cited) -> str | None:
 
 def _value_preserved(c: _Cited) -> str | None:
     value, conditions = c.proposal["value_text"], c.proposal["conditions"]
-    if c.kind not in _VALUE_FREE_KINDS and value not in c.quoted:
+    if c.kind not in VALUE_FREE_KINDS and value not in c.quoted:
         return "value_not_supported_by_quote"
     if c.kind in _POLARITY_KINDS and not preserves_qualifiers(
         c.source_text, value, conditions=conditions, polarity_only=True
     ):
         return "value_polarity_not_preserved"
     if c.kind in {"preference", "decision"} and _NEGATION.search(c.source_text) and not _NEGATION.search(value):
-        from .claim_normalization import rejects_other_value
-
         if not rejects_other_value(c.source_text, c.proposal):
             return "negation_not_preserved"
     return None
+
+
+def rejects_other_value(content, proposal):
+    """An explicit 'X, not Y' does not negate the positive X clause.
+
+    A general denial of the statement remains a denial. Every negative clause
+    must be an isolated rejected alternative; questions/uncertainty are still
+    checked by the owning qualifier.
+    """
+    clauses = re.split(r"[，,;；。!?！？\n]", content)
+    subject, predicate, value = (proposal[k] for k in ("subject", "predicate", "value_text"))
+    frame = re.compile(
+        re.escape(subject) + r"\s*(?:应当|应该|应|仍然|仍)?" + re.escape(predicate) + r"\s*" + re.escape(value)
+    )
+    if not any(frame.search(c) and not _NEGATION.search(c) for c in clauses):
+        return False
+    negatives = [c.strip() for c in clauses if _NEGATION.search(c)]
+    if not negatives:
+        return False
+    for clause in negatives:
+        match = re.fullmatch(r"(?:不是|并非)([^\s，,。;；!?！？]{1,120})", clause)
+        if (
+            not match
+            or value in match.group(1)
+            or re.search(r"事实|确认|真的|真实|认真|意思|偏好|断言|承诺|决定|成立|正确", match.group(1))
+        ):
+            return False
+    return True
 
 
 def _time_scope_known(c: _Cited) -> str | None:
@@ -662,9 +699,9 @@ def select_proposal(versions: tuple[ClaimVersion, ...], instant: str) -> ClaimVe
 
     ``select_effective`` deliberately returns None for these, and it is right to:
     a proposal is not an effective version and must never be answered as if it
-    were settled. But that also removed them from recall entirely, and on a real
-    instance almost the whole derived layer sits in this state — 231 proposed
-    against 11 active on one instance — so 95% of what consolidation produced was
+    were settled. But that also removed them from recall entirely, and in a real
+    store almost the whole derived layer can sit in this state (231 proposed
+    against 11 active in one), so most of what consolidation produced would be
     invisible to every caller, with no error and no gap to notice it by.
 
     Returning the head here lets retrieval admit it *labelled*, so the reader can

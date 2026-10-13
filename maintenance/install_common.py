@@ -1,26 +1,28 @@
 """Types and primitives shared by the install module family.
 
 ``install.py`` is the plan/apply entry.  ``install_codex.py``,
-``install_claude_code.py``, ``install_hermes.py`` and ``install_workbuddy.py``
-each render one host's wrapper files (WorkBuddy's: entries merged into its own
+``install_claude_code.py``, ``install_hermes.py``, ``install_workbuddy.py`` and ``install_dsh.py``
+each render one host's wrapper files (WorkBuddy's and dsh's: entries merged into their own
 settings) and bind its instance behind the same function names, so the
-entry picks a host module instead of branching on the host.  ``install_receipt.py`` signs and verifies
+entry picks a host module instead of branching on the host; ``install_client.py`` holds the functions
+the four clients share.  ``install_receipt.py`` signs and verifies
 the receipt; ``install_purge.py`` inventories what an explicit purge may
 delete.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import codecs
 import json
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from scope_recall._version import __version__
 
-from .backup import _first_link
+from .backup import first_link
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SKILL = Path(__file__).with_name("skills") / "scope-recall-setup" / "SKILL.md"
@@ -188,22 +190,41 @@ class UninstallResult:
         }
 
 
-def _norm(path: Path) -> str:
+def normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path.resolve())))
 
 
-def _within(norm: str, root_norm: str) -> bool:
+def within(norm: str, root_norm: str) -> bool:
     """Whether a normalized path is the root itself or lies below it."""
     return norm == root_norm or norm.startswith(root_norm + os.sep)
 
 
-def _reject_symlink_chain(path: Path) -> None:
-    link = _first_link(path)
+def reject_symlink_chain(path: Path) -> None:
+    link = first_link(path)
     if link is not None:
         raise InstallError(f"symlink or reparse paths are not allowed: {link}")
 
 
-def _absolute(value: str | Path, field: str, *, error: type[BaseException] = InstallError) -> Path:
+def read_host_file(path: Path) -> bytes | None:
+    """What one of the host's own files that an install merges into holds; None when there is no such file yet."""
+    reject_symlink_chain(path)
+    if not path.exists():
+        return None
+    if not path.is_file() or path.stat().st_size > RUNTIME_CONFIG_LIMIT:
+        raise InstallError(f"{path} is not a file of at most {RUNTIME_CONFIG_LIMIT} bytes")
+    return path.read_bytes()
+
+
+def like_original(text: str, original: bytes | None) -> bytes:
+    """``text`` written back as the host's file was: in its line endings (CRLF when it had any) and with its byte order
+    mark if it had one."""
+    if original is not None and b"\r\n" in original:
+        text = text.replace("\n", "\r\n")
+    data = text.encode("utf-8")
+    return codecs.BOM_UTF8 + data if original is not None and original.startswith(codecs.BOM_UTF8) else data
+
+
+def absolute(value: str | Path, field: str, *, error: type[BaseException] = InstallError) -> Path:
     """Expand ``~`` and refuse a relative path; the caller resolves after its own link checks."""
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -211,16 +232,16 @@ def _absolute(value: str | Path, field: str, *, error: type[BaseException] = Ins
     return path
 
 
-def _require_absolute(path: Path, field: str) -> Path:
-    expanded = _absolute(path, field)
-    _reject_symlink_chain(expanded)
+def require_absolute(path: Path, field: str) -> Path:
+    expanded = absolute(path, field)
+    reject_symlink_chain(expanded)
     resolved = expanded.resolve()
     if resolved.parent == resolved:
         raise InstallError(f"{field} must not be a filesystem root")
     return resolved
 
 
-def _require_interpreter(path: Path, field: str) -> Path:
+def require_interpreter(path: Path, field: str) -> Path:
     """Validate an interpreter through its real target, but keep the path as given.
 
     Managed interpreter layouts (hostedtoolcache, pyenv, homebrew) and every
@@ -229,19 +250,19 @@ def _require_interpreter(path: Path, field: str) -> Path:
     inside the resolved chain is still refused.  What is recorded and later
     executed -- hooks, MCP launchers, the autostart task, the worker -- is the
     link itself: a venv's ``bin/python`` started by its resolved target runs
-    without the venv on ``sys.path`` and cannot import this package (#87).
+    without the venv on ``sys.path`` and cannot import this package.
     """
 
-    expanded = _absolute(path, field)
+    expanded = absolute(path, field)
     resolved = expanded.resolve()
-    _reject_symlink_chain(resolved)
+    reject_symlink_chain(resolved)
     if not resolved.is_file():
         raise InstallError(f"{field} must reference an existing file")
     return expanded
 
 
-def _safe_interpreter(path: Path, *, error_type=InstallError) -> Path:
-    """``_safe_path`` for interpreter executables: resolve, then verify the chain.
+def safe_interpreter(path: Path, *, error_type=InstallError) -> Path:
+    """``safe_path`` for interpreter executables: resolve, then verify the chain.
 
     Managed interpreter layouts (hostedtoolcache, pyenv, homebrew) expose
     ``python`` as a symlink into a versioned directory; the chain check must
@@ -253,30 +274,30 @@ def _safe_interpreter(path: Path, *, error_type=InstallError) -> Path:
     if not expanded.is_absolute():
         expanded = Path.cwd() / expanded
     resolved = expanded.resolve(strict=True)
-    _reject_symlink_chain(resolved)
+    reject_symlink_chain(resolved)
     if not resolved.is_file():
         raise error_type(f"{resolved} must reference an existing file")
     return resolved
 
 
-def _require_file(path: Path, field: str) -> Path:
-    resolved = _require_absolute(path, field)
+def require_file(path: Path, field: str) -> Path:
+    resolved = require_absolute(path, field)
     if not resolved.is_file():
         raise InstallError(f"{field} must reference an existing file")
     return resolved
 
 
-def _validate_roots(*paths: tuple[Path, str]) -> None:
+def validate_roots(*paths: tuple[Path, str]) -> None:
     seen: list[tuple[str, str]] = []
     for path, label in paths:
-        norm = _norm(path)
+        norm = normalized_path(path)
         for other, other_label in seen:
-            if _within(norm, other) or _within(other, norm):
+            if within(norm, other) or within(other, norm):
                 raise InstallError(f"{label} overlaps {other_label}")
         seen.append((norm, label))
 
 
-def _validate_identifier(value: str, field: str) -> str:
+def validate_identifier(value: str, field: str) -> str:
     if len(value) > _MAX_IDENTIFIER_LEN:
         raise InstallError(f"{field} exceeds bounded length")
     if not _IDENTIFIER_RE.fullmatch(value):
@@ -284,20 +305,20 @@ def _validate_identifier(value: str, field: str) -> str:
     return value
 
 
-def _validate_agent_id(agent_id: str) -> str:
+def validate_agent_id(agent_id: str) -> str:
     agent = agent_id.strip()
     if not agent:
         raise InstallError("agent_id is required")
-    return _validate_identifier(agent, "agent_id")
+    return validate_identifier(agent, "agent_id")
 
 
-def _validate_plugin_name(name: str) -> str:
+def validate_plugin_name(name: str) -> str:
     if not _PLUGIN_NAME_RE.fullmatch(name):
         raise InstallError("plugin directory name format is invalid")
     return name
 
 
-def _validate_host(host: str) -> HostChoice:
+def validate_host(host: str) -> HostChoice:
     if host == "hermes":
         return "hermes"
     if host == "codex":
@@ -311,7 +332,7 @@ def _validate_host(host: str) -> HostChoice:
     raise InstallError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy' or 'dsh'")
 
 
-def _manifest_version(version: str = PACKAGE_VERSION) -> str:
+def manifest_version(version: str = PACKAGE_VERSION) -> str:
     """Semver spelling of the PEP 440 package version for host plugin manifests."""
     if ".dev" in version:
         return version.replace(".dev", "-dev.", 1)
@@ -321,5 +342,5 @@ def _manifest_version(version: str = PACKAGE_VERSION) -> str:
     return re.sub(r"(\d+\.\d+\.\d+)rc(\d+)", r"\1-rc.\2", version)
 
 
-def _json_dump(payload: dict[str, Any]) -> str:
+def json_dump(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"

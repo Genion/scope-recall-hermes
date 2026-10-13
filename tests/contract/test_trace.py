@@ -1,13 +1,13 @@
-from dataclasses import replace
-import json
 import itertools
+import json
+from dataclasses import replace
 
 import pytest
-
 from scope_recall.contracts import ContractError, validate_payload
 from scope_recall.core import CoreConfig, MemoryCore
-from tests.contract.test_v11_profile_entity import app as _entity_app
-from tests.contract.test_v11_claims import draft
+
+from tests.contract.test_claims import draft
+from tests.contract.test_profile_entity import app as _entity_app
 from tests.v11_support import source_event
 
 
@@ -48,7 +48,7 @@ def edge(core, ctx, subject, target, **kwargs):
         kind="fact",
         **kwargs,
     )
-    result = core.accept_claim_proposals(
+    result = core.records.accept_claim_proposals(
         ctx,
         dict(
             protocol_version="1.1",
@@ -167,7 +167,8 @@ def test_long_requirement_is_a_terminal_value_not_an_invalid_entity(app):
 
 def test_deleted_edge_and_racing_epoch_never_release_stale_paths(app, monkeypatch):
     import scope_recall.core.trace as trace
-    from tests.contract.test_v11_claims import capture
+
+    from tests.contract.test_claims import capture
 
     core, ctx = app
     first, _ = edge(core, ctx, "TEST-A", "TEST-B")
@@ -204,7 +205,8 @@ def test_deleted_edge_and_racing_epoch_never_release_stale_paths(app, monkeypatc
 def test_index_page_excludes_deleted_sources_and_is_idempotent(app):
     from scope_recall.core.index_rebuild import queue_embedding_page
     from scope_recall.core.storage import SQLiteStorage
-    from tests.contract.test_v11_claims import capture
+
+    from tests.contract.test_claims import capture
 
     core, ctx = app
     _, source = edge(core, ctx, "TEST-A", "TEST-B")

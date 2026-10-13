@@ -11,11 +11,10 @@ reporting and classification, not for slicing or redacting the original text.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
-
 
 #: The label's words are bounded: ``(?:[A-Z0-9-]+[ ]+)*`` backtracked through every way to split a run of
 #: ``-----BEGIN `` repeats, 14 s for 100 kB.  Real labels have a few short words ("OPENSSH", "ENCRYPTED").
@@ -88,8 +87,6 @@ COMMON_SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
 }
-
-COMMON_SECRET_PATTERN_VALUES: tuple[re.Pattern[str], ...] = tuple(COMMON_SECRET_PATTERNS.values())
 
 #: What follows a credential word without being a credential, kept narrow on purpose: a password can be any
 #: word in any script, so only what cannot be one is let through.  Every message that said
@@ -218,8 +215,8 @@ def secret_scan_shadow(value: Any) -> str:
     A serialised line break (the two characters ``\\n``) counts as the break it
     stands for.  Serialised into a model request, a document template with an
     empty credential slot ("AppSecret:" and nothing after it) had the next line
-    swallowed as its value and was refused as ``sensitive_request``: 369
-    candidate evaluations on one instance, none holding a secret.  Text that
+    swallowed as its value and would be refused as ``sensitive_request`` (369
+    candidate evaluations in one store, none holding a secret).  Text that
     was serialised more than once (a tool output that is itself JSON holding
     JSON) writes the same break as ``\\\\n``; treating only the last two
     characters as the break left a backslash after the slot, which then read

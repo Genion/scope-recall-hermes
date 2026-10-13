@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 from typing import Any
 
-from .backup import _create_output, _safe_path, _sha256
+from scope_recall.contracts import InstanceBinding, TrustedContext
+from scope_recall.core.storage import SQLiteStorage
+
+from .backup import create_output, safe_path, sha256
 
 
 class RollbackError(RuntimeError):
@@ -35,7 +38,7 @@ def _counts(path: Path) -> dict[str, int]:
 
 
 def _verified_snapshot_copy(source: Path, destination: Path) -> str:
-    _create_output(destination, error_type=RollbackError)
+    create_output(destination, error_type=RollbackError)
     reader = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)
     writer = sqlite3.connect(destination)
     try:
@@ -52,9 +55,7 @@ def _verified_snapshot_copy(source: Path, destination: Path) -> str:
 
 def _install_core_restore_fence(current: Path) -> dict[str, str]:
     """Install the restore-required marker consumed by every normal Core open."""
-    from scope_recall.contracts import InstanceBinding, TrustedContext
     from scope_recall.core.restore import InstallationMaintenance, begin_restore, export_deletion_ledger, ledger_digest
-    from scope_recall.core.storage import SQLiteStorage
 
     conn = sqlite3.connect(f"{current.as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -101,14 +102,14 @@ def plan_rollback(
     current_db: str | Path, old_snapshot: str | Path, *, destination: str | Path | None = None
 ) -> dict[str, Any]:
     """Inspect a rollback without installing a stop-write fence or copying data."""
-    current = _safe_path(current_db, must_exist=True, error_type=RollbackError)
-    snapshot = _safe_path(old_snapshot, must_exist=True, error_type=RollbackError)
+    current = safe_path(current_db, must_exist=True, error_type=RollbackError)
+    snapshot = safe_path(old_snapshot, must_exist=True, error_type=RollbackError)
     if current == snapshot or not current.is_file() or not snapshot.is_file():
         raise RollbackError("current and snapshot must be distinct regular files")
     counts = _counts(current)
     protects_new_data = any(counts.get(key, 0) for key in ("source_events", "deletion_operations", "capture_inbox"))
     if destination is not None:
-        target = _safe_path(destination, error_type=RollbackError)
+        target = safe_path(destination, error_type=RollbackError)
         if target.exists() or target in {current, snapshot}:
             raise RollbackError("rollback output must be a new path")
     return dict(
@@ -133,16 +134,16 @@ def rollback_to_verified_snapshot(
     database, preserving the new database, its deletion ledger, and the old
     snapshot for an authorized replay/cutover decision.
     """
-    current = _safe_path(current_db, must_exist=True, error_type=RollbackError)
-    snapshot = _safe_path(old_snapshot, must_exist=True, error_type=RollbackError)
+    current = safe_path(current_db, must_exist=True, error_type=RollbackError)
+    snapshot = safe_path(old_snapshot, must_exist=True, error_type=RollbackError)
     if current == snapshot or not current.is_file() or not snapshot.is_file():
         raise RollbackError("current and snapshot must be distinct regular files")
     current_counts = _counts(current)
     new_data = any(current_counts.get(key, 0) for key in ("source_events", "deletion_operations", "capture_inbox"))
     receipt: dict[str, Any] = {
         "format": "scope-recall-p15-rollback/1",
-        "current_sha256": _sha256(current),
-        "old_snapshot_sha256": _sha256(snapshot),
+        "current_sha256": sha256(current),
+        "old_snapshot_sha256": sha256(snapshot),
         "current_counts": current_counts,
         "old_snapshot_preserved": True,
         "restored": False,
@@ -157,13 +158,13 @@ def rollback_to_verified_snapshot(
             reason="old format cannot losslessly represent new sources/deletions/permissions",
             **fence,
         )
-        _safe_path(marker, error_type=RollbackError)
+        safe_path(marker, error_type=RollbackError)
         with marker.open("x", encoding="utf-8") as stream:
             stream.write(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
         receipt["stop_write_marker"] = str(marker)
         return receipt
     target = (
-        _safe_path(destination, error_type=RollbackError)
+        safe_path(destination, error_type=RollbackError)
         if destination is not None
         else current.with_name(current.stem + ".rolledback.sqlite3")
     )
@@ -176,7 +177,7 @@ def rollback_to_verified_snapshot(
         restored=True,
         snapshot_quick_check=quick,
         rollback_output=str(target),
-        rollback_output_sha256=_sha256(target),
+        rollback_output_sha256=sha256(target),
     )
     return receipt
 

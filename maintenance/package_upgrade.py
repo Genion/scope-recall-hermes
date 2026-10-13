@@ -10,18 +10,19 @@ host stopped; do not retry, delete ~* remnants or guess that rollback is safe.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import json
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import zipfile
+from contextlib import contextmanager
+from pathlib import Path
 
 from ..core.file_lock import advisory_file_lock
-from .backup import _atomic_json as _write_receipt, _safe_path, _sha256
-from .install_common import _safe_interpreter
+from .backup import atomic_json as _write_receipt
+from .backup import safe_path, sha256
+from .install_common import safe_interpreter
 
 
 class PackageUpgradeError(RuntimeError):
@@ -108,15 +109,15 @@ def replace_package(python, wheel, backup, *, source_quiesced=False, uv=None) ->
     # the launcher the caller passed: a venv's ``bin/python`` symlink is how
     # CPython finds the venv's ``pyvenv.cfg``, and a probe run with the
     # resolved base interpreter reports the base prefix instead of the venv
-    # (observed on Ubuntu's hostedtoolcache layout), which then misjudges the
+    # (as on Ubuntu's hostedtoolcache layout), which then misjudges the
     # helper's containment. The resolved path is still the safety anchor.
     launcher = Path(python).expanduser()
     if not launcher.is_absolute():
         launcher = Path.cwd() / launcher
-    _safe_interpreter(launcher, error_type=PackageUpgradeError)
+    safe_interpreter(launcher, error_type=PackageUpgradeError)
     python = launcher
-    wheel = _safe_path(wheel, must_exist=True, error_type=PackageUpgradeError)
-    backup = _safe_path(backup, error_type=PackageUpgradeError)
+    wheel = safe_path(wheel, must_exist=True, error_type=PackageUpgradeError)
+    backup = safe_path(backup, error_type=PackageUpgradeError)
     # Never silently choose another agent's PATH wrapper. The operator selects
     # an external native uv executable after checking its ownership.
     helper = uv
@@ -132,16 +133,16 @@ def replace_package(python, wheel, backup, *, source_quiesced=False, uv=None) ->
         if metadata["Name"] != "hermes-scope-recall" or not metadata["Version"]:
             raise PackageUpgradeError("wrong_wheel_distribution")
         target_version = metadata["Version"]
-    helper = _safe_path(helper, must_exist=True, error_type=PackageUpgradeError)
+    helper = safe_path(helper, must_exist=True, error_type=PackageUpgradeError)
     if not helper.is_file():
         raise PackageUpgradeError("uv_must_be_external_executable")
     current = _installed(python)
-    prefix = _safe_path(current["prefix"], must_exist=True, error_type=PackageUpgradeError)
+    prefix = safe_path(current["prefix"], must_exist=True, error_type=PackageUpgradeError)
     if helper.is_relative_to(prefix):
         raise PackageUpgradeError("uv_must_be_outside_target_venv")
     if backup.is_relative_to(prefix) or prefix.is_relative_to(backup) or wheel.is_relative_to(prefix):
         raise PackageUpgradeError("backup_and_wheel_must_be_outside_target_venv")
-    files = sorted({_safe_path(f, must_exist=True, error_type=PackageUpgradeError) for f in current["files"]})
+    files = sorted({safe_path(f, must_exist=True, error_type=PackageUpgradeError) for f in current["files"]})
     if not files or any(not f.is_file() or not f.is_relative_to(prefix) for f in files):
         raise PackageUpgradeError("record_outside_target_venv_or_missing")
     # Include package directory handles, not only files listed in RECORD: the
@@ -161,8 +162,8 @@ def replace_package(python, wheel, backup, *, source_quiesced=False, uv=None) ->
             destination = backup / "files" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
-            digest = _sha256(path)
-            if _sha256(destination) != digest:
+            digest = sha256(path)
+            if sha256(destination) != digest:
                 raise PackageUpgradeError("backup_verification_failed")
             records.append(dict(path=relative.as_posix(), sha256=digest))
         value = dict(
@@ -172,7 +173,7 @@ def replace_package(python, wheel, backup, *, source_quiesced=False, uv=None) ->
             target_python=str(python),
             target_prefix=str(prefix),
             files=records,
-            wheel_sha256=_sha256(wheel),
+            wheel_sha256=sha256(wheel),
             host_restart_allowed=False,
             automatic_rollback=False,
         )

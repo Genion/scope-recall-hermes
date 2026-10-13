@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ..adapters.models import (
+from .codex_cli import CodexCliConsolidationAdapter, CodexCliRouteConfig
+from .consolidation_models import (
     RESPONSES_KIND,
     ConsolidationRouteConfig,
-    EmbeddingRouteConfig,
-    GeminiEmbeddingAdapter,
-    HttpTransport,
     OpenAIConsolidationAdapter,
     ResponsesConsolidationAdapter,
     ResponsesRouteConfig,
 )
-from ..adapters.codex_cli import CodexCliConsolidationAdapter, CodexCliRouteConfig
-from .subscription_budget import SubscriptionBudgetLedger
+from .embedding_models import EmbeddingRouteConfig, GeminiEmbeddingAdapter
 from .model_budget import (
     AuxiliaryBudgetLedger,
     BudgetPolicy,
@@ -30,8 +27,9 @@ from .model_budget import (
     load_hermes_attempt_authorization,
     read_auxiliary_budget_status,
 )
+from .models import HttpTransport
+from .subscription_budget import SubscriptionBudgetLedger
 from .validation import absolute_path, mapping, only_keys, positive_int, strict_bool, text
-
 
 DEFAULT_LEDGER_NAME = "auxiliary-budget.sqlite3"
 
@@ -181,20 +179,26 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
     # shipped Gemini space, or state all four to address another provider.
     # EmbeddingRouteConfig rejects a partial descriptor.
     # The width's field name is a wire detail of the openai dialect, optional on its own.
-    wire = (
-        {}
-        if raw.get("dimensions_field") is None
-        else {"dimensions_field": text("embedding_dimensions_field", raw.get("dimensions_field"))}
+    dimensions_field = (
+        None if raw.get("dimensions_field") is None else text("embedding_dimensions_field", raw.get("dimensions_field"))
     )
     if all(raw.get(key) is None for key in ("model", "endpoint", "dimensions", "dialect")):
-        return EmbeddingRouteConfig(credential_env=credential_env, **wire)
+        return EmbeddingRouteConfig(
+            credential_env=credential_env,
+            dimensions_field=dimensions_field or "dimensions",
+        )
     return EmbeddingRouteConfig(
         credential_env=credential_env,
         model=text("embedding_model", raw.get("model")),
         endpoint=text("embedding_endpoint", raw.get("endpoint")),
         dimensions=positive_int("embedding_dimensions", raw.get("dimensions")),
         dialect=text("embedding_dialect", raw.get("dialect")),
-        **wire,
+        # Permission for plaintext HTTP beyond this machine.  Only a literal boolean reads as permission
+        # (``EmbeddingRouteConfig`` refuses anything else), so a string "true" in a config file cannot open it.
+        allow_insecure_endpoint=strict_bool(
+            "embedding_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
+        ),
+        dimensions_field=dimensions_field or "dimensions",
     )
 
 

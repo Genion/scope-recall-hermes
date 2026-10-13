@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
 import threading
-from types import SimpleNamespace
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
-from scope_recall.adapters.hermes.provider import GAP_CURRENT_SOURCE_REFS_LIMIT
+from scope_recall.adapters.hermes.capture import GAP_CURRENT_SOURCE_REFS_LIMIT
 from scope_recall.adapters.hermes.runtime_wiring import (
     GAP_BINDING_MISMATCH,
     GAP_UNCONFIGURED,

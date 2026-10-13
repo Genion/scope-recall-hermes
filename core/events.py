@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import functools
 import hashlib
 import re
 import unicodedata
+from dataclasses import dataclass
 
-from .capture_filters import sanitize_source_capture_text
 from ..contracts import ContractError, SourceEvent, TrustedContext, decode_payload, validate_capture
+from .capture_filters import sanitize_source_capture_text
 from .secret_patterns import contains_secret_like_text
-
 
 MAX_SEGMENT_CHARS = 65536
 
@@ -82,7 +81,7 @@ def stored_content_digest(content: str) -> str:
     return hashlib.sha256(sanitize_source_capture_text(content)[:MAX_SEGMENT_CHARS].encode("utf-8")).hexdigest()
 
 
-_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _IDENTIFIER = re.compile(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*")
 _FILENAME = re.compile(r"(?<![\w-])[\w-]+(?:\.[\w-]+)+", re.UNICODE)
 #: A dotted release version with a pre-release or build suffix, after
@@ -102,8 +101,8 @@ def version_suffixes(text: str) -> frozenset[str]:
 
 #: The placeholder an earlier release's capture filter left for a tool output it withheld ("Tool execution summary
 #: (terminal): tool=terminal; output_chars=377; exit_code=0; output_preview=omitted"), and the form the report filter
-#: writes today (``capture_filters.sanitize_report_text``, on no capture path).  On one instance 132,000 of 168,000
-#: sources were such lines, each embedded; the shared store imported 212,773 of them (68% of its sources).
+#: writes today (``capture_filters.sanitize_report_text``, on no capture path).  Such lines can be most of a store:
+#: 132,000 of a Hermes store's 168,000 sources, each embedded, and 212,773 of the shared store's (68%).
 _WITHHELD_TOOL_OUTPUT = re.compile(r"Tool execution summary\b.*\b(?:output omitted|output_preview=omitted)\b", re.S)
 #: The same placeholders as a condition on ``source_events e``, cheap enough to test before the role.  Leading
 #: whitespace is passed over as ``withheld_tool_output`` passes it over.
@@ -122,9 +121,9 @@ def withheld_tool_output(event) -> bool:
 
 
 def indexed_terms(event) -> tuple[str, ...]:
-    """The terms a source is found by.  A withheld tool output's placeholder is found by its error text alone, when it
-    carries one: the rest is the envelope's own words, and indexed, the imported placeholders pushed ordinary words
-    such as "tool", "status" and "patch" past the common-term ceiling, so questions lost them (#206)."""
+    """The terms a source is indexed by.  A withheld tool output's placeholder is indexed by its error text alone,
+    when it carries one: the rest is the envelope's own words, and indexed, the placeholders push ordinary words such
+    as "tool", "status" and "patch" past the common-term ceiling, so questions lose them."""
     if not withheld_tool_output(event):
         return lexical_terms(event["content"])
     error = _WITHHELD_ERROR.search(str(event.get("content") or ""))
@@ -137,7 +136,7 @@ def lexical_terms(text: str) -> tuple[str, ...]:
     terms = set(_IDENTIFIER.findall(normalized)) | set(_FILENAME.findall(normalized))
     terms.update(part for token in tuple(terms) for part in token.split("/"))
     terms.update(_VERSION_SUFFIX.findall(normalized))
-    for run in _CJK.findall(normalized):
+    for run in CJK_RUN.findall(normalized):
         if len(run) == 1:
             terms.add(run)
         terms.update(run[i : i + 2] for i in range(len(run) - 1))

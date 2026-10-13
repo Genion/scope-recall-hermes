@@ -14,12 +14,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from scope_recall._version import __version__
 from scope_recall.maintenance import doctor
 from scope_recall.runtime import running_code as rc
-from scope_recall.runtime.process_probe import is_same_process, probe_process
 from scope_recall.runtime.model_budget import REFUSAL_WINDOW_SECONDS, provider_refusals
+from scope_recall.runtime.process_probe import is_same_process, probe_process
 from scope_recall.runtime.running_code import package_modified_at
 from test_autonomous_admission import app_at
 
@@ -178,7 +177,7 @@ def _doctor_instance(tmp_path, monkeypatch):
     """A doctor pointed at a real store, as the diagnostics tests do it."""
     app, ctx = app_at(tmp_path)
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *a: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *a: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     return app, ctx
 
@@ -452,8 +451,9 @@ def _auxiliary(
 ):
     from decimal import Decimal
 
-    from scope_recall.adapters.models import ConsolidationRouteConfig, EmbeddingRouteConfig
     from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+    from scope_recall.runtime.consolidation_models import ConsolidationRouteConfig
+    from scope_recall.runtime.embedding_models import EmbeddingRouteConfig
     from scope_recall.runtime.model_budget import BudgetPolicy, ModelPricing
 
     names = tuple(approved)
@@ -544,7 +544,7 @@ def test_a_route_that_is_switched_off_is_not_a_gap():
 def test_the_embedding_default_is_checked_under_the_name_it_will_send():
     """An omitted embedding model still resolves to a concrete name, and that
     name is what ``reserve`` will judge."""
-    from scope_recall.adapters.models import EMBEDDING_SPACE
+    from scope_recall.core.recall_policy import EMBEDDING_SPACE
     from scope_recall.runtime.model_budget import pre_request_refusals
 
     default = EMBEDDING_SPACE["model"]

@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import math
 import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from ..contracts import ContractError
+from .delete_storage import purge_work_parts
+from .failure_retry import (
+    AUTO_RECOVERABLE_ERRORS,
+    DERIVATION_RETRY_MARKER,
+    RETRY_GENERATION,
+    RETRY_MARKER,
+    already_retried,
+    marked,
+    validate_page,
+    validation_feedback,
+    wanted,
+)
+from .inbox_rules import deferred_path
 from .schema import SCHEMA_VERSION
 
 MAX_RECOVERABLE_ATTEMPTS = 3
 MAX_OPERATOR_RETRIES = 2
+#: Work items one explicit operator retry may name.
+MAX_OPERATOR_PAGE = 8
 #: Failed rows one pass may reopen.  Reopening a failure is not the same kind of
 #: work as claiming a ready item: each reopened row becomes a model call later,
 #: so it keeps its own page however large a pass of cheap work may be.  It was
@@ -21,56 +36,34 @@ MAX_RECOVERY_PAGE = 200
 #: (``core/worker.py``'s ``max_items``), because a pass that claims its embedding
 #: group together claims as much of itself as it is allowed to process.
 MAX_CLAIM_PAGE = 1000
-DERIVATION_RETRY_MARKER = "derivation_retry:1"
 INTERRUPTED_RETRY_MARKER = "interrupted_retry:1"
+#: What ``recover_oversized_consolidations`` writes on the row it repairs, its one repair.
+CHUNK_UPGRADE_MARKER = "chunk_upgrade:1106"
 OPERATOR_ORIGINS = frozenset({"human_direct", "host_generated"})
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-_OPERATOR_TOKEN = re.compile(r"(?:^|\|prior:)operator_retry:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\||$)")
-_AUTO_TOKEN = re.compile(r"(?:^|\|(?:prior:)?)auto_retry:([0-9]+)(?=\||$)")
-# Only infrastructure failures may be recovered without a new source revision.
-# Invalid derivations and rejected authority remain terminal and inspectable.
-# ``http_protocol`` is the transport failing mid-reply (a connection closed or a malformed answer), and is treated as
-# ``network_error`` is: it says nothing about the payload.  Missing here, consolidation and embedding work failing
-# with it was never recovered, and no work failing with it was clearable by ``retry-failures``: candidate evaluations
-# against a model served over plain HTTP left failed rows only a hand edit could clear (#201).
-AUTO_RECOVERABLE_ERRORS = frozenset(
-    {
-        "model_unavailable",
-        "model_timeout",
-        "timeout",
-        "network_error",
-        "http_protocol",
-        "http_429",
-        "http_500",
-        "http_502",
-        "http_503",
-        "http_504",
-        "http_529",
-        "rate_limited",
-        "storage_unavailable",
-        "STORAGE_UNAVAILABLE",
-        "DEADLINE_EXCEEDED",
-        "memory_epoch_changed",
-        "lease_exhausted",
-        "embedding_unavailable",
-    }
+#: The longest error code a row keeps, and the longest failure kind a shortened one keeps beside its marks.
+CODE_BOUND = 1024
+_KIND_BOUND = 128
+# A mark is read wherever a later step left it: at the start, after another segment, or behind an explicit retry's
+# ``prior:``, which keeps the code it found.
+_AT_A_MARK = r"(?:^|\|)(?:prior:)?"
+#: Each explicit retry's token; together they are the item's explicit budget.
+_OPERATOR_TOKEN = re.compile(rf"{_AT_A_MARK}operator_retry:([A-Za-z0-9][A-Za-z0-9_.-]{{0,63}})(?=\||$)")
+_AUTO_TOKEN = re.compile(rf"{_AT_A_MARK}auto_retry:([0-9]+)(?=\||$)")
+#: The marks a retry budget is read from, but the automatic count: a release's re-look, the extra derivation
+#: attempt, the interrupted attempt's, the one repair of an old oversized consolidation, an explicit retry.
+_BUDGET_MARK = re.compile(
+    rf"{_AT_A_MARK}({RETRY_MARKER}:[^|]+|{DERIVATION_RETRY_MARKER}|{INTERRUPTED_RETRY_MARKER}|{CHUNK_UPGRADE_MARKER}"
+    rf"|operator_retry:[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}})(?=\||$)"
 )
 
 #: Failures that are never about the work item.  A provider declining to serve
 #: anyone says nothing about this payload -- unlike a timeout, which a large
 #: item can genuinely cause -- so the lease never got an attempt at all and the
-#: attempt is refunded.  Without the refund one four-hour provider outage pushed
-#: 195 items into ``failed`` at ``attempt=3`` apiece, each needing an operator.  529 is a provider saying it is
-#: overloaded (MiniMax, Anthropic): one such answer failed a candidate evaluation for good on 2026-09-28.
+#: attempt is refunded.  Without the refund one four-hour provider outage pushes
+#: hundreds of items into ``failed`` at ``attempt=3`` apiece, each needing an operator.  529 is a provider saying
+#: it is overloaded (MiniMax, Anthropic): without it here one such answer fails a candidate evaluation for good.
 CAPACITY_REFUSALS = frozenset({"http_429", "rate_limited", "http_502", "http_503", "http_504", "http_529"})
-
-#: The provider declining the account rather than this request: payment
-#: required, key rejected, access forbidden.  No payload changes that answer, so
-#: the worker parks the item without an attempt (``BUDGET_PAUSE_ERRORS``) until
-#: someone fixes the account.  On one instance a DeepSeek balance that ran out
-#: answered 402 for fifteen minutes and failed 100 candidate evaluations
-#: outright, none of which an operator command could reopen afterwards.
-ACCOUNT_REFUSALS = frozenset({"http_401", "http_402", "http_403"})
 
 #: Token recording how many times in a row a provider refused for capacity.
 #: Kept in the error code beside ``auto_retry:`` rather than a new column, so
@@ -96,9 +89,9 @@ _LEASED_ROW = "work_id=? AND state='leased' AND lease_token=? AND lease_owner=?"
 
 # --- the fresh conversation lane ---------------------------------------------
 #
-# Claiming is otherwise strictly FIFO, so a message typed now waited behind the
-# whole backlog -- 1,443 items, the oldest 19 hours, on one live instance --
-# before it was consolidated into claims or embedded for semantic recall.  A
+# Claiming is otherwise strictly FIFO, so a message typed now would wait behind
+# the whole backlog (1,443 items, the oldest 19 hours, on a busy store) before
+# it was consolidated into claims or embedded for semantic recall.  A
 # lane claim prefers ready consolidate/embed work whose subject source is fresh
 # conversation, oldest first, so one conversation is still consolidated in
 # order and its episode batch still forms.  Purge keeps absolute priority and
@@ -133,8 +126,8 @@ FRESH_LANE_SCAN_ROWS = 512
 # --- a re-embed run after the embedding space changed ----------------------
 #
 # ``work_items`` is unique on its type and subject and says nothing of the space a vector was made in, so an
-# embedding done in one space stays done when the model changes, and the new store never receives it (#200, found
-# and reproduced by @Vivamisu).  Re-embedding a store is a deliberate, paid act: an operator starts a run
+# embedding done in one space stays done when the model changes, and the new store never receives it.
+# Re-embedding a store is a deliberate, paid act: an operator starts a run
 # (``respace-embeddings``), and each drain of a worker in that space reopens a page of done embeddings
 # (``respace_page``), newest first and only while the embed queue has room, down to the bottom of the queue.
 #
@@ -185,25 +178,31 @@ def _failure_kind(error: str) -> str:
     return error.rsplit("|", 1)[-1]
 
 
+def _budget_marks(error: str, *, counted: bool = True) -> str:
+    """Every mark in ``error`` a retry budget is read from, once each in the order met, and the automatic count
+    unless ``counted`` is off: what a code that is rebuilt or shortened must keep, or a spent budget begins again."""
+    marks = "".join(f"{mark}|" for mark in dict.fromkeys(_BUDGET_MARK.findall(error)))
+    count = _auto_count(error) if counted else 0
+    return marks + (f"auto_retry:{count}|" if count else "")
+
+
+def _within(code: str) -> str:
+    """``code``, a history ending in its failure kind, within ``CODE_BOUND``.  Past it, what lies between its budget
+    marks and its kind gives way: the history is detail, the marks and the kind decide what is done next.  A kind
+    longer than any the worker writes is cut, so the marks always fit."""
+    if len(code) <= CODE_BOUND:
+        return code
+    return (_budget_marks(code) + _failure_kind(code)[-_KIND_BOUND:])[:CODE_BOUND]
+
+
 def _preserve_retry_history(error) -> bool:
-    return bool(
-        error
-        and (
-            str(error).startswith(("operator_retry:", "chunk_upgrade:1106|"))
-            or _auto_count(str(error))
-            or "derivation_retry:1" in str(error)
-        )
-    )
+    """Whether a new failure is added to ``error`` rather than replacing it: it holds a mark a budget is read from."""
+    return bool(error) and bool(_budget_marks(str(error)))
 
 
 def _auto_retry_stamp(error: str) -> str:
-    """The error code of a row granted one automatic recovery."""
-    stamp = f"auto_retry:{_auto_count(error) + 1}|{_failure_kind(error)}"
-    if "derivation_retry:1|" in error:
-        stamp = "derivation_retry:1|" + stamp
-    if error.startswith("operator_retry:"):
-        stamp = f"{error}|{stamp}"[-1024:]
-    return stamp
+    """The error code of a row granted one automatic recovery: its marks, its new count and its failure kind."""
+    return _within(f"{_budget_marks(error, counted=False)}auto_retry:{_auto_count(error) + 1}|{_failure_kind(error)}")
 
 
 def _capacity_count(error: object) -> int:
@@ -315,8 +314,6 @@ def _source_or_claim_context(tx, ref: str, revision: int) -> tuple[str, str | No
 
 
 def _purge_context(tx, ref: str, revision: int) -> tuple[str, str | None, str | None]:
-    from .delete_storage import purge_work_parts
-
     _operation_id, scope_id = purge_work_parts(ref)
     tx._scope(scope_id)
     return scope_id, tx.context.project_id, tx.context.branch_id
@@ -352,7 +349,7 @@ ALLOWED_WORK_TYPES = frozenset(_SUBJECT_CONTEXT)
 
 
 def _current_source_reason(tx, source) -> str | None:
-    current = tx.source_current(source.ref)
+    current = tx.sources.source_current(source.ref)
     if current is None or current.revision != source.revision:
         return "source_revision_stale"
     try:
@@ -387,7 +384,7 @@ def _embed_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | Non
     """An embed's subject is a source or, since every claim head is queued for the vector index, a claim, which may
     be worked on while it is the readable head it was queued for.  Read as a source, a claim was never found: every
     claim embed a provider failed was made obsolete instead of reopened, and 114 readable heads of the shared store
-    had no vector (review of 3.7.4)."""
+    had no vector."""
     if ref.startswith("claim-"):
         return _projection_retry_reason(tx, ref, revision, current_epoch=current_epoch)
     return _source_retry_reason(tx, ref, revision, current_epoch=current_epoch)
@@ -395,8 +392,6 @@ def _embed_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | Non
 
 def _purge_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
     try:
-        from .delete_storage import purge_work_parts
-
         receipt = tx.deletions.receipt(purge_work_parts(ref)[0])
     except ContractError:
         receipt = None
@@ -428,8 +423,6 @@ class WorkItems:
 
     def derivation_feedback(self, work_id: int) -> dict[str, str] | None:
         """Read repair metadata only for a work item granted the bounded retry."""
-        from .failure_retry import validation_feedback  # imports this module
-
         conn = self._tx._check()
         row = conn.execute("SELECT last_error_code FROM work_items WHERE work_id=?", (work_id,)).fetchone()
         if row is None or f"{DERIVATION_RETRY_MARKER}|" not in str(row[0] or ""):
@@ -440,9 +433,10 @@ class WorkItems:
         outstanding = str(row[0]).lower().rsplit("consolidation_chunk_pending", 1)[-1]
         if not {"derivation_invalid", "input_invalid"}.intersection(outstanding.split("|")):
             return None
+        # A summary dropped beside an accepted result (stage ``summary``) failed nothing; the feedback is the refusal's.
         detail = conn.execute(
             """SELECT error_code,error_field FROM work_error_details WHERE work_id=?
-               AND lower(error_code) IN ('derivation_invalid','input_invalid')
+               AND lower(error_code) IN ('derivation_invalid','input_invalid') AND stage<>'summary'
                ORDER BY detail_id DESC LIMIT 1""",
             (work_id,),
         ).fetchone()
@@ -527,13 +521,19 @@ class WorkItems:
         visible, params = self._visible_filter()
         base = f"state='leased' AND {visible} AND lease_until IS NOT NULL AND lease_until < ?"
         params = (*params, now)
-        failed = conn.execute(
-            f"""UPDATE work_items SET state='failed',lease_owner=NULL,lease_until=NULL,last_error_code=CASE
-                    WHEN last_error_code LIKE 'operator_retry:%' OR last_error_code LIKE 'auto_retry:%' OR last_error_code LIKE '%derivation_retry:1|%' THEN last_error_code || '|lease_exhausted'
-                    ELSE 'lease_exhausted' END, available_at=?
-                WHERE {base} AND attempt >= ?""",
-            (now, *params, MAX_RECOVERABLE_ATTEMPTS),
-        ).rowcount
+        # A lost lease is a failure like another: a history a budget is read from is added to, anything else replaced.
+        spent = conn.execute(
+            f"SELECT work_id,last_error_code FROM work_items WHERE {base} AND attempt >= ?",
+            (*params, MAX_RECOVERABLE_ATTEMPTS),
+        ).fetchall()
+        for work_id, prior in spent:
+            code = _within(f"{prior}|lease_exhausted") if _preserve_retry_history(prior) else "lease_exhausted"
+            conn.execute(
+                """UPDATE work_items SET state='failed',lease_owner=NULL,lease_until=NULL,last_error_code=?,
+                   available_at=? WHERE work_id=? AND state='leased'""",
+                (code, now, work_id),
+            )
+        failed = len(spent)
         released = conn.execute(
             f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL
                 WHERE {base} AND attempt < ?""",
@@ -750,10 +750,10 @@ class WorkItems:
                 continue
             recovered += conn.execute(
                 """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,lease_until=NULL,
-                   last_error_code='chunk_upgrade:1106|INPUT_INVALID'
+                   last_error_code=?
                    WHERE work_id=? AND state='failed' AND last_error_code='INPUT_INVALID'
                    AND consolidation_offset=0""",
-                (now, row["work_id"]),
+                (now, f"{CHUNK_UPGRADE_MARKER}|INPUT_INVALID", row["work_id"]),
             ).rowcount
         return recovered
 
@@ -791,9 +791,9 @@ class WorkItems:
 
         The at-most-once fence is committed before the model call, so a worker
         killed after it -- a gateway stop, a lost lease, a machine restart --
-        leaves the candidate failed with nothing recorded and nothing to look at:
-        24 of another instance's candidates and 5 of one instance's sat there. Waiting for new
-        evidence never comes for a candidate whose evidence is already in.
+        leaves the candidate failed with nothing recorded and nothing to look at,
+        and waiting for new evidence never comes for a candidate whose evidence is
+        already in.
 
         One attempt: the marker says it was given, and ``attempt`` bounds it even
         when a later failure overwrites the marker -- an interruption observed as
@@ -824,7 +824,7 @@ class WorkItems:
             recovered += conn.execute(
                 """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                    lease_until=NULL,last_error_code=? WHERE work_id=? AND state='failed'""",
-                (now, f"{INTERRUPTED_RETRY_MARKER}|{row['last_error_code']}"[:1024], row["work_id"]),
+                (now, _within(f"{INTERRUPTED_RETRY_MARKER}|{row['last_error_code']}"), row["work_id"]),
             ).rowcount
         return recovered
 
@@ -869,12 +869,13 @@ class WorkItems:
         attempt as ``candidate_attempt_interrupted``.  Other work types need
         only the work item.
 
-        Idempotent: every row is stamped with the schema generation that granted
-        it, and a row already carrying this generation's stamp is skipped.
+        Idempotent: every row is stamped with the release that granted it, and
+        a row already carrying this release's stamp is skipped.  Skipped rows the
+        request covers are counted (``already_retried``, the first ids in
+        ``already_retried_work_ids``): each failed again after this release
+        re-opened it, and a run that re-opens nothing says so rather than
+        nothing.
         """
-        from .capture_inbox import deferred_path
-        from .failure_retry import selects, validate_page  # imports this module
-
         validate_page(limit)
         if type(include_terminal) is not bool or type(dry_run) is not bool:
             raise ContractError("INPUT_INVALID", "retry_flags")
@@ -888,13 +889,26 @@ class WorkItems:
             (*params, max(limit * 8, limit)),
         ).fetchall()
 
-        report = {"examined": 0, "retried": 0, "by_kind": {}, "applied": not dry_run}
+        report = {
+            "examined": 0,
+            "retried": 0,
+            "by_kind": {},
+            "applied": not dry_run,
+            "already_retried": 0,
+            "already_retried_work_ids": [],
+        }
         for row in rows:
             if report["retried"] >= limit:
                 break
             report["examined"] += 1
             code = row["last_error_code"]
-            if not selects(code, include_terminal=include_terminal, generation=SCHEMA_VERSION):
+            if not wanted(code, include_terminal=include_terminal):
+                continue
+            if already_retried(code, generation=RETRY_GENERATION):
+                report["already_retried"] += 1
+                # As many as one explicit retry by work id takes (``worker_entry --retry-failed``).
+                if len(report["already_retried_work_ids"]) < MAX_OPERATOR_PAGE:
+                    report["already_retried_work_ids"].append(int(row["work_id"]))
                 continue
             if not dry_run and not self._reopen_failed(row["work_id"], row["work_type"], code, now=now):
                 continue
@@ -903,13 +917,11 @@ class WorkItems:
             report["retried"] += 1
         # The automatic recovery read every embed's subject as a source, so a claim embed a provider failed was made
         # obsolete instead of reopened (``_embed_retry_reason``).  A readable head it left without a vector is worked
-        # on again, and one an earlier conversion never queued is queued (review of 3.7.4).
+        # on again, and one an earlier conversion never queued is queued.
         heads = self._claim_heads_without_vectors(limit=limit)
         report["claim_embeds_reopened"] = sum(1 for work_id, _ref, _revision in heads if work_id is not None)
         report["claim_embeds_queued"] = sum(1 for work_id, _ref, _revision in heads if work_id is None)
         if not dry_run:
-            from .failure_retry import marked  # imports this module
-
             for work_id, ref, revision in heads:
                 if work_id is None:
                     self.enqueue("embed", ref, revision, available_at=now)
@@ -917,12 +929,12 @@ class WorkItems:
                     conn.execute(
                         """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                                     lease_until=NULL,last_error_code=? WHERE work_id=? AND state='obsolete'""",
-                        (now, marked("authority_revoked", generation=SCHEMA_VERSION), work_id),
+                        (now, marked("authority_revoked", generation=RETRY_GENERATION), work_id),
                     )
-        # Captures a replay gave up after its tries (``capture_inbox._GAVE_UP``) go back to it, their tries counted
+        # Captures a replay gave up after its tries (``inbox_rules.GAVE_UP``) go back to it, their tries counted
         # anew: whatever kept them out has been fixed, or they are given up again, visibly.  Only the partition this
-        # config's replay takes (``replay_inbox``): returned by what the config could see, a row of another went back
-        # to a replay that never takes it (review of rc10).
+        # config's replay takes (``replay_inbox``): returned by what the config could see, a row of another would go
+        # back to a replay that never takes it.
         context = self._tx.context
         scopes = sorted(context.allowed_scope_ids)
         abandoned = conn.execute(
@@ -935,10 +947,10 @@ class WorkItems:
         for _token, code in abandoned:
             kind = str(code).rsplit("|", 1)[-1]
             report["inbox_by_kind"][kind] = report["inbox_by_kind"].get(kind, 0) + 1
-        # A capture an earlier release refused as ACCESS_DENIED, most often one under a deleted message's key, stayed
-        # in the inbox for good with doctor's capture_ingress_blocked up, and nothing but a hand could remove it.  The
-        # replay now cancels a copy of the deleted message and stores another message under a key of its own
-        # (``storage.Transaction.refuse_under_a_deleted_key``), so such rows go back to it once asked (review of rc13).
+        # A capture an earlier release refused as ACCESS_DENIED, most often one under a deleted message's key, stays
+        # in the inbox for good with doctor's capture_ingress_blocked up, and nothing but a hand removes it.  The
+        # replay cancels a copy of the deleted message and stores another message under a key of its own
+        # (``Sources.refuse_under_a_deleted_key``), so such rows go back to it once asked.
         refused = conn.execute(
             f"""SELECT token FROM capture_inbox WHERE last_error_code='ACCESS_DENIED'
                 AND scope_id IN ({_marks(scopes)}) AND project_id IS ? AND branch_id IS ?""",
@@ -946,8 +958,8 @@ class WorkItems:
         ).fetchall()
         report["inbox_refused"] = len(refused)
         if not dry_run:
-            # One the rekey path gave up goes back to it: returned as never tried, the plain replay met the old
-            # collision, and a row it put off was matched by a delete through the key it had taken (review of rc10).
+            # One the rekey path gave up goes back to it: returned as never tried, the plain replay would meet the old
+            # collision, and a row it put off would be matched by a delete through the key it had taken.
             conn.executemany(
                 "UPDATE capture_inbox SET last_error_code=? WHERE token=?",
                 [("VERSION_CONFLICT" if deferred_path(code) == "rekey" else None, token) for token, code in abandoned],
@@ -962,7 +974,7 @@ class WorkItems:
         row's work id, or None when there is none, the claim, its head revision), at most ``limit``.
 
         The query asks what ``_embed_retry_reason`` will (the exact project and branch, no block), so heads it would
-        refuse never fill the page ahead of one it takes (review of 3.7.5)."""
+        refuse never fill the page ahead of one it takes."""
         conn = self._tx._check()
         context = self._tx.context
         scopes = sorted(context.allowed_scope_ids)
@@ -1146,8 +1158,6 @@ class WorkItems:
 
     def _reopen_failed(self, work_id: int, work_type: str, code: object, *, now: str, automatic: bool = False) -> bool:
         """Move one failed row, and its sibling tables when it has any."""
-        from .failure_retry import marked  # imports this module
-
         conn = self._tx._check(write=True)
         reason = "derivation_retry" if automatic else "operator_retry"
         if work_type == "evaluate_candidate" and not self._tx.candidates.reopen_evaluation(
@@ -1160,7 +1170,9 @@ class WorkItems:
                lease_until=NULL,last_error_code=? WHERE work_id=? AND state='failed'""",
                 (
                     now,
-                    f"{DERIVATION_RETRY_MARKER}|{code}" if automatic else marked(code, generation=SCHEMA_VERSION),
+                    _within(
+                        f"{DERIVATION_RETRY_MARKER}|{code}" if automatic else marked(code, generation=RETRY_GENERATION)
+                    ),
                     work_id,
                 ),
             ).rowcount
@@ -1176,7 +1188,7 @@ class WorkItems:
             return WorkMutation(work_id, "stale", self.read_state(work_id) or "stale", lease_token)
         prior = conn.execute("SELECT last_error_code FROM work_items WHERE work_id=?", (work_id,)).fetchone()[0]
         if _preserve_retry_history(prior):
-            error_code = f"{prior}|{error_code}"[:1024]
+            error_code = _within(f"{prior}|{error_code}")
         conn.execute(
             f"""UPDATE work_items SET state='pending',attempt=MAX(0,attempt-1),
                        lease_owner=NULL,lease_until=NULL,last_error_code=?,available_at=?
@@ -1233,7 +1245,7 @@ class WorkItems:
             raise ContractError("ACCESS_DENIED", "operator_origin")
         if not isinstance(work_ids, (tuple, list)) or not work_ids:
             raise ContractError("INPUT_INVALID", "retry_work_ids")
-        if type(max_items) is not int or not 1 <= max_items <= 8 or len(work_ids) > max_items:
+        if type(max_items) is not int or not 1 <= max_items <= MAX_OPERATOR_PAGE or len(work_ids) > max_items:
             raise ContractError("INPUT_INVALID", "retry_budget")
         if any(type(value) is not int or value < 1 for value in work_ids) or len(set(work_ids)) != len(work_ids):
             raise ContractError("INPUT_INVALID", "retry_work_ids")
@@ -1279,7 +1291,7 @@ class WorkItems:
         # existing bounded error field for audit/idempotence.
         marker = f"operator_retry:{operation_id}"
         prior_error = row["last_error_code"] or ""
-        stamped = marker if not prior_error else f"{marker}|prior:{prior_error}"[:1024]
+        stamped = marker if not prior_error else _within(f"{marker}|prior:{prior_error}")
         conn.execute(
             """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                lease_until=NULL,last_error_code=?
@@ -1424,17 +1436,16 @@ class WorkItems:
             # ordinary 60s ceiling in place and 197 items retried without pause
             # for an entire provider outage, which is the silent loop this
             # whole design exists to prevent.
+            # Rebuilt from its count, the code keeps every budget mark it had, so an outage spends no budget.
             refusals = _capacity_count(prior) + 1
-            retry_error = f"capacity:{refusals}|{error_code}"[:1024]
-            if "derivation_retry:1|" in str(prior or ""):
-                retry_error = "derivation_retry:1|" + retry_error
+            retry_error = _within(f"{_budget_marks(str(prior or ''))}capacity:{refusals}|{error_code}")
             conn.execute(
                 f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL,
                    last_error_code=?,available_at=?,attempt=MAX(attempt-1,0) WHERE {_LEASED_ROW}""",
                 (retry_error, _after(now, _capacity_backoff_seconds(refusals)), work_id, lease_token, owner),
             )
             return WorkMutation(work_id, "retry", "pending", lease_token)
-        history = f"{prior}|{error_code}"[:1024] if _preserve_retry_history(prior) else error_code
+        history = _within(f"{prior}|{error_code}") if _preserve_retry_history(prior) else error_code
         if recoverable and (invalid or attempt < MAX_RECOVERABLE_ATTEMPTS):
             conn.execute(
                 f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL,last_error_code=?,available_at=?

@@ -8,7 +8,6 @@ the two background slots.
 from __future__ import annotations
 
 import pytest
-
 from scope_recall.core.background_context import PROFILE_WINDOW, background_candidates
 from scope_recall.core.coverage import (
     COVERAGE_GAP_PREFIX,
@@ -18,7 +17,8 @@ from scope_recall.core.coverage import (
 )
 from scope_recall.core.recall_packet import public_gaps
 from scope_recall.core.retrieval import SearchContext
-from tests.contract.test_v11_claims import app, accept, capture, draft
+
+from tests.contract.test_claims import accept, app, capture, draft
 from tests.v11_support import recall_request
 
 
@@ -179,7 +179,7 @@ def test_a_vector_failure_carries_the_auxiliary_error_type(app):
     """Every auxiliary failure is an ``AuxiliaryModelError``; whether it was
     the connection or the request decides both whether the read path retries
     and whether an operator should act."""
-    from scope_recall.adapters.models import AuxiliaryModelError
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     core, ctx = app
 
@@ -227,7 +227,7 @@ def test_an_optional_channel_that_overruns_does_not_empty_the_packet(app):
     hydrate loop abandoned every one of them because the clock was gone."""
     import time
 
-    from scope_recall.adapters.models import AuxiliaryModelError
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     core, ctx = app
     for index in range(8):

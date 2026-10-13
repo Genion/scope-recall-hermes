@@ -5,7 +5,7 @@ Every gate in this system asks one question of one piece of evidence: does
 source saying exactly the same thing is dropped as a duplicate -- the identical
 assertion returns ``Mutation(..., "duplicate", ...)`` and its evidence is never
 recorded.  So the system has no way to get stronger by hearing something twice,
-which is why 401 claims on one instance produced 36 active ones.
+which is how 401 claims in one store produced only 36 active ones.
 
 This is the missing dimension, and it is deliberately the *only* one being
 added.  Nothing here loosens a single judgement about a single source.  What it
@@ -38,6 +38,8 @@ that), or writing anything (``core/mutate.apply_claim`` owns the version).
 """
 
 from __future__ import annotations
+
+from .claims import effective_origin, verified_human_ref
 
 #: Independent first-hand statements required before a refusal is overturned.
 #: Two is the ordinary standard for "not just one person's word"; a higher bar
@@ -82,8 +84,6 @@ def _first_hand(roots):
     ``capture_state``/``capture_gaps`` are checked because a partially captured
     source is a fragment of a statement, and half a sentence is not a witness.
     """
-    from .claims import effective_origin
-
     return [
         root
         for root in roots
@@ -108,9 +108,7 @@ def witness_occasions(roots) -> set[tuple[str | None, str]]:
     speaker in two sessions is too.  The same speaker twice in one session is
     one.
     """
-    from .claims import _principal_ref
-
-    return {(_principal_ref(root), root.session_id) for root in _first_hand(roots)}
+    return {(verified_human_ref(root), root.session_id) for root in _first_hand(roots)}
 
 
 def corroboration_promotes(

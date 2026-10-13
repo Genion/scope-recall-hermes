@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import VectorStore, VectorStoreCompatibilityError
+from .purge import governed_row_ids, purge_request
 
 _ROW_COLUMNS = "id, scope_id, source, target, content, summary, updated_at, vector_json"
 
@@ -293,7 +294,7 @@ class SQLiteBruteForceVectorStore(VectorStore):
         """Write ``rows`` as one group, only if ``guard`` still approves under this store's lock.
 
         The worker publishes every embedding through this fenced form (see
-        ``adapters.lance.LanceIndexWriter``), so a companion without it cannot
+        ``runtime.lance_port.LanceIndexWriter``), so a companion without it cannot
         be written to at all.  The store's own lock is the fence boundary: the
         guard is evaluated with the write already serialized, a refusing guard
         writes nothing, and ``upsert_records`` commits the group once.
@@ -320,15 +321,12 @@ class SQLiteBruteForceVectorStore(VectorStore):
     ) -> bool:
         """Remove every revision of the governed members; acknowledge only an inventory verified empty.
 
-        This companion could not be purged at all.  That did not matter while
-        it could not be published to either (#85); once it could, a forget left
-        its vector rows behind and its purge work retrying for good.  The rules
+        This companion is purged as it is published to: otherwise a forget
+        would leave its vector rows behind and its purge work retrying for good.  The rules
         are the native store's, from the same code: opaque identities only, a
         row that cannot be classified makes the inventory unknown, and an
         unknown inventory is never acknowledged.
         """
-        from .store import governed_row_ids, purge_request
-
         if (
             type(remaining_seconds) not in (int, float)
             or not math.isfinite(float(remaining_seconds))

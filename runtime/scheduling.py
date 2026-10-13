@@ -6,20 +6,27 @@ a model, changes work state, widens authority, or renews a model budget.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from ..core.capture_inbox import _RETRIED, REPLAY_CANDIDATES, deferred_until, replayable
-from ..core.storage import SQLiteStorage
-from ..core.work_storage import AUTO_RECOVERABLE_ERRORS, AUTO_RECOVERABLE_WORK_TYPES
+from ..core.failure_retry import AUTO_RECOVERABLE_ERRORS
 from ..core.file_lock import advisory_file_lock
-from .worker_entry import DAILY_COUNTER_MAX, _atomic_metadata, _metadata_path, _read_metadata, load_config
-
+from ..core.inbox_rules import REPLAY_CANDIDATES, RETRIED, deferred_until, replayable
+from ..core.storage import SQLiteStorage
+from ..core.work_storage import AUTO_RECOVERABLE_WORK_TYPES
+from .model_budget import provider_holds
+from .worker_entry import (
+    DAILY_COUNTER_MAX,
+    load_config,
+    read_worker_metadata,
+    worker_metadata_path,
+    write_worker_metadata,
+)
 
 #: Seconds a supervisor waits after a busy pass, when the worker lock or the
 #: truth writer was held, before it tries again.  At the plain interval a long
@@ -29,9 +36,9 @@ BUSY_BACKOFF_SECONDS = 30.0
 #: Hard worker failures in a row before a supervisor stops accepting wakes.
 #: One is not a broken worker: a pass can raise on one item, lose a lease to a
 #: maintenance command, or meet a bound nobody had met before.  Standing down on
-#: the first one stopped the processing loop until the next five-minute wake and
-#: said so nowhere -- observed on a live instance at ``drains=217`` with 180
-#: items still queued.  Three in a row, each after a backoff, is a worker that
+#: the first one would stop the processing loop until the next five-minute wake
+#: and say so nowhere, with the queue left waiting.  Three in a row, each after
+#: a backoff, is a worker that
 #: is not going to work, and then standing down is right.
 MAX_CONSECUTIVE_WORKER_FAILURES = 3
 #: Seconds between two reads of the operator pause while a supervisor sleeps its start delay.
@@ -69,7 +76,7 @@ class WakePlan:
     failed: int = 0
 
 
-def _capable_work_types(config) -> set[str]:
+def capable_work_types(config) -> set[str]:
     aux = config.auxiliary
     capable = {"purge", "rebuild_projection"}
     # A pass uses a route only with its budget ledger (``runtime/auxiliary``).
@@ -82,7 +89,7 @@ def _capable_work_types(config) -> set[str]:
 
 
 def _daily_items_used(config, now: datetime) -> int:
-    day = _read_metadata(_metadata_path(config, "runtime-worker-day.json"))
+    day = read_worker_metadata(worker_metadata_path(config, "runtime-worker-day.json"))
     if day.get("installation_id") not in (None, config.binding.installation_id):
         raise ValueError("supervisor_budget_binding")
     used = day.get("used", 0) if day.get("day") == _stamp(now)[:10] else 0
@@ -132,13 +139,12 @@ def next_wake(config, *, now: datetime | None = None, unavailable_until=None) ->
     unavailable_until = dict(unavailable_until or {})
     # A provider on hold keeps its work types asleep until the hold ends, so a
     # refusing provider is asked once per hold instead of once per wake.
-    from .model_budget import provider_holds
 
     for work_type, (_model, until) in provider_holds(config.auxiliary, now=now.timestamp()).items():
         held = datetime.fromtimestamp(until, timezone.utc)
         if work_type not in unavailable_until or unavailable_until[work_type] < held:
             unavailable_until[work_type] = held
-    capable = _capable_work_types(config)
+    capable = capable_work_types(config)
     spent = _daily_budget_spent(config, _daily_items_used(config, now))
     next_day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -194,7 +200,7 @@ def next_wake(config, *, now: datetime | None = None, unavailable_until=None) ->
             f"""SELECT last_error_code FROM capture_inbox WHERE scope_id IN ({marks})
                     AND project_id IS ? AND branch_id IS ?
                     AND ({REPLAY_CANDIDATES} OR last_error_code='VERSION_CONFLICT')""",
-            (*scopes, config.project_id, config.branch_id, *_RETRIED),
+            (*scopes, config.project_id, config.branch_id, *RETRIED),
         ):
             if replayable(code, now):
                 inbox += 1
@@ -269,12 +275,12 @@ class SupervisorControl:
             sorted(config.allowed_scope_ids),
         ]
         key = hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest()[:24]
-        self.path = _metadata_path(config, f"runtime-supervisor-{key}.json")
-        self.control_lock = _metadata_path(config, f"runtime-supervisor-{key}.control.lock")
-        self.owner_lock = _metadata_path(config, f"runtime-supervisor-{key}.owner.lock")
+        self.path = worker_metadata_path(config, f"runtime-supervisor-{key}.json")
+        self.control_lock = worker_metadata_path(config, f"runtime-supervisor-{key}.control.lock")
+        self.owner_lock = worker_metadata_path(config, f"runtime-supervisor-{key}.owner.lock")
 
     def read(self):
-        value = _read_metadata(self.path)
+        value = read_worker_metadata(self.path)
         if value.get("installation_id") not in (None, self.config.binding.installation_id):
             raise ValueError("supervisor_binding_mismatch")
         revision = value.get("wake_revision", 0)
@@ -288,13 +294,13 @@ class SupervisorControl:
             value.update(
                 installation_id=self.config.binding.installation_id, wake_revision=value.get("wake_revision", 0) + 1
             )
-            _atomic_metadata(self.path, value)
+            write_worker_metadata(self.path, value)
 
     def update(self, **fields):
         with advisory_file_lock(self.control_lock, timeout_seconds=1):
             value = self.read()
             value.update(fields)
-            _atomic_metadata(self.path, value)
+            write_worker_metadata(self.path, value)
             return value
 
     def close_if_unchanged(self, revision, **fields):
@@ -303,8 +309,27 @@ class SupervisorControl:
             if value.get("wake_revision", 0) != revision:
                 return False
             value.update(accepting=False, **fields)
-            _atomic_metadata(self.path, value)
+            write_worker_metadata(self.path, value)
             return True
+
+
+def control_path(config):
+    return config.binding.data_directory / "runtime-autostart.json"
+
+
+def read_control(config):
+    path = control_path(config)
+    if not path.exists():
+        return None
+    if path.is_symlink() or path.stat().st_size > 65536:
+        raise ValueError("autostart_control_invalid")
+    control = json.loads(path.read_text(encoding="utf-8"))
+    if control.get("installation_id") != config.binding.installation_id or type(control.get("enabled")) is not bool:
+        raise ValueError("autostart_binding_invalid")
+    expected = "ScopeRecall-" + hashlib.sha256(config.binding.installation_id.encode()).hexdigest()[:20]
+    if control.get("task_name") != expected:
+        raise ValueError("autostart_task_identity_invalid")
+    return control
 
 
 def _acquire_ownership(control: SupervisorControl):
@@ -344,8 +369,6 @@ def supervise(
     An OS restart needs a separate startup integration. The finite window and
     drain count are never extended by coalesced requests.
     """
-    from .resume_entry import read_control  # it imports this module, so not at the top of the file
-
     config = load_config(config_path)
     control = SupervisorControl(config)
     control.request()

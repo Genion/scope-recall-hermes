@@ -7,24 +7,26 @@ a side effect of an optional host hookup.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import tzinfo
 import json
 import math
 import os
-from pathlib import Path
 import stat
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field, replace
+from datetime import tzinfo
+from pathlib import Path
 from typing import Any, Mapping
 
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.recall_budget import canonical_render_json
-from scope_recall.runtime.instance import RuntimeInstance, RuntimeInstanceConfig, build_runtime_instance
+from scope_recall.runtime.instance import RuntimeInstance, build_runtime_instance
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.worker_entry import load_config
-from scope_recall.runtime.worker_launch import EPHEMERAL_CONFIG_INFIX
+from scope_recall.runtime.worker_launch import EPHEMERAL_CONFIG_INFIX, RUNTIME_CONFIG_FILENAME
+
 from .tool_common import local_times
 
 GAP_UNCONFIGURED = "capability_gap:trusted_runtime_unconfigured"
@@ -33,7 +35,6 @@ GAP_BINDING_MISMATCH = "capability_gap:trusted_runtime_binding_mismatch"
 GAP_WORKER_BUSY = "capability_gap:trusted_runtime_worker_busy"
 GAP_WORKER_LAUNCH_FAILED = "capability_gap:trusted_runtime_worker_launch_failed"
 GAP_AUDIENCE_CAPACITY = "capability_gap:trusted_runtime_audience_capacity"
-RUNTIME_CONFIG_FILENAME = "runtime-config.json"
 #: Exact audiences a host may keep workers for at once, one active and one follower each.
 MAX_AUDIENCE_LANES = 8
 
@@ -165,7 +166,7 @@ def _basic_core(expected_binding: InstanceBinding, core: MemoryCore | None, cloc
     return MemoryCore(CoreConfig(expected_binding), clock=clock)
 
 
-def _strict_hook_budget(value: object) -> float:
+def strict_hook_budget(value: object) -> float:
     if type(value) not in (int, float):
         raise ValueError("hook_processing_seconds")
     parsed = float(value)
@@ -193,7 +194,7 @@ class TrustedHostRuntime:
     _last_worker_launch: float = 0.0
 
     def __post_init__(self) -> None:
-        self._hook_processing_seconds = _strict_hook_budget(self._hook_processing_seconds)
+        self._hook_processing_seconds = strict_hook_budget(self._hook_processing_seconds)
 
     @property
     def configured(self) -> bool:
@@ -208,7 +209,7 @@ class TrustedHostRuntime:
         """Return the budget from the verified runtime, or the safe default."""
         runtime = self._runtime
         value = runtime.config.hook_processing_seconds if runtime is not None else self._hook_processing_seconds
-        value = _strict_hook_budget(value)
+        value = strict_hook_budget(value)
         auto = getattr(self.core.config, "auto_recall_seconds", 5.0)
         if type(auto) not in (int, float) or not math.isfinite(auto) or not 0 < auto <= 5.0:
             raise ValueError("auto_recall_seconds")

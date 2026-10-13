@@ -2,45 +2,44 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import math
-from pathlib import Path
 import sqlite3
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Protocol, cast
 
 from scope_recall.contracts import ContractError, Origin, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.capture_inbox import DELETED_KEY
-from scope_recall.runtime.instance import RuntimeInstanceConfig
-from ..runtime_wiring import _strict_hook_budget
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 
+from ..runtime_wiring import strict_hook_budget
 from . import transcript
 from .boundary import (
-    without_lone_surrogates,
     is_workbuddy_agent_run,
+    without_lone_surrogates,
 )
 from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfig, load_codex_config, load_shared_client
 from .hook_answer import (
     HookDiagnostics,
 )
-from .identity import resolve_runtime_audience, trusted_context
 from .hook_events import CAPTURE_TIMEOUT_S, RUNTIME_ATTACH_MIN_S, HookEvents
+from .identity import resolve_runtime_audience, trusted_context
 from .prompt_recall import PromptRecall
 from .record_reader import RecordLines, RecordReader
-from .session_marks import (
-    forget_turns,
-    in_suggestions_thread,
-)
 from .runtime_wiring import (
     GAP_UNCONFIGURED,
     GAP_WORKER_LAUNCH_FAILED,
     TrustedHostRuntime,
     attach_trusted_host_runtime,
 )
-
+from .session_marks import (
+    forget_turns,
+    in_suggestions_thread,
+)
 
 _MAX_STDIN_BYTES = 65536
 _TOTAL_BUDGET_S = 2.0
@@ -296,8 +295,8 @@ class CodexHookHandler:
     def runtime_ready(self) -> bool:
         """Whether this handler has its trusted runtime attached from a config it could read.  One kept for later
         prompts (``local_endpoint.KeptRecaller``) never attaches again, so without it the handler is made anew: a
-        config read at a bad moment (a sharing violation) left every later recall without its vector search, where a
-        handler of its own read it again (review of rc12)."""
+        config read at a bad moment (a sharing violation) would leave every later recall without its vector search,
+        where a handler of its own reads it again."""
         return self._host_runtime is not None and bool(getattr(self._host_runtime, "configured", False))
 
     def warm_vectors(self, seconds: float) -> None:
@@ -458,7 +457,7 @@ class CodexHookHandler:
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError, RecursionError):
-            # Nested past what the parser takes, a tool's output ended the hook with no answer (review of rc11).
+            # Nested past what the parser takes, a tool's output would otherwise end the hook with no answer.
             self.note("invalid_json")
             return {}
         if type(payload) is not dict:
@@ -517,8 +516,8 @@ class CodexHookHandler:
                 self.diagnostics.note_capture_error(exc.code)
                 if (exc.code, exc.field) == DELETED_KEY:
                     # A copy of a deleted message under its key, written straight from the session record: refused for
-                    # good, as the inbox cancels one.  Taken as unsettled, every later Stop stopped at that line
-                    # (review of rc13).
+                    # good, as the inbox cancels one.  Taken as unsettled, every later Stop would stop at that
+                    # line.
                     self.diagnostics.capture_disposition = "cancelled"
             gaps = (*gaps, "capture_gap:write_exception")
             self.note("capture_exception", gaps=gaps)
@@ -578,6 +577,6 @@ def _configured_budget(runtime_config_path: str | None) -> float | None:
             return None
         if "hook_processing_seconds" not in raw:
             return _DEFAULT_CONFIGURED_BUDGET_S
-        return _strict_hook_budget(raw["hook_processing_seconds"])
+        return strict_hook_budget(raw["hook_processing_seconds"])
     except (OSError, UnicodeError, ValueError):
         return None

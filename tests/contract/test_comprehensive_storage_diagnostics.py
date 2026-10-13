@@ -1,21 +1,20 @@
 """Real SQLite diagnostic and durable replay boundaries; no models or production data."""
 
-from contextlib import closing
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from scope_recall._version import __version__
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.admission import AdmissionPolicy
 from scope_recall.core.recall_policy import SPACE_ID
-from scope_recall.maintenance import doctor
+from scope_recall.maintenance import doctor, doctor_store
 from test_autonomous_admission import app_at, capture
 from v11_support import downgrade_store
 
@@ -44,7 +43,7 @@ def test_admission_counts_show_current_visible_sources_and_clear_after_activatio
         while work := tx.work.claim_next("TEST-worker", app.clock.utc_now(), lease_seconds=10):
             for item in work:
                 tx.work.complete(item.work_id, item.lease_token, item.lease_owner, now=app.clock.utc_now())
-    assert len(app.resume_deferred(ctx)) == 1
+    assert len(app.records.resume_deferred(ctx)) == 1
     assert app.status(ctx).deferred_sources == 0
     assert app.status(ctx).oldest_deferred_at is None
 
@@ -115,7 +114,7 @@ def test_host_replay_rejects_invalid_identity_keys(tmp_path, key):
 def _doctor_app(tmp_path, monkeypatch):
     app, ctx = app_at(tmp_path, AdmissionPolicy(max_pending_work=2, important_reserve=0))
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     return app, ctx
 
@@ -238,7 +237,7 @@ def test_doctor_names_answers_cut_off_at_the_output_limit(tmp_path, monkeypatch)
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     now = datetime.now(timezone.utc)
     with sqlite3.connect(app.storage.path) as conn:
-        for n in range(doctor.OUTPUT_TRUNCATION_ALERT):
+        for n in range(doctor_store.OUTPUT_TRUNCATION_ALERT):
             conn.execute(
                 "INSERT INTO work_error_details(work_id,lease_token,stage,error_code,error_field,recorded_at) VALUES (?,?,?,?,?,?)",
                 (
@@ -252,7 +251,7 @@ def test_doctor_names_answers_cut_off_at_the_output_limit(tmp_path, monkeypatch)
             )
     before = app.storage.path.read_bytes()
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
-    assert result.recent_output_truncations == doctor.OUTPUT_TRUNCATION_ALERT
+    assert result.recent_output_truncations == doctor_store.OUTPUT_TRUNCATION_ALERT
     assert "model_output_truncated" in result.capability_gaps and result.status == "degraded"
     [check] = [item for item in result.checks if item["name"] == "model_output"]
     assert "max_output_tokens" in check["detail"] and "thinking" in check["detail"]

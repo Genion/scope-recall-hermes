@@ -11,15 +11,13 @@ vectors paid for and dropped as stale.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
-from scope_recall.adapters.lance import LanceEmbedPort
 from scope_recall.core.recall_policy import claim_embedding_text, encode_embedding_text
-
-from test_v11_claims import accept, app, capture, draft, revise_request  # noqa: F401  (fixtures)
+from scope_recall.runtime.lance_port import LanceEmbedPort
+from test_claims import accept, app, capture, draft, revise_request  # noqa: F401  (fixtures)
 
 
 def _queue_only_embeds(core) -> None:

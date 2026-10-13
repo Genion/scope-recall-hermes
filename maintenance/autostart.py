@@ -4,19 +4,20 @@ operator's own timer (systemd or cron) to run."""
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from ..runtime.resume_entry import control_path, read_control
-from ..runtime.worker_entry import _atomic_metadata, load_config
+from ..core.storage import SQLiteStorage
+from ..runtime.scheduling import control_path, read_control
+from ..runtime.worker_entry import load_config, write_worker_metadata
 
 #: How the wake runs outside Windows: from the operator's timer.  Nothing here registers one.
 OPERATOR_TIMER = "operator_timer"
@@ -62,22 +63,26 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     config = load_config(config_path)
     if config_path.resolve().parent != config.binding.data_directory.resolve():
         raise ValueError("autostart_config_outside_binding")
-    from ..core.storage import SQLiteStorage
 
     with SQLiteStorage(config.binding).read(config.context()) as tx:
         tx.status()
     if env_file and (not Path(env_file).is_absolute() or not Path(env_file).is_file()):
         raise ValueError("autostart_environment_missing")
     name = "ScopeRecall-" + hashlib.sha256(config.binding.installation_id.encode()).hexdigest()[:20]
+    recorded = dict(
+        installation_id=config.binding.installation_id,
+        enabled=True,
+        task_name=name,
+        # The interpreter is recorded as given: the task must start the
+        # venv launcher, not the base interpreter its symlink points at.
+        config_path=str(config_path.resolve()),
+        python_executable=str(python),
+        env_file=str(Path(env_file).resolve()) if env_file else None,
+    )
     if not _windows():
         # No task to register and no principal to run it as: the operator's timer runs the wake as its own user.
         return dict(
-            installation_id=config.binding.installation_id,
-            enabled=True,
-            task_name=name,
-            config_path=str(config_path.resolve()),
-            python_executable=str(python),
-            env_file=str(Path(env_file).resolve()) if env_file else None,
+            recorded,
             trigger="every_5_minutes_from_the_operator_timer",
             registration=OPERATOR_TIMER,
             **_posix_wake(name, config_path.resolve(), python),
@@ -132,14 +137,7 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     )
     node(action, "WorkingDirectory", str(config.binding.data_directory))
     return dict(
-        installation_id=config.binding.installation_id,
-        enabled=True,
-        task_name=name,
-        # The interpreter is recorded as given: the task must start the
-        # venv launcher, not the base interpreter its symlink points at.
-        config_path=str(config_path.resolve()),
-        python_executable=str(python),
-        env_file=str(Path(env_file).resolve()) if env_file else None,
+        recorded,
         trigger="user_logon_and_every_5_minutes",
         xml=ET.tostring(task, encoding="unicode"),
     )
@@ -150,7 +148,7 @@ def apply(prepared):
     if not _windows():
         # The control file is what the wake reads (``resume_entry``); the operator installs the timer that runs it.
         control = {key: value for key, value in prepared.items() if key not in _TIMER_FIELDS}
-        _atomic_metadata(control_path(config), control)
+        write_worker_metadata(control_path(config), control)
         return dict(
             control,
             **{key: prepared[key] for key in _TIMER_FIELDS},
@@ -165,7 +163,7 @@ def apply(prepared):
         raise ValueError("autostart_task_ownership_unverified")
     # Disabled control prevents a trigger racing registration from doing work.
     control = {k: v for k, v in prepared.items() if k != "xml"}
-    _atomic_metadata(control_path(config), dict(control, enabled=False))
+    write_worker_metadata(control_path(config), dict(control, enabled=False))
     with tempfile.TemporaryDirectory(prefix="scope-recall-task-") as temp:
         path = Path(temp) / "task.xml"
         path.write_text(prepared["xml"], encoding="utf-16")
@@ -176,9 +174,9 @@ def apply(prepared):
         )
     if result.returncode:
         if previous is not None:
-            _atomic_metadata(control_path(config), previous)
+            write_worker_metadata(control_path(config), previous)
         raise ValueError("autostart_registration_failed")
-    _atomic_metadata(control_path(config), control)
+    write_worker_metadata(control_path(config), control)
     return control
 
 
@@ -190,12 +188,12 @@ def disable(config_path, *, remove=False):
     if remove and control.get("registration_state") == "removed":
         return dict(status="removed", task_name=control["task_name"])
     control["enabled"] = False
-    _atomic_metadata(control_path(config), control)
+    write_worker_metadata(control_path(config), control)
     if control.get("registration") == OPERATOR_TIMER:
         # The wake reads the control file and does nothing while it is disabled; the timer is the operator's.
         if remove:
             control["registration_state"] = "removed"
-            _atomic_metadata(control_path(config), control)
+            write_worker_metadata(control_path(config), control)
         return dict(
             status="removed" if remove else "paused",
             task_name=control["task_name"],
@@ -211,7 +209,7 @@ def disable(config_path, *, remove=False):
         raise ValueError("autostart_unregister_failed")
     if remove:
         control["registration_state"] = "removed"
-        _atomic_metadata(control_path(config), control)
+        write_worker_metadata(control_path(config), control)
     return dict(status="removed" if remove else "paused", task_name=control["task_name"])
 
 

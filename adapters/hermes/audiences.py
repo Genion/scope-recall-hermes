@@ -66,8 +66,8 @@ def normalize_local_platforms(values: object) -> tuple[str, ...]:
 def normalize_owner_logins(values: object) -> tuple[tuple[str, str], ...]:
     """Dashboard logins an installer approves as the owner's own, each on one local surface: ``desktop=basic:alice``.
 
-    The host passes a login there as the session's ``user_id`` (``<provider>:<user>``) and names no chat
-    (#175).  Approving one is the owner principal ``(platform, login)``, as approving the surface for a
+    The host passes a login there as the session's ``user_id`` (``<provider>:<user>``) and names no
+    chat.  Approving one is the owner principal ``(platform, login)``, as approving the surface for a
     session that names nobody is ``(platform, "local")``.
     """
     if not isinstance(values, (list, tuple)):
@@ -140,7 +140,7 @@ def normalize_retained_scope_ids(values: object) -> frozenset[str]:
     return frozenset(_scope_ids(values, field="retained_scope_ids"))
 
 
-def _audience_entry(
+def audience_entry(
     *,
     platform: str,
     user_id: str,
@@ -192,7 +192,7 @@ def _audience_entry(
     }
 
 
-def _normalize_audience_entry(value: object) -> dict[str, Any]:
+def normalize_audience_entry(value: object) -> dict[str, Any]:
     """Reject pre-upgrade or incomplete rows rather than inferring new grants."""
     required = {*EXACT_FIELDS, "allowed_scope_ids", "writable_scope_ids", "capture_scope_id"}
     if not isinstance(value, dict) or not required <= value.keys():
@@ -201,4 +201,4 @@ def _normalize_audience_entry(value: object) -> dict[str, Any]:
         raise HermesIdentityError("unsupported audience fields")
     if not isinstance(value["allowed_scope_ids"], list) or not isinstance(value["writable_scope_ids"], list):
         raise HermesIdentityError("audience read/write scope sets must be explicit lists")
-    return _audience_entry(**{key: value[key] for key in required}, kind=value.get("kind", "conversation"))
+    return audience_entry(**{key: value[key] for key in required}, kind=value.get("kind", "conversation"))

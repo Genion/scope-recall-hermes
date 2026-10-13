@@ -8,27 +8,26 @@ Sources are synthetic; nothing here is a person's memory.
 
 from __future__ import annotations
 
-from contextlib import closing
-from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-
 from scope_recall.adapters.clients import CodexHookHandler
 from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
 from scope_recall.adapters.clients.mcp_server import build_server
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter
 from scope_recall.adapters.hermes.authorization import build_ingress_authorizer
 from scope_recall.adapters.hermes.identity import host_scope_payload, principal_ref
-from scope_recall.adapters.hermes.installation import (
+from scope_recall.adapters.hermes.installation import build_installation_manifest
+from scope_recall.adapters.hermes.shared_entries import (
     attach_shared_entry,
     attach_shared_record,
-    build_installation_manifest,
     client_entry_record,
     load_binding_for_home,
     new_shared_payload,
@@ -1139,12 +1138,18 @@ def test_a_prompt_blank_for_its_first_8192_characters_is_recalled_by_what_follow
         told.sync_turn("TEST 白鹭项目的负责人是 KZ-42。", "好的。", session_id="TEST-session-1")
     finally:
         told.shutdown()
+    # What attach writes, so the hook has a real entry's 6 s: with no runtime config a test entry's hook gets 2 s,
+    # which a slow runner's first recall from a cold store outlived, and no context came back.
+    (client / "scope-recall" / "runtime-config.json").write_text(
+        json.dumps({"auto_recall_seconds": 5.0}), encoding="utf-8"
+    )
     hook = _hook(client)
     try:
         result = hook.handle_payload(_prompt(" " * 9000 + "白鹭项目的负责人 KZ-42 是谁", prompt_id="TEST-prompt-blank"))
     finally:
         hook.close()
     assert hook.diagnostics.last_reason != "recall_exception", hook.diagnostics.recall_error_detail
+    assert "hookSpecificOutput" in result, (hook.diagnostics.last_reason, hook.diagnostics.recall_error_detail)
     body = result["hookSpecificOutput"]["additionalContext"].partition("\n")[2]
     assert any("KZ-42" in item["content"] for item in json.loads(body)["items"])
 
@@ -1228,8 +1233,9 @@ def _hook_entry(monkeypatch, raw, client):
     return hook_entry.main(["--home", str(client), "--host", "claude-code"])
 
 
-def _counted(endpoint, monkeypatch, *, delay=0.0):
-    """Count the recalls the server runs; ``delay`` keeps each one waiting that long first."""
+def _counted(endpoint, monkeypatch, *, delay=0.0, hold=None, finished=None):
+    """Count the recalls the server runs; ``delay`` keeps each one waiting that long first, ``hold`` (an event) until
+    the test sets it, at most a minute, and ``finished`` gets each prompt whose recall has ended."""
     import time
 
     calls = []
@@ -1238,7 +1244,13 @@ def _counted(endpoint, monkeypatch, *, delay=0.0):
     def recall(request, **kwargs):
         calls.append(request["payload"].get("prompt"))
         time.sleep(delay)
-        return real(request, **kwargs)
+        if hold is not None:
+            hold.wait(60.0)
+        try:
+            return real(request, **kwargs)
+        finally:
+            if finished is not None:
+                finished.append(request["payload"].get("prompt"))
 
     monkeypatch.setattr(endpoint, "recall", recall)
     return calls
@@ -1290,19 +1302,25 @@ def test_a_late_answer_leaves_the_prompt_stored_once(resident, small_reserve, mo
     """The first version had the server store the prompt too: one that answered after its hook stopped waiting left
     the prompt stored twice.  The server now only recalls, and the hook recalls itself; while its late recall runs, the
     server tells the next prompt at once that it is busy."""
-    import time
+    import threading
 
+    from scope_recall.adapters.clients import handler as handler_module
+
+    # A real entry's 6 s: on the 2 s default, a slow runner's write of the prompt left no time to ask the server.
+    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 6.0)
     root, client, endpoint = resident
-    calls = _counted(endpoint, monkeypatch, delay=3.0)
+    release, finished = threading.Event(), []
+    calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
     raw = json.dumps(_prompt("TEST 常驻进程答得太晚。", prompt_id="TEST-prompt-late")).encode()
     assert _hook_entry(monkeypatch, raw, client) == 0
     assert "CODEX_RECALL_RESIDENT:late" in capsys.readouterr().err
-    time.sleep(0.5)  # past the time the hook gave its server
+    assert _eventually(endpoint._stuck), "past the time the hook gave its server"
     raw = json.dumps(_prompt("TEST 下一句不再等它。", prompt_id="TEST-prompt-after-late")).encode()
     assert _hook_entry(monkeypatch, raw, client) == 0
     assert "CODEX_RECALL_RESIDENT:busy" in capsys.readouterr().err and endpoint.path.exists()
     assert calls == ["TEST 常驻进程答得太晚。"], "later prompts go past it"
-    time.sleep(3.0)  # the server's late recall ends
+    release.set()
+    assert _eventually(lambda: finished), "the server's late recall ends"
     assert sorted(_user_rows(root)) == [("TEST 下一句不再等它。",), ("TEST 常驻进程答得太晚。",)]
 
 
@@ -1874,7 +1892,7 @@ def test_a_server_answer_without_its_vector_search_gives_way_to_the_hook_s_own(
         )
 
 
-def test_a_hook_whose_own_recall_went_without_vectors_waits_for_its_server(resident, monkeypatch, capsys):
+def test_a_hook_whose_own_recall_went_without_vectors_waits_for_its_server(resident, ample_budget, monkeypatch, capsys):
     """Recalling alongside, the hook stopped waiting the moment its own recall was done, dropped an answer that came in
     the time it had given the server, and called the server late (review of rc11).  A hook whose own recall had no
     vector search waits until its own time is up; one whose own had it does not."""
@@ -1883,9 +1901,9 @@ def test_a_hook_whose_own_recall_went_without_vectors_waits_for_its_server(resid
     from scope_recall.adapters.clients import handler as handler_module
 
     _root, client, endpoint = resident
-    monkeypatch.setattr(
-        "scope_recall.adapters.clients.prompt_recall._LOCAL_RECALL_RESERVE_S", 5.0
-    )  # alongside from the start
+    # Alongside from the start: the reserve is more than the whole budget, which is ample so that a slow runner's
+    # write of the prompt leaves the server its time.
+    monkeypatch.setattr("scope_recall.adapters.clients.prompt_recall._LOCAL_RECALL_RESERVE_S", 60.0)
     monkeypatch.setattr("scope_recall.adapters.clients.prompt_recall._RESIDENT_MIN_S", 0.5)
 
     def slow(request, **kwargs):
@@ -2591,7 +2609,6 @@ def test_a_kept_handler_that_raised_or_could_not_attach_its_runtime_is_made_anew
     every later prompt without its vector search (review of rc12).  One whose recall raised is not trusted with the
     next."""
     import pytest
-
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
 
     _KeptFake.made = []
@@ -2745,20 +2762,20 @@ def _embedding_entry(base, monkeypatch, *, delay=0.0):
     connection idle for 1 s, as a provider closes an idle keep-alive one, and answers each request after ``delay``
     seconds, and a SQLite vector store."""
     import http.server
-    from pathlib import Path
     import threading
     import time
+    from pathlib import Path
 
-    from scope_recall.adapters import models
-    from scope_recall.adapters.hermes.installation import (
+    from scope_recall.adapters.hermes.installation import build_installation_manifest
+    from scope_recall.adapters.hermes.shared_entries import (
         attach_shared_entry,
-        build_installation_manifest,
         new_shared_payload,
         read_shared_payload,
         write_shared_payload,
     )
     from scope_recall.maintenance.shared import attach
-    from scope_recall.runtime.instance import RuntimeInstanceConfig
+    from scope_recall.runtime import models
+    from scope_recall.runtime.instance_config import RuntimeInstanceConfig
     from scope_recall.runtime.worker_entry import load_config
     from scope_recall.vector.store import build_vector_store
 
@@ -3604,7 +3621,7 @@ def test_a_workbuddy_record_s_own_user_messages_are_not_the_person_s(workbuddy):
     assert _wb_said(root, "user") == [("user", "human_direct", "/review a.py")]
 
 
-def test_a_workbuddy_message_queued_while_a_turn_ran_is_kept_from_the_record(workbuddy):
+def test_a_workbuddy_message_queued_while_a_turn_ran_is_kept_from_the_record(workbuddy, ample_budget):
     """Messages sent while a turn ran are merged into one, a ``<user_query>`` block each, and the prompt hook is handed
     only the last: the others are read from the record."""
     root, home, projects = workbuddy
@@ -3821,8 +3838,8 @@ def test_dsh_sends_no_session_end(dsh):
 
 # -- dsh's plugin (``distribution/dsh/scope-recall/index.mjs``) driven as dsh drives it, without dsh -------------------
 # node runs the plugin with a fake ``ctx`` (``dsh_harness/harness.mjs``) through one turn; the plugin runs the real hook
-# client against the test store.  The harness drops the interpreter's ``-I`` (``dsh_harness/hooks.mjs``), so the hook
-# imports this checkout through tests/sitecustomize.py.  Skipped where node (20.6 or later, for module hooks) is not
+# client against the test store.  The harness binds this checkout inside isolated Python and drops host editable
+# bridges (``dsh_harness/child_process_mock.mjs``).  Skipped where node (20.6 or later, for module hooks) is not
 # installed; the gate lets the host tier run the node it found (``SCOPE_RECALL_TEST_NODE``).
 
 DSH_PLUGIN = Path(__file__).resolve().parents[3] / "distribution" / "dsh" / "scope-recall" / "index.mjs"
@@ -3845,6 +3862,10 @@ _NEEDS_NODE = pytest.mark.skipif(not _node_ok(), reason="node 20.6 or later is n
 
 
 def _run_plugin(config: dict, scenario: str = "turn", env: dict | None = None) -> dict:
+    # The plugin ends a prompt hook at 9 s, answered or not.  On a slow Windows runner one outlived that before it
+    # stored the prompt, which the Stop then stored from the turn's messages (``record:u-0``, not ``user:1``); the
+    # plugin takes the answer as soon as it is whole, so the longest wait it allows costs a test nothing.
+    config = {"recallTimeoutMs": 30_000, **config}
     process = subprocess.run(
         [
             NODE,
@@ -3925,7 +3946,10 @@ def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end
         "the prompt (the step's last message of the person's) and the reply once each, the message taken with the "
         "prompt and what was said in between from the record, and none of dsh's own context"
     )
-    assert _plugin_keys(root) == ["assistant:1", "record:a-1", "record:u-1", "user:1"], "the reply is the turn's"
+    assert _plugin_keys(root) == ["assistant:1", "record:a-1", "record:u-1", "user:1"], (
+        "the reply is the turn's",
+        result["status"],
+    )
 
 
 @_NEEDS_NODE
@@ -3937,7 +3961,7 @@ def test_a_turn_that_did_not_complete_has_no_reply_and_keeps_what_was_said(dsh, 
         {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "endReason": "aborted"}
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None
-    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"]
+    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
 
 
 @_NEEDS_NODE
@@ -3945,6 +3969,12 @@ def test_a_message_that_comes_while_a_turn_is_stored_is_kept_and_stored_with_the
     """The person's next message, and the next turn, come while the first turn's Stop runs: the store rewrites the spool
     from what it holds then, not from what it read before, and stores the rest when that turn ends."""
     root, home = dsh
+    # Each Stop is a process of its own; on a slow runner the 2 s a test entry's hooks get stored a line or two a Stop,
+    # and the turns' lines outlasted the harness's wait.  The entry's hooks get the 6 s a real entry's have, and no
+    # resident recall server, as without a runtime config: one kept running holds its lock past the test's end.
+    (home / "scope-recall" / "runtime-config.json").write_text(
+        json.dumps({"hook_processing_seconds": 6, "resident_recall_minutes": 0}), "utf-8"
+    )
     result = _run_plugin(
         {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "overlap": True}
     )
@@ -3970,7 +4000,7 @@ def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_inpu
         }
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None, result["warnings"]
-    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"]
+    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
     stored = [content for role, _origin, content in _plugin_rows(root) if role == "assistant"]
     assert all(
         content.endswith("more characters not kept by Scope Recall]") and len(content.encode("utf-8")) < 36_000

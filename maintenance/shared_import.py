@@ -10,7 +10,7 @@ embeddings the source store had: every source it embedded whose vector its
 retention had not expired, and every fact's current version -- less the tool
 outputs retention would expire at once (a withheld output's summary, a repeat),
 which are recorded as expired instead.  Until the worker has made them, those
-memories are found by their words.
+memories are recalled by their words.
 
 Three things cannot be copied as they are.
 
@@ -36,19 +36,19 @@ work is, as new work.  A store already imported for the entry is refused.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from urllib.request import pathname2url
 
-from ..adapters.hermes.installation import read_shared_payload
+from ..adapters.hermes.shared_entries import read_shared_payload
 from ..core import lexical_index
 from ..core.delete_storage import group_digest
 from ..core.events import indexed_terms, withheld_tool_output
@@ -57,6 +57,7 @@ from ..core.truth_connection import connect_truth_database
 from ..core.writer_lease import TruthWriterBusyError
 from ..runtime.running_code import live_records
 from ..runtime.vector_retention import OMITTED_TOOL_OUTPUT, REPEATED_TOOL_OUTPUT
+from .shared_run import Run, SharedStoreError
 
 #: Store versions whose tables this import reads.  An older store is upgraded first.
 SOURCE_SCHEMAS = frozenset({1109, 1110})
@@ -418,8 +419,8 @@ def _import_rows(conn, src, names: _Names, *, store_installation: str, store_sco
         conn.execute("SELECT i.old_id, t.term_id FROM temp.import_terms i JOIN lexical_terms t ON t.term=i.term")
     )
     conn.execute("DROP TABLE temp.import_terms")
-    # A withheld tool output's placeholder is found by its error text alone, when it carries one; the rest of the
-    # postings an older release gave it stay behind (#206).
+    # A withheld tool output's placeholder is indexed by its error text alone, when it carries one; the rest of the
+    # postings an older release gave it stay behind.
     withheld: dict[int, tuple[str, ...]] = {}
     for source_id, role, content in src.execute(
         f"SELECT e.source_id, e.role, e.content FROM source_events e WHERE e.role='tool' AND {OMITTED_TOOL_OUTPUT}"
@@ -496,10 +497,10 @@ def _drop_expirable_embeddings(conn, names: _Names, *, now: str) -> int:
 
     A summary the capture filter left for an output it withheld, and a repeat of an earlier tool
     output in the same scope, are what the intake gate keeps as sources only.  A store from an
-    earlier release embedded them anyway, and its embed history queued them again: the pilot's
-    import put 12,953 of them in front of the shared worker, each embedded and then deleted by
-    retention within the hour.  They are recorded as expired, under the reason retention gives,
-    and never asked for; the text and everything drawn from it stay, found by their words.
+    earlier release embedded them anyway, and its embed history would queue them again: thousands
+    in front of the shared worker, each embedded and then deleted by retention within the hour.
+    They are recorded as expired, under the reason retention gives, and never asked for; the text
+    and everything drawn from it stay, recalled by their words.
     """
     rows = conn.execute(
         f"""SELECT w.work_id, e.event_id, e.source_revision,
@@ -521,8 +522,6 @@ def _drop_expirable_embeddings(conn, names: _Names, *, now: str) -> int:
 def import_entry(
     *, root: Path, entry_id: str, source: Path, dry_run: bool = False, now: str | None = None
 ) -> dict[str, Any]:
-    from .shared import SharedStoreError, _Run
-
     now = now or _now()
     payload = read_shared_payload(root)
     record = next((e for e in payload["entries"] if e["entry_id"] == entry_id and not e.get("detached_at")), None)
@@ -602,5 +601,5 @@ def import_entry(
         src.close()
     result["import_seconds"] = round(time.monotonic() - started, 1)
     if not dry_run:
-        result["receipt"] = _Run(root, f"import-{entry_id}", now).receipt(result)
+        result["receipt"] = Run(root, f"import-{entry_id}", now).receipt(result)
     return result

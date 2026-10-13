@@ -7,8 +7,8 @@ entry of a shared store: its wrappers then name the home, not a config."""
 
 from __future__ import annotations
 
-from pathlib import Path
 import shlex
+from pathlib import Path
 from typing import Any
 
 from scope_recall.adapters.clients.config import (
@@ -18,18 +18,28 @@ from scope_recall.adapters.clients.config import (
     load_codex_config,
     load_shared_client,
 )
-from scope_recall.adapters.hermes.installation import ATTACHMENT_FILENAME, attachment_path
+from scope_recall.adapters.hermes.shared_entries import ATTACHMENT_FILENAME, attachment_path
 
+from . import install_client
+from .install_client import (  # noqa: F401 -- install.py calls these on every host's module
+    approve_local_platforms,
+    home_plugin_dir,
+    host_config_files,
+    instance_wrapper_files,
+    unapproved_local_platforms,
+    unapproved_owner_logins,
+    validate_local_platforms,
+    validate_owner_logins,
+)
 from .install_common import (
     BACKUP_DIRNAME,
     RECEIPT_FILENAME,
     SKILLS,
     InstallError,
     InstallPlan,
-    _json_dump,
-    _manifest_version,
-    _reject_symlink_chain,
-    _require_file,
+    json_dump,
+    manifest_version,
+    reject_symlink_chain,
 )
 
 CODEX_HOOK_EVENTS = frozenset({"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "Interrupt", "SessionEnd"})
@@ -63,55 +73,8 @@ def config_path(instance_root: Path) -> Path:
     return attachment_path(instance_root) if attached(instance_root) else instance_root / CONFIG_FILENAME
 
 
-def instance_wrapper_files(instance_root: Path) -> tuple[Path, ...]:
-    """Codex keeps every wrapper inside the plugin directory."""
-    return ()
-
-
-def home_plugin_dir(instance_root: Path) -> None:
-    """Codex finds its plugin by its own configuration; no plugin directory sits inside the instance root."""
-    return None
-
-
-def host_config_files(target_plugin_dir: Path) -> tuple[Path, ...]:
-    """The plugin is the installer's own; no file of the host's configuration is changed."""
-    return ()
-
-
 def validate_options(agent_workspace: str | None, env_file: Path | str | None) -> tuple[str, Path | None]:
-    """Codex starts the MCP server and hooks with its own environment, so the
-    installer may hand them a credential file; audience workspaces are a Hermes
-    concept and are refused here."""
-    if agent_workspace is not None and str(agent_workspace).strip():
-        raise InstallError("agent_workspace is not used for Codex installation")
-    if env_file is None or str(env_file).strip() == "":
-        return "", None
-    return "", _require_file(Path(env_file), "env_file")
-
-
-def validate_local_platforms(values: object) -> tuple[str, ...]:
-    """A Codex installation has one local user and no audiences to approve."""
-    if values:
-        raise InstallError("local_platform is only used for Hermes installation")
-    return ()
-
-
-def validate_owner_logins(values: object) -> tuple[str, ...]:
-    if values:
-        raise InstallError("owner_login is only used for Hermes installation")
-    return ()
-
-
-def unapproved_owner_logins(plan: InstallPlan) -> tuple[tuple[str, str], ...]:
-    return ()
-
-
-def unapproved_local_platforms(plan: InstallPlan) -> tuple[str, ...]:
-    return ()
-
-
-def approve_local_platforms(plan: InstallPlan) -> None:
-    return None
+    return install_client.validate_options(agent_workspace, env_file, "Codex")
 
 
 def _binding_argv(config: Path) -> list[str]:
@@ -185,7 +148,7 @@ def _mcp_json(
 def _plugin_json(plugin_name: str) -> dict[str, Any]:
     return {
         "name": plugin_name,
-        "version": _manifest_version(),
+        "version": manifest_version(),
         "description": "Scope Recall local Codex plugin",
         "author": {"name": "Local developer"},
         "interface": {
@@ -207,16 +170,16 @@ def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
         raise InstallError("project_root is required for a Codex installation of its own")
     launcher = plan.target_plugin_dir / "hooks" / WINDOWS_HOOK_LAUNCHER
     return {
-        plan.target_plugin_dir / ".codex-plugin" / "plugin.json": _json_dump(_plugin_json(plan.target_plugin_dir.name)),
+        plan.target_plugin_dir / ".codex-plugin" / "plugin.json": json_dump(_plugin_json(plan.target_plugin_dir.name)),
         launcher: _windows_hook_launcher_bytes(plan.python_executable, config, env_file=plan.env_file),
-        plan.target_plugin_dir / "hooks" / "hooks.json": _json_dump(
+        plan.target_plugin_dir / "hooks" / "hooks.json": json_dump(
             _hooks_json(plan.python_executable, config, windows_launcher=launcher, env_file=plan.env_file)
         ),
         **{
             plan.target_plugin_dir / "skills" / name / "SKILL.md": source.read_text(encoding="utf-8")
             for name, source in SKILLS.items()
         },
-        plan.target_plugin_dir / ".mcp.json": _json_dump(
+        plan.target_plugin_dir / ".mcp.json": json_dump(
             _mcp_json(plan.python_executable, config, plan.project_root, env_file=plan.env_file)
         ),
     }
@@ -269,6 +232,6 @@ def purge_identity(instance_root: Path) -> tuple[Path, str, str, Path]:
         raise InstallError("an entry of a shared store is never purged from its home; detach it instead")
     path = config_path(instance_root)
     config = load_codex_config(path)
-    _reject_symlink_chain(config.data_directory)
-    _reject_symlink_chain(path)
+    reject_symlink_chain(config.data_directory)
+    reject_symlink_chain(path)
     return config.data_directory.resolve(), config.installation_id, config.agent_id, path.resolve()

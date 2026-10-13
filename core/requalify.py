@@ -28,7 +28,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..contracts import ContractError
+from .claim_normalization import expand_frames
+from .claims import Qualification, bind_claim_subject, evidence_refs, qualify, same_assertion
+from .confirmation import CONFIRMED_REASON
+from .corroboration import CORROBORATED_REASON
+from .episodes import source_origin
 from .evidence_question import DERIVATION_ROOT_ORIGINS, NO_DERIVATION_ROOT_REASON
+from .mutate import apply_claim, register_applied_candidate
 
 #: Page ceiling.  Matches ``repair_frames``: large enough to finish a real
 #: store in a few passes, small enough that one pass is an ordinary transaction.
@@ -52,9 +58,6 @@ def _preserved_reasons() -> frozenset[str]:
 
     Imported lazily so this module stays free of import cycles with ``mutate``.
     """
-    from .confirmation import CONFIRMED_REASON
-    from .corroboration import CORROBORATED_REASON
-
     return frozenset({CONFIRMED_REASON, CORROBORATED_REASON})
 
 
@@ -76,18 +79,16 @@ class RequalifyReport:
         }
 
 
-def requalify_claims(tx, *, now: str, after_ref: str = "", limit: int = 16, dry_run: bool = True) -> RequalifyReport:
-    """Re-judge one bounded page of stored claims.  Returns what moved."""
-    from .claims import Qualification, bind_claim_subject, qualify, same_assertion
-    from .mutate import evidence_refs
+def _page(tx, after_ref: str, limit: int) -> list:
+    """The refs of one page of the claims this context may read and nothing blocks, after ``after_ref`` in ref order.
 
+    Authorization filters before pagination, so a visited prefix or another audience cannot starve the records behind
+    it.
+    """
     if type(limit) is not int or type(limit) is bool or not 1 <= limit <= MAX_PAGE:
         raise ContractError("INPUT_INVALID", "requalify_limit")
     if type(after_ref) is not str:
         raise ContractError("INPUT_INVALID", "requalify_cursor")
-
-    # Authorization filters before pagination, so a visited prefix or another
-    # audience cannot starve the records behind it.
     scopes = sorted(tx.context.allowed_scope_ids)
     rows = (
         tx._check()
@@ -100,13 +101,22 @@ def requalify_claims(tx, *, now: str, after_ref: str = "", limit: int = 16, dry_
         )
         .fetchall()
     )
+    return [row[0] for row in rows]
 
+
+def _head(tx, ref: str):
+    """The claim's current version, or None."""
+    return next((v for v in tx.claims.versions(ref) if v.revision == v.current_revision), None)
+
+
+def requalify_claims(tx, *, now: str, after_ref: str = "", limit: int = 16, dry_run: bool = True) -> RequalifyReport:
+    """Re-judge one bounded page of stored claims.  Returns what moved."""
+    refs = _page(tx, after_ref, limit)
     preserved = _preserved_reasons()
     report = RequalifyReport(applied=not dry_run)
-    for row in rows:
-        ref = row[0]
+    for ref in refs:
         report.last_ref = ref
-        head = next((v for v in tx.claims.versions(ref) if v.revision == v.current_revision), None)
+        head = _head(tx, ref)
         if head is None or head.state not in REQUALIFIABLE_STATES:
             continue
         if head.reason in preserved:
@@ -170,31 +180,11 @@ def retire_rootless_proposals(
     changed since they were written (on the pilot, 154 of them, promotions included), and retiring
     these must not bring that along.  The report names refs and verdicts only, never claim text.
     """
-    from .claims import Qualification
-    from .episodes import source_origin
-    from .mutate import evidence_refs
-
-    if type(limit) is not int or type(limit) is bool or not 1 <= limit <= MAX_PAGE:
-        raise ContractError("INPUT_INVALID", "requalify_limit")
-    if type(after_ref) is not str:
-        raise ContractError("INPUT_INVALID", "requalify_cursor")
-    scopes = sorted(tx.context.allowed_scope_ids)
-    rows = (
-        tx._check()
-        .execute(
-            f"""SELECT claim_id FROM claims WHERE claim_id>? AND read_blocked=0 AND suppressed=0
-            AND scope_id IN ({",".join("?" for _ in scopes)})
-            AND project_id IS ? AND branch_id IS ?
-            ORDER BY claim_id LIMIT ?""",
-            (after_ref, *scopes, tx.context.project_id, tx.context.branch_id, limit),
-        )
-        .fetchall()
-    )
+    refs = _page(tx, after_ref, limit)
     report = RequalifyReport(applied=not dry_run)
-    for row in rows:
-        ref = row[0]
+    for ref in refs:
         report.last_ref = ref
-        head = next((v for v in tx.claims.versions(ref) if v.revision == v.current_revision), None)
+        head = _head(tx, ref)
         if head is None or head.state != "proposed":
             continue
         report.examined += 1
@@ -240,3 +230,96 @@ __all__ = [
     "requalify_claims",
     "retire_rootless_proposals",
 ]
+
+
+def repair_frames(tx, *, now, after_ref="", limit=16):
+    """Bounded upgrade repair through the ordinary evidence/application path.
+
+    The caller persists the cursor; old versions and original sources remain.
+    No model call, manual approval, or fabricated claim payload is involved.
+    """
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise ContractError("INPUT_INVALID", "normalization_limit")
+    # Filter authorization before pagination so an already-visited prefix or
+    # another audience cannot starve later records.
+    scopes = sorted(tx.context.allowed_scope_ids)
+    rows = (
+        tx._check()
+        .execute(
+            f"""SELECT claim_id FROM claims WHERE claim_id>? AND read_blocked=0 AND suppressed=0
+        AND scope_id IN ({",".join("?" for _ in scopes)}) AND project_id IS ? AND branch_id IS ?
+        ORDER BY claim_id LIMIT ?""",
+            (after_ref, *scopes, tx.context.project_id, tx.context.branch_id, limit),
+        )
+        .fetchall()
+    )
+    repaired, errors = [], []
+    for row in rows:
+        versions = tx.claims.versions(row[0])
+        head = next((v for v in versions if v.revision == v.current_revision), None)
+        if head is None or head.state not in {"active", "proposed", "disputed"}:
+            continue
+        try:
+            with tx.savepoint():
+                roots = tx.claims.roots(evidence_refs(head.payload))
+                frames = expand_frames(head.payload, roots)
+                if len(frames) == 1 and same_assertion(head.payload, frames[0]):
+                    continue
+                mutation = apply_claim(tx, frames[0], head.scope_id, now)
+                register_applied_candidate(tx, mutation, now)
+                for sibling in frames[1:]:
+                    sibling_mutation = apply_claim(tx, sibling, head.scope_id, now)
+                    register_applied_candidate(tx, sibling_mutation, now)
+                    repaired.append(
+                        {
+                            "original_ref": head.ref,
+                            "ref": sibling_mutation.ref,
+                            "revision": sibling_mutation.revision,
+                            "state": sibling_mutation.state,
+                            "disposition": sibling_mutation.disposition,
+                        }
+                    )
+                if mutation.ref != head.ref and mutation.state == "active" and head.state in {"active", "disputed"}:
+                    # Retire a duplicate legacy frame only after its corrected
+                    # canonical replacement passed ordinary evidence admission.
+                    # Append a version; never rewrite the original payload.
+                    retired = tx.claims.append(
+                        head.scope_id,
+                        head.payload,
+                        Qualification("retracted", head.basis, "canonical_frame_reconciled"),
+                        recorded_at=now,
+                        previous=head,
+                    )
+                    tx.candidates.register(retired.ref, retired.revision, observed_at=now, schedule_initial=False)
+                if mutation.ref != head.ref and head.state == "proposed":
+                    conn = tx._check(write=True)
+                    conn.execute(
+                        "UPDATE candidate_lifecycle SET processing_state='archived',reason='canonical_frame_reconciled',updated_at=? WHERE candidate_ref=?",
+                        (now, head.ref),
+                    )
+                    conn.execute(
+                        "UPDATE work_items SET state='obsolete',last_error_code='canonical_frame_reconciled' WHERE work_type='evaluate_candidate' AND subject_ref=? AND state IN ('pending','leased')",
+                        ("candidate:" + head.ref,),
+                    )
+                    conn.execute(
+                        "UPDATE candidate_evaluations SET state='obsolete',reason='canonical_frame_reconciled',completed_at=? WHERE candidate_ref=? AND state='queued'",
+                        (now, head.ref),
+                    )
+                repaired.append(
+                    {
+                        "original_ref": head.ref,
+                        "ref": mutation.ref,
+                        "revision": mutation.revision,
+                        "state": mutation.state,
+                        "disposition": mutation.disposition,
+                    }
+                )
+        except ContractError as exc:
+            errors.append({"ref": head.ref, "code": exc.code, "field": exc.field})
+    return {
+        "cursor": rows[-1][0] if rows else after_ref,
+        "scanned": len(rows),
+        "items": repaired,
+        "errors": errors,
+        "done": len(rows) < limit,
+    }

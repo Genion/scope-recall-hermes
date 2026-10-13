@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 
 from ..contracts import ContractError
-from .storage import StoredSource
+from .source_records import StoredSource
 
 
 @dataclass(frozen=True)

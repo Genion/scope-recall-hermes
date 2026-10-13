@@ -7,6 +7,7 @@ import sqlite3
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter
 from scope_recall.adapters.hermes.boundary import SourceObservationLedger, pre_llm_source_event, sync_turn_source_events
 from scope_recall.core import capture_inbox
+
 from tests.v11_support import context
 
 
@@ -290,7 +291,7 @@ def test_a_message_hermes_writes_itself_is_stored_as_the_host_s(adapter, hermes_
 def test_a_notice_whose_pre_llm_call_was_not_taken_is_still_the_host_s(adapter, hermes_home):
     """A busy session leaves pre_llm_call untaken, and sync_turn stores the turn's opening message instead."""
     provider, _clock = adapter
-    provider._session_busy(
+    provider._calls.busy(
         "pre_llm_call",
         {
             "turn_id": "turn-busy",
@@ -311,12 +312,12 @@ def test_a_late_sync_of_the_person_s_turn_keeps_their_words_theirs(adapter, herm
     person's message written then is still theirs (review of 3.7.2)."""
     provider, _clock = adapter
     said = "TEST 帮我看一下日志"
-    provider._session_busy(
+    provider._calls.busy(
         "pre_llm_call",
         {"turn_id": "turn-person", "user_message": said, "conversation_history": [{"role": "user", "content": said}]},
     )
     provider.on_turn_start(8, said)
-    provider._session_busy(
+    provider._calls.busy(
         "pre_llm_call",
         {
             "turn_id": "turn-host",
@@ -686,6 +687,7 @@ def test_a_busy_store_met_by_a_session_s_capture_retry_says_pending(adapter, ins
 
     from scope_recall.adapters.hermes.identity import host_scope_payload
     from scope_recall.core.writer_lease import TruthWriterBusyError
+
     from tests.v11_support import source_event
 
     provider, clock = adapter

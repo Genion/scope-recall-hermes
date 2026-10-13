@@ -11,8 +11,7 @@ from __future__ import annotations
 import json
 
 import pytest
-
-from scope_recall.adapters.models import AuxiliaryModelError
+from scope_recall.runtime.models import AuxiliaryModelError
 from test_responses_consolidation import CREDENTIAL_ENV, MODEL, FakeTransport, _answer, _payload, _runtime
 
 BACKSLASH = chr(92)
@@ -92,7 +91,7 @@ def test_a_secret_in_a_content_is_refused_before_anything_is_sent(tmp_path, monk
 
 def test_the_body_gate_still_guards_what_is_not_a_content(tmp_path, monkeypatch):
     """Blanking the contents must not blank the gate: a route field that reads like a secret is refused."""
-    from scope_recall.adapters import models
+    from scope_recall.runtime import models
 
     monkeypatch.setenv(CREDENTIAL_ENV, "test-key")
     transport = FakeTransport(lambda **kwargs: (200, _chat_answer()))
@@ -103,7 +102,7 @@ def test_the_body_gate_still_guards_what_is_not_a_content(tmp_path, monkeypatch)
     def body_with_a_leaking_field(messages):
         body = json.loads(original(messages).decode("utf-8"))
         body["metadata"] = {"note": "password: hunter2-not-a-placeholder"}
-        return models._json_bytes(body)
+        return models.json_bytes(body)
 
     monkeypatch.setattr(adapter, "_chat_body", body_with_a_leaking_field)
     with pytest.raises(AuxiliaryModelError, match="sensitive_request"):

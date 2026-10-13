@@ -1,19 +1,18 @@
 """Autonomous recovery remains finite, scoped, and honest about failures."""
 
-from dataclasses import replace
-from io import StringIO
 import json
 import sqlite3
+from dataclasses import replace
+from io import StringIO
 
 import pytest
-
+from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.worker import WorkerConfig, drain_worker
-from scope_recall.runtime.instance import RuntimeInstanceConfig
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.validation import utc_now as _now
 from scope_recall.runtime.worker_entry import _reserve_daily_work, persist_worker_status, run_worker
-from test_v11_worker import worker_app, app, capture, work_rows, _mark_embed_done
 from test_runtime_worker_entry import _binding, _config_payload, _write_config
-from scope_recall.core import CoreConfig, MemoryCore
+from test_worker import _mark_embed_done, app, capture, work_rows, worker_app
 
 
 def test_explicit_retry_preserves_automatic_retry_ceiling():
@@ -124,7 +123,7 @@ def test_failed_work_is_reported_even_with_no_pending(worker_app, monkeypatch):
     with sqlite3.connect(core.storage.path) as db:
         db.execute("UPDATE work_items SET state='failed',last_error_code='derivation_invalid'")
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert result.pending_work == 0 and result.failed_work == 2
@@ -156,6 +155,49 @@ def test_idle_worker_receipt_still_reports_terminal_failures(worker_app, tmp_pat
     saved = json.loads((ctx.binding.data_directory / "runtime-worker-status.json").read_text())
     assert saved["failed_work"] == 2 and saved["status"] != "degraded"
     assert "work_failed_terminal_only" in saved["capability_gaps"]
+
+
+def _failed_and_queued(core, ctx):
+    """One row failed with a fault; one queued for another attempt, keeping its last attempt's terminal error."""
+    capture(core, ctx, "TEST failed and queued work")
+    with sqlite3.connect(core.storage.path) as db:
+        failed, queued = (row[0] for row in db.execute("SELECT work_id FROM work_items ORDER BY work_id"))
+        db.execute("UPDATE work_items SET state='failed',last_error_code='http_400' WHERE work_id=?", (failed,))
+        db.execute(
+            "UPDATE work_items SET state='pending',last_error_code='auto_retry:1|derivation_invalid',"
+            "available_at='2099-01-01T00:00:00+00:00' WHERE work_id=?",
+            (queued,),
+        )
+
+
+def test_a_queued_row_s_old_error_does_not_hide_a_failure(worker_app, tmp_path):
+    """Counted among the failures, a queued row's terminal error took the failed row that needs a look out of the
+    count, and the pass said "terminal only"."""
+    core, ctx, _ = worker_app
+    _failed_and_queued(core, ctx)
+    path = _write_config(
+        tmp_path / "worker.json", _config_payload(ctx.binding, project_id=ctx.project_id, branch_id=ctx.branch_id)
+    )
+    output = StringIO()
+    run_worker(path, output=output)
+    result = json.loads(output.getvalue())
+    assert (result["pending_work"], result["failed_work"], result["terminal_failed_work"]) == (1, 1, 0)
+    assert result["status"] == "degraded" and "work_failed:1" in result["capability_gaps"]
+
+
+def test_the_doctor_reads_a_queued_row_s_old_error_apart_from_the_failures(worker_app, monkeypatch):
+    from scope_recall.maintenance import doctor
+
+    core, ctx, _ = worker_app
+    _failed_and_queued(core, ctx)
+    (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
+    result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    assert (result.failed_work, result.terminal_failed_work) == (1, 0)
+    assert result.work_error_counts == {"http_400": 1}
+    assert result.pending_error_counts == {"derivation_invalid": 1}
+    assert "work_failed" in result.capability_gaps
 
 
 def test_daily_processing_cap_never_resets_model_budget_and_resets_by_day(tmp_path, monkeypatch):

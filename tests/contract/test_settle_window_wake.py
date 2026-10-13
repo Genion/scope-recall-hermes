@@ -10,24 +10,23 @@ worker after every pass.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 import itertools
 import json
 import sqlite3
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
+from scope_recall.core import worker as worker_module
 from scope_recall.core.candidate_debounce import MAX_DEFERRAL_SECONDS, QUIET_SECONDS, settle_reason, settles_at
-from scope_recall.maintenance import doctor
+from scope_recall.core.claims import Qualification
+from scope_recall.maintenance import doctor, doctor_store
 from scope_recall.runtime import scheduling
-from scope_recall.runtime.instance import RuntimeInstanceConfig
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.scheduling import SupervisorControl, next_wake, supervise
 from scope_recall.runtime.worker_entry import _receipt_payload
-from scope_recall.core import worker as worker_module
-from scope_recall.core.claims import Qualification
-from test_r1_candidate_lifecycle import Evaluator, ModelRefusal, _candidate, _finish_source_work
-from test_v11_claims import app, capture  # noqa: F401  (app is a fixture)
+from test_candidate_lifecycle import Evaluator, ModelRefusal, _candidate, _finish_source_work
+from test_claims import app, capture  # noqa: F401  (app is a fixture)
 
 EVIDENCE = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)  # the claims fixture's clock
 EVERY_TYPE = {"purge", "rebuild_projection", "consolidate", "evaluate_candidate", "embed"}
@@ -120,7 +119,7 @@ def test_the_plan_waits_for_a_collecting_candidate_and_never_again_once_a_pass_h
     ready = EVIDENCE + timedelta(seconds=QUIET_SECONDS)
     # Without a consolidation route nothing evaluates, so nothing is worth waking for.
     assert next_wake(config, now=EVIDENCE + timedelta(seconds=60)).reason == "idle"
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
 
     plan = next_wake(config, now=EVIDENCE + timedelta(seconds=60))
     assert (plan.due_at, plan.reason) == (_stamp(ready), "candidate_settle_window")
@@ -174,7 +173,7 @@ def test_a_candidate_no_sweep_would_ask_about_wakes_no_worker(app, monkeypatch, 
     core, ctx = app
     _collecting(core, ctx)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     assert next_wake(config, now=EVIDENCE + timedelta(seconds=60)).reason == "candidate_settle_window"
     with sqlite3.connect(core.storage.path) as conn:
         conn.execute(change)
@@ -195,7 +194,7 @@ def test_a_pass_on_record_without_a_fraction_still_sees_a_later_readiness(app, m
     capture(core, ctx, "又发现 entity-blue property-blue 的相关证据。", key="TEST-214/fraction")
     _finish_source_work(core)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     ready = evidence + timedelta(seconds=QUIET_SECONDS)
     _passed(config, ready - timedelta(microseconds=500000))  # written as 12:15:00Z
     plan = next_wake(config, now=ready + timedelta(seconds=30))
@@ -205,7 +204,7 @@ def test_a_pass_on_record_without_a_fraction_still_sees_a_later_readiness(app, m
 def test_another_partition_s_candidate_wakes_no_worker_here(app, monkeypatch):
     core, ctx = app
     _collecting(core, ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     other, _path = _config(ctx, project_id="TEST-other-project")
     assert next_wake(other, now=EVIDENCE + timedelta(seconds=60)).reason == "idle"
 
@@ -215,7 +214,7 @@ def test_the_supervisor_waits_for_the_window_and_drains_when_it_closes(app, monk
     core, ctx = app
     _collecting(core, ctx)
     config, path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     elapsed = [60.0]  # the last message came a minute before the worker woke
     drains: list[float] = []
 
@@ -309,16 +308,16 @@ def test_the_doctor_names_work_and_candidates_that_waited_a_day(app, monkeypatch
         )
         conn.commit()
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     # Without an evaluator route, waiting candidates wait by design.
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: {"purge", "rebuild_projection"})
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: {"purge", "rebuild_projection"})
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert {row["project_id"] for row in result.unreached} == {"TEST-other-project"}
     # A candidate pending for another reason than new evidence is no finding either.
     monkeypatch.setattr(
         scheduling,
-        "_capable_work_types",
+        "capable_work_types",
         lambda config: {"purge", "rebuild_projection", "consolidate", "evaluate_candidate"},
     )
     with sqlite3.connect(core.storage.path) as conn:
@@ -352,15 +351,17 @@ def test_the_doctor_names_work_and_candidates_that_waited_a_day(app, monkeypatch
         conn.commit()
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert {row["project_id"]: row["work"] for row in result.unreached}.get("TEST-third-project") == 1
-    monkeypatch.setattr(doctor, "provider_holds", lambda auxiliary, now=None: {"rebuild_projection": ("TEST", 0.0)})
+    monkeypatch.setattr(
+        doctor_store, "provider_holds", lambda auxiliary, now=None: {"rebuild_projection": ("TEST", 0.0)}
+    )
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert {row["project_id"] for row in result.unreached} == {"TEST-project"}
     monkeypatch.undo()
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     monkeypatch.setattr(
         scheduling,
-        "_capable_work_types",
+        "capable_work_types",
         lambda config: {"purge", "rebuild_projection", "consolidate", "evaluate_candidate"},
     )
     # Within the day it is no finding.
@@ -376,7 +377,7 @@ def test_the_doctor_names_work_and_candidates_that_waited_a_day(app, monkeypatch
 
 def _doctor(core, ctx, monkeypatch):
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     return doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
 
@@ -400,7 +401,7 @@ def test_the_doctor_leaves_out_a_candidate_queued_blocked_or_muted(app, monkeypa
     core, ctx = app
     _collecting(core, ctx)
     _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     [old] = _days_ago(2)
     with sqlite3.connect(core.storage.path) as conn:
         conn.execute("UPDATE candidate_lifecycle SET updated_at=?,last_evidence_at=?", (old, old))
@@ -418,7 +419,7 @@ def test_the_doctor_names_each_partition_from_its_oldest_wait(app, monkeypatch):
     core, ctx = app
     _collecting(core, ctx)
     _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     two, three, four = _days_ago(2, 3, 4)
     with sqlite3.connect(core.storage.path) as conn:
         conn.execute("UPDATE candidate_lifecycle SET updated_at=?,last_evidence_at=?", (two, two))
@@ -447,7 +448,7 @@ def test_without_a_pass_on_record_a_ready_candidate_wakes_the_worker_once(app, m
     core, ctx = app
     _collecting(core, ctx)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     later = EVIDENCE + timedelta(seconds=QUIET_SECONDS, hours=3)
     plan = next_wake(config, now=later)
     assert (plan.due_at, plan.reason) == (_stamp(later), "candidate_settle_window")
@@ -465,7 +466,7 @@ def test_a_pass_that_did_not_sweep_is_not_repeated_for_the_candidates_at_once(ap
     core, ctx = app
     _collecting(core, ctx)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     ready = EVIDENCE + timedelta(seconds=QUIET_SECONDS)
     _passed(config, EVIDENCE)
     _unswept(config, ready + timedelta(seconds=5))
@@ -506,7 +507,7 @@ def test_the_supervisor_does_not_spin_on_passes_that_cannot_sweep(app, monkeypat
     core, ctx = app
     _collecting(core, ctx)
     config, path = _config(ctx, supervisor_seconds=3600, supervisor_max_drains=64)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     drains = _run(path, itertools.repeat((0, {"completed": 0, "settle_swept": False})), start=QUIET_SECONDS + 60)
     assert 2 <= len(drains) <= 5, drains
     assert all(later - earlier >= scheduling.SETTLE_RETRY_SECONDS for earlier, later in zip(drains, drains[1:])), drains
@@ -518,7 +519,7 @@ def test_a_sweep_that_stopped_at_its_page_goes_on_with_the_rest(app, monkeypatch
     core, ctx = app
     _collecting(core, ctx)
     config, path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     _passed(config, EVIDENCE - timedelta(minutes=1))
     passes = [(0, {"completed": 0, "settle_partial": True}), (0, {"completed": 0, "settle_swept": True})]
     drains = _run(path, iter(passes), start=QUIET_SECONDS + 60)
@@ -584,15 +585,15 @@ def test_a_route_without_a_budget_ledger_is_not_planned_for():
             ),
         )
 
-    assert scheduling._capable_work_types(config(None)) == {"purge", "rebuild_projection"}
-    assert scheduling._capable_work_types(config("TEST-ledger")) == EVERY_TYPE
+    assert scheduling.capable_work_types(config(None)) == {"purge", "rebuild_projection"}
+    assert scheduling.capable_work_types(config("TEST-ledger")) == EVERY_TYPE
 
 
 def test_the_scheduled_wake_launches_for_a_candidate_ready_with_no_pass_on_record(app, monkeypatch):
     """Right after an upgrade no control file has the record: the scheduled wake launches a worker, once, for a
     candidate that became ready meanwhile."""
-    from pathlib import Path
     import sys
+    from pathlib import Path
     from types import SimpleNamespace
 
     from scope_recall.maintenance import autostart
@@ -601,7 +602,7 @@ def test_the_scheduled_wake_launches_for_a_candidate_ready_with_no_pass_on_recor
     core, ctx = app
     _collecting(core, ctx)
     config, path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     monkeypatch.setattr(autostart, "_windows", lambda: False)
     autostart.apply(autostart.plan(path, Path(sys.executable), user_id=None))
     ready = EVIDENCE + timedelta(seconds=QUIET_SECONDS)
@@ -624,7 +625,7 @@ def test_a_candidate_another_worker_put_its_question_to_wakes_no_worker(app, mon
     core, ctx = app
     _collecting(core, ctx)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     ready = EVIDENCE + timedelta(seconds=QUIET_SECONDS)
     later = ready + timedelta(hours=1)
     assert next_wake(config, now=later).reason == "candidate_settle_window", "no pass on record: it counts"
@@ -652,7 +653,7 @@ def test_a_candidate_asked_about_as_its_evidence_came_wakes_no_worker(app, monke
         ).fetchone() == ("queued", _stamp(EVIDENCE))
     core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Evaluator())
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     assert next_wake(config, now=EVIDENCE + timedelta(seconds=60)).reason == "idle"
     assert next_wake(config, now=EVIDENCE + timedelta(seconds=QUIET_SECONDS + 60)).reason == "idle"
     # Stores written by earlier releases hold ``+00:00`` stamps too: the same moment, written otherwise.
@@ -717,7 +718,7 @@ def test_evidence_that_came_while_a_question_waited_wakes_the_worker_once_it_set
     with core.storage.read(ctx) as tx:
         assert tx.candidates.settled_to_schedule(now=core.clock.now) == ((saved.ref, saved.revision),)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     # With no pass on record, and with the pass that closed it on record: it began before it closed, here a second
     # before or at the same moment on this clock.
     for record in (None, answered - timedelta(seconds=1), answered):
@@ -801,7 +802,7 @@ def test_a_hold_older_than_the_last_sweep_holds_nothing(app, monkeypatch):
     core, ctx = app
     _collecting(core, ctx)
     config, _path = _config(ctx)
-    monkeypatch.setattr(scheduling, "_capable_work_types", lambda config: set(EVERY_TYPE))
+    monkeypatch.setattr(scheduling, "capable_work_types", lambda config: set(EVERY_TYPE))
     _unswept(config, EVIDENCE + timedelta(seconds=800))
     _passed(config, EVIDENCE + timedelta(seconds=850))
     now = EVIDENCE + timedelta(seconds=QUIET_SECONDS + 40)
@@ -809,8 +810,8 @@ def test_a_hold_older_than_the_last_sweep_holds_nothing(app, monkeypatch):
 
 
 def test_the_doctor_reports_an_operator_timer(app, monkeypatch):
-    from pathlib import Path
     import sys
+    from pathlib import Path
 
     from scope_recall.maintenance import autostart
 
@@ -819,7 +820,7 @@ def test_the_doctor_reports_an_operator_timer(app, monkeypatch):
     monkeypatch.setattr(autostart, "_windows", lambda: False)
     autostart.apply(autostart.plan(path, Path(sys.executable), user_id=None))
     (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(doctor, "_load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert result.autostart_status == "operator_timer"

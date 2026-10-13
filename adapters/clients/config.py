@@ -7,29 +7,27 @@ server speak the protocol Codex's were modelled on.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
 import hashlib
 import json
 import os
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
 from scope_recall.adapters.hermes.identity import HermesRuntimeScope, RuntimeAudience, resolve_runtime_audience
-from scope_recall.adapters.hermes.installation import (
+from scope_recall.adapters.hermes.installation import HermesIdentityError, InstallationManifest, bounded_text
+from scope_recall.adapters.hermes.shared_entries import (
     CLIENT_HOSTS,
-    HermesIdentityError,
-    InstallationManifest,
     attachment_path,
-    bounded_text,
     read_attachment,
     shared_entry_manifest,
 )
-from scope_recall.adapters.runtime_wiring import RUNTIME_CONFIG_FILENAME
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 
 class CodexConfigError(RuntimeError):
