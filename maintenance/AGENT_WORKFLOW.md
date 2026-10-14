@@ -128,6 +128,36 @@ version: pause the store's worker and stop every attached host, upgrade the work
 environment first, then each entry's, then resume. `plan-install`/`apply-install`
 and `doctor` on an attached home work as on any other.
 
+## 1.2 A Hermes that builds its own plugin environment
+
+A Hermes home with `installs\<id>\facts.json` runs plugins in an environment its
+package manager builds (`packages.venv.environment` in that file), not in the venv
+the `hermes` command runs with, and builds it again from each plugin's declaration
+in `<home>\plugins\`. Upgrading the venv with `package-upgrade` does not reach the
+gateway, and pip or uv into the package manager's environment is undone by its next
+build. A declaration written there by hand without the vector extra once left every
+recall without vectors for two days, while every check read the venv.
+
+1. Once the release is on PyPI, run plan-install/apply-install with
+   `--target-plugin-dir <home>\plugins\scope-recall`. A receipt that names another
+   plugin directory is moved (`move` in the plan); a wrapper someone put there by
+   hand is backed up and replaced (`replace`). The wrapper's `pyproject.toml`
+   declares `hermes-scope-recall[lancedb]==<version>`.
+2. Rebuild the environment with Hermes's own sync, `HERMES_HOME` set to the home:
+   `<hermes python> -m hermes_cli.venv_sync --project-root <home>\hermes-agent --json`.
+   A running gateway keeps the environment it started with. `"state": "synced"` or
+   `"current"` is success. A failed sync disables the plugin: Hermes adds
+   `scope-recall` to `plugins.disabled` in `config.yaml` and empties
+   `memory.provider`. Copy `config.yaml` before the sync and put the copy back after
+   a failed one; removing only the `plugins.disabled` entry leaves the gateway
+   without memory (`doctor`: `host_registration_status: "not_selected"`). Then fix
+   the cause and sync again before the gateway restarts.
+3. Restart the gateway through its controller and run `doctor`: `hermes_runtime`
+   must name the new version with `vector_dependencies: true`, and no
+   `hermes_runtime_*` gap may remain. A Hermes that runs elevated may keep that
+   environment's interpreter readable only to an elevated process; then run step 2
+   from an elevated shell.
+
 ## 2. Prepare legacy identity and permissions
 
 Use the source catalog and the old runtime's actual audience/identity settings.
@@ -185,7 +215,7 @@ and out of automatic memory/skill discovery.
 4. Inspect the structured blockers. `prepared` means the snapshot/catalog/target
    binding are fixed, not that migration is complete.
 5. Run `scope-recall migrate run --job <job-dir> --source-quiesced`.
-   Supply `--legacy-reader-contract one instance-2.0.1/memories-physical-scope-in-accessible-scopes`
+   Supply `--legacy-reader-contract legacy-2.0.1/memories-physical-scope-in-accessible-scopes`
    only after verifying the matching old runtime/schema. Do not apply it to other
    reader semantics. Completed bridge records are archived without replay.
    Known OpenClaw import ledgers are preserved as verified, non-searchable audit
@@ -194,6 +224,13 @@ and out of automatic memory/skill discovery.
 6. On interruption, run `migrate status`, then `migrate run` on the same job after
    diagnosing the recorded error. No blind retry loop. A changed source requires
    a fresh snapshot before cutover; never discard changes made after preparation.
+
+A record longer than a source holds (65,536 characters) is stored in parts with
+every character kept (`segmented_records` in the conversion report). A journal
+entry several episodes name has one processing owner; the other episodes keep
+its evidence link and leave automatic recall (`legacy_episode_memberships`). An
+entry stored under another scope than its episode stays its own source, unlinked
+(`episode_source_outside_episode_scope`).
 
 The converter preserves original status, evidence/history and deletion closure.
 Do not re-extract the entire old journal or promote every old candidate. The

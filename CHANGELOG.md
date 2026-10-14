@@ -3,6 +3,52 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.10.4] - 2026-10-14
+
+The README's install commands still named 3.9.3, without the vector extra. Whoever installed from that first page, on GitHub or on PyPI, got a release four versions old, and recall without vector search, since the default LanceDB store cannot open without the extra. The commands now install or upgrade (`-U`) to the current release with `[lancedb]` (`[lancedb,codex]` for an entry with an MCP server). A packaging test keeps them that way: it fails on an install line without the extra, an unpinned one without `-U`, a pinned version other than this one, or a link to an older release.
+
+For an entry of a shared store, the doctor now reads the vector checks (this one and 3.10.3's check of a Hermes plugin environment) against the entry's own runtime config, beside its pointer. Before, it read the store's, which is the shared worker's.
+
+`doctor` now names an interpreter that lacks the vector extra while the runtime config names a LanceDB store (`vector_dependencies_missing`), on every host. Because the extra is optional, it used to say nothing; only the recall's own gaps said `lance_not_installed`. A Hermes that builds its own plugin environment is still checked in that environment (3.10.3).
+
+The install guide and the agent workflow now say to put back the whole `config.yaml` after a failed Hermes environment sync, which also empties `memory.provider`. They also say to sync before restarting a gateway, which may otherwise rebuild the environment itself. The package summary, the plugin descriptions, the security policy's supported version and the contributors list are brought up to date.
+
+### Migrating a 2.0.1 store
+
+A 2.0.1 user's migration ended twice in `migrate run`, both times answered only with `invalid_or_unavailable_input`. Thanks to them for a report that named both causes. Both failures were the converter's, and the same shapes are in other 2.0 stores:
+
+- **A record longer than a 3.x source.** A memory that 2.0 had merged again and again reached 77,000 characters, and a source holds at most 65,536 (`CHECK constraint failed: length(content)<=65536`). Such a record, whether memory, journal entry or archived row, is now stored as a long message is captured: in parts of at most 65,536 characters, every character once and in order, one source group under the record's key, the first part under the record's own id. A purge 2.0 completed deletes every part, and a deleted memory's digest rows with it. A claim's quote that runs across a cut is linked to each part with its piece, and a digest row stored in parts stays an unreadable archive in every part. The report lists such records under `segmented_records`.
+- **A journal entry two episodes share.** 2.0's automatic episodes overlap, while a Core source has one processing owner (`UNIQUE constraint failed: episode_events.source_ref, episode_events.source_revision`). The converter's membership projection handled this only when asked, and the migration job never asked. It now always runs: each entry has one owner, every episode keeps its evidence links, an episode that lost entries to another leaves automatic recall, and the report's `legacy_episode_memberships` says which.
+- **An episode naming an entry under another scope**, in a store whose scope ids changed while it ran. The episode cited a source its own readers cannot open, which hid the whole episode from them. The entry now stays its own source, unlinked, and the report names it (`episode_source_outside_episode_scope`).
+- **More than 2,000 hidden memories** (archived, obsolete and so on). They exceeded what one Core suppression request holds (`dependency_budget`); the converter now asks in parts.
+
+`migrate` now tells a constraint failure, in the forms SQLite gives one, and the converter's own refusals, fixed phrases: neither carries a stored value. A record SQLite refuses is named by its table and event id, not by its legacy id, which can hold a path. Any other SQLite text stays masked: one error quotes a cell that is not valid UTF-8. The agent workflow named a `--legacy-reader-contract` value the converter does not accept; it now names `legacy-2.0.1/memories-physical-scope-in-accessible-scopes`, as does the Chinese upgrade guide.
+
+### Upgrading from 3.10.3
+
+Install the package with its `lancedb` extra, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. For a Hermes with its own package manager, use `--target-plugin-dir <home>/plugins/scope-recall` and let Hermes sync. The schema is unchanged (1110).
+
+## [3.10.3] - 2026-10-14
+
+A claim whose value none of the sources it cites carries, such as a value the model translated, was stored and could then never be promoted (#236). Consolidation now leaves such a claim out and keeps the rest of the result: on a copy of the shared store, 57 of a week's 3,083 claims were of this kind, in 51 results that held 119 other claims. The work item's error details name each claim left out (stage `claim`, field `evidence_value`), and the message's outcome is `partial`; a candidate evaluation whose verdict carries such a value waits for evidence. A proposal a host makes directly is still refused whole. A span that names its source as `ref@1` beside `source_revision` 1 is read as that source: it was read as `ref@1@1`, and the whole result refused as citing a source the model never declared (#236).
+
+The spend ledger's default `max_request_bytes` is 128,000 (was 32,000). The old cap refused, before sending, candidate evaluations the package had built within their own 64,000-byte bound, and each waited an hour, again and again, as `budget_unavailable` (#237). A body over a cap set by hand now fails its item as `request_too_large`, which `retry-failures` re-opens once the cap is raised. A model the configuration does not approve (`unsupported_model`) keeps its work waiting, spending no attempt, until it is approved; the doctor names it (`model_not_approved`).
+
+A consolidation model that reasons before it answers needs longer than `request_seconds` allows, at most 45 seconds (#240 measured 18 to 90). `model_request_seconds`, up to 600, bounds the worker's consolidation and candidate-evaluation requests instead; recall, capture, embedding and every other boundary keep `request_seconds`. A pass claims such work only while that long is left, so `drain_seconds` may go above 120, up to 900, when `model_request_seconds` needs it, and `lease_seconds` must cover it.
+
+An auxiliary budget may count by calendar month: `"period": "monthly"`, with an optional `time_zone`, applies its spend, call and token caps to the current month, and the doctor's `ledger_headroom` reports that month (#239, contributed by @JohnYinl).
+
+A Hermes with its own package manager builds the environment it runs plugins in from each plugin's declaration in `<home>/plugins/`, and reads a `pyproject.toml` there before `plugin.yaml`. One written there by hand without the vector extra left every recall of one installation without vectors for two days, while the venv every check read had them. `apply-install` with `--target-plugin-dir <home>/plugins/scope-recall` now writes that `pyproject.toml` itself, declaring this release with its vector dependencies; it moves a wrapper its receipt put elsewhere, and backs up and replaces one put there by hand. The doctor reads the environment Hermes really runs (`hermes_runtime`) and names a core missing there or of another version, and missing vector dependencies. A recall whose vector helper lacks them says so (`vector_error:RuntimeError:lance_not_installed`, where it said `RuntimeError:RuntimeError`).
+
+On Windows, `package-upgrade` accepts an external uv reached through a directory junction, and a refusal names a stable reason (#236). A scheduled wake no longer flashes a console window where a venv's `pythonw.exe` is a console redirector: the task starts a verified windowless interpreter with the venv's packages (#238).
+
+### Upgrading from 3.10.2
+
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110).
+- On Windows, run `autostart enable` again with the same config, interpreter and environment-file arguments, so the scheduled task starts the windowless interpreter.
+- A Hermes with its own package manager (its home has `installs/<id>/facts.json`): run `plan-install` and `apply-install` with `--target-plugin-dir <home>/plugins/scope-recall` once this release is on PyPI, let Hermes sync its environment, restart the gateway and read `hermes_runtime` in `doctor` (`docs/install.md`, section 4).
+- Results refused for a `ref@revision` source can be re-opened with `retry-failures --config <file> --include-terminal --apply` (one re-look per release), or by id with `worker_entry --retry-failed`.
+
 ## [3.10.2] - 2026-10-11
 
 A long message is consolidated a page at a time. A page whose summary of the task did not use the page's own words was refused whole: its goal, decisions, progress, open items, blockers or next step had to be quoted from the page. The claims found on that page were lost with it, and no later page of the message was read. Now such a summary is dropped, as a short message's summary already is when it does not qualify. The page's claims, still checked against the page on their own, are kept, and the message is read to its end. What a page dropped is named in the work item's error details (stage `summary`) and makes the message's outcome `partial`; it is not fed back to the model as a failure.
