@@ -20,7 +20,7 @@
 5. 在 Rune 仓库用既有同步脚本同步这个已验证的固定 fork 提交，校验源码及来源清单。未授权推送时，可从 origin/upstream 身份正确、main 干净且 HEAD 等于固定提交的独立仓库通过 `--local-repository` 离线导入；清单必须明确记录本地来源和尚未发布，不能冒充 GitHub 可下载提交。同步前发现快照内有修改时停止，先把修复转入 fork，不强制覆盖。
 6. 同步 Rune 的运行版本说明、记忆管理文档和适用回归；最后按已确认时机用 Rune 的正常开发入口启动并验证实际加载。源码同步通过不等于普通用户窗口已加载更新。
 
-本轮审查基线为上游 `3.10.2`，提交 `8d25dbb437a5d866aab4f5ff7931fa8025af502c`；schema 保持 1110，基础依赖声明及锁未变化。3.9.2 起拆分的 Core 管理/记录接口须由 Rune bridge 显式适配，候选降频、失败重试预算、长消息部分提炼与身份边界按隔离回归验证。Rune 实际固定的 fork 提交以其来源清单为准，不把上游版本号、fork HEAD、依赖环境回执或进程实际加载版本混为一谈。
+本轮审查基线为正式版 `3.10.4`，提交 `af088f1ec34d488d9db34dd977269d157bf96aae`（`v3.10.4`）；schema 保持 1110，基础依赖声明及 `uv.lock` 未变化，包描述与关键词有更新。Rune bridge 继续显式消费 Core 管理/记录接口，并将丢弃无证据 claim 或摘要的结果统一反馈为部分提炼；指定模型不可用时保留工作、等待配置修复。Core 原生月预算、长模型时限及独立宿主安装诊断不自动成为 Rune 新设置；Rune 保留自己的持久预算和请求时限。Rune 实际固定的 fork 提交以其来源清单为准，不把上游版本号、fork HEAD、依赖环境回执或进程实际加载版本混为一谈。
 
 Rune 的具体命令和验证边界见 [源码同步与适配](https://github.com/Genion/rune/blob/main/docs/scope-recall-sync.md)、[记忆管理](https://github.com/Genion/rune/blob/main/docs/memory-management.md) 和 [运行环境](https://github.com/Genion/rune/blob/main/docs/runtime-environments.md)。
 
