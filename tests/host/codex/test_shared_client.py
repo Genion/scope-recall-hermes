@@ -13,8 +13,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -362,6 +363,43 @@ def test_the_client_s_tools_read_the_store_and_refuse_to_change_it(store):
     with pytest.raises(ContractError):
         server.propose_memory(Ctx(), "1.1", "TEST a proposal")
     assert _rows(root, "SELECT count(*) FROM source_events WHERE entry_id='claude-code'") == [(0,)]
+
+
+READ_TOOLS = ["recall", "inspect", "profile", "trace", "entity", "status"]
+
+
+@pytest.mark.parametrize("host", ["claude-code", "workbuddy", "dsh", "codex"])
+def test_only_a_client_that_names_its_conversation_is_offered_the_tools_that_change_the_store(store, tmp_path, host):
+    """#245: the store takes a change only on the word of the person's latest message in the same conversation, and
+    Claude Code, WorkBuddy and dsh name no conversation with a tool call: offered there, propose_memory, revise and
+    forget were refused on every call (ACCESS_DENIED codex_thread_id).  Codex names its thread and keeps all nine."""
+    root, _homes, client, _capture = store
+    if host != "claude-code":
+        owner = next(
+            row for row in read_shared_payload(root)["entries"][0]["audiences"] if row["kind"] == "owner_private"
+        )
+        client = tmp_path / f"TEST-{host}-home"
+        attach_shared_record(
+            root,
+            client_entry_record(
+                host=host,
+                home=client,
+                entry_id=host,
+                display_name=f"TEST {host}",
+                attached_at=NOW,
+                allowed_scope_ids=owner["allowed_scope_ids"],
+                writable_scope_ids=owner["writable_scope_ids"],
+                capture_scope_id=owner["capture_scope_id"],
+            ),
+            now=NOW,
+        )
+    server = build_server(load_shared_client(client, host), workspace=None)
+    offered = [tool.name for tool in server.server._tool_manager.list_tools()]
+    if host == "codex":
+        writes = ["propose_memory", "revise", "forget"]
+        assert offered == [*READ_TOOLS[:5], *writes, "status"]
+    else:
+        assert offered == READ_TOOLS
 
 
 # -- the session record ------------------------------------------------------
@@ -750,6 +788,11 @@ def test_a_prompt_still_in_the_inbox_is_not_stored_again_from_the_record(store, 
 
 
 def test_what_could_not_be_written_is_recorded_at_the_next_stop_once(store, tmp_path, monkeypatch):
+    from scope_recall.adapters.clients import handler as handler_module
+
+    # Room for every message of the record to be written in one hook however slow the runner: what is written and
+    # when, not the budget, is under test.  On the 2 s default a slow runner left the last ones for a later stop.
+    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 30.0)
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -875,6 +918,161 @@ def test_a_task_notification_is_not_the_owner_s_prompt(store):
     assert [content for _role, _origin, content in _said_in_store(root)] == ["TEST 一句真话。"]
 
 
+#: What Claude's desktop app puts in the person's first message when a session starts without a project folder,
+#: shortened (#248).  Synthetic.
+APP_REMINDER = (
+    "<system-reminder>\nTEST The user started this session without choosing a project folder, so your working "
+    "directory is a scratch workspace the app created for it.\n</system-reminder>"
+)
+
+
+def test_a_reminder_the_desktop_app_puts_in_a_prompt_is_not_the_owner_s_words(store, monkeypatch):
+    """#248: Claude's desktop app puts a <system-reminder> ahead of what the person typed; it was stored as their words,
+    claims were drawn from it, and it was recalled for.  A prompt that is only reminders stores and recalls nothing,
+    here and on the entry's server; the person's own words about such a block stay."""
+    root, _homes, client, _capture = store
+    asked = []
+    monkeypatch.setattr(
+        "scope_recall.adapters.clients.prompt_recall.PromptRecall.own",
+        lambda self, context, text, *rest, **_kw: asked.append(text) or {},
+    )
+    mention = "TEST 为什么 <system-reminder>…</system-reminder> 会被存下来？"
+    hook = _hook(client)
+    try:
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 帮我看看这个仓库。", prompt_id="TEST-prompt-1"))
+        assert hook.handle_payload(_prompt(APP_REMINDER, prompt_id="TEST-prompt-2")) == {}
+        hook.handle_payload(_prompt(mention, prompt_id="TEST-prompt-3"))
+    finally:
+        hook.close()
+    assert asked == ["TEST 帮我看看这个仓库。", mention]
+    assert [content for _role, _origin, content in _said_in_store(root)] == sorted(["TEST 帮我看看这个仓库。", mention])
+    server = _hook(client)
+    try:
+        asked_there = _prompt(f"{APP_REMINDER}\nTEST 服务这边的问题。", prompt_id="TEST-prompt-4")
+        server.resident_recall_for(asked_there, (), (), 5.0)
+        assert server.resident_recall_for(_prompt(APP_REMINDER, prompt_id="TEST-prompt-5"), (), (), 5.0) == {}
+    finally:
+        server.close()
+    assert asked[2:] == ["TEST 服务这边的问题。"]
+
+
+def test_a_reminder_the_desktop_app_puts_in_the_record_is_not_the_owner_s_words(store, tmp_path):
+    """#248, the session record: the reminder is a text block of its own, or ahead of the typed text in one string, in
+    a message the record marks as the person's.  A message that is only reminders is not theirs."""
+    root, _homes, client, _capture = store
+    at = _moments()
+    record = _record(
+        tmp_path / "TEST-projects" / "TEST-cc-session.jsonl",
+        _person("u1", at(0), [_said(APP_REMINDER), _said("TEST 第一句。")], prompt_id="TEST-prompt-1"),
+        _person("u2", at(1), f"{APP_REMINDER}\n\nTEST 第二句。", prompt_id="TEST-prompt-2"),
+        _person("u3", at(2), [_said(APP_REMINDER)], prompt_id="TEST-prompt-3"),
+        _line(
+            "attachment",
+            "q1",
+            at(3),
+            attachment={
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+                "prompt": f"{APP_REMINDER}\nTEST 顺便一句。",
+            },
+        ),
+        _model("a1", at(4), _said("TEST 好的。")),
+    )
+    hook = _hook(client)
+    try:
+        hook.handle_payload(_stop(record, last="TEST 好的。"))
+    finally:
+        hook.close()
+    assert _said_in_store(root) == sorted(
+        [
+            ("user", "human_direct", "TEST 第一句。"),
+            ("user", "human_direct", "TEST 第二句。"),
+            ("user", "human_direct", "TEST 顺便一句。"),
+            ("assistant", "assistant_visible", "TEST 好的。"),
+        ]
+    )
+
+
+def _compaction(stamp):
+    """A compaction as Claude Code records it: its boundary, then the summary that replaces what came before."""
+    return [
+        _line("system", "c0", stamp, subtype="compact_boundary", compactMetadata={"trigger": "auto"}),
+        _line("user", "c1", stamp, isCompactSummary=True, message={"role": "user", "content": "TEST summary"}),
+    ]
+
+
+def test_a_prompt_s_recall_leaves_out_what_claude_code_s_model_still_holds(store, tmp_path):
+    """#249: a message of this session the model still has (said since its last compaction, or in a session that has
+    had none) came back in a later prompt's recall, a second copy in the context.  One said before the compaction
+    reaches the model only as the compaction's summary, and is still recalled."""
+    root, _homes, client, _capture = store
+    record = tmp_path / "TEST-projects" / "TEST-cc-session.jsonl"
+    record.parent.mkdir(parents=True)
+    _record(record, _person("u0", _moments()(0), "TEST 开始。"))
+    hook = _hook(client)
+
+    def ask(text, prompt_id):
+        answer = hook.handle_payload({**_prompt(text, prompt_id=prompt_id), "transcript_path": str(record)})
+        return answer.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    try:
+        ask("TEST 机器清单：构建机是 QX-17。", "TEST-p1")
+        ask("TEST 机器清单：部署机是 KZ-42。", "TEST-p2")
+        whole = ask("TEST 机器清单", "TEST-p3")
+        time.sleep(0.05)
+        _record(record, *_compaction(datetime.now(UTC).isoformat()))
+        time.sleep(0.05)
+        ask("TEST 机器清单：备份机是 VX-9。", "TEST-p4")
+        compacted = ask("TEST 机器清单", "TEST-p5")
+    finally:
+        hook.close()
+    assert "QX-17。" not in whole and "KZ-42。" not in whole, f"no compaction yet: the model has it all: {whole}"
+    assert "QX-17。" in compacted and "KZ-42。" in compacted, "said before the compaction: recalled"
+    assert "VX-9。" not in compacted, "said since the compaction: the model has it"
+    assert len(_said_in_store(root)) == 5, "every prompt was stored"
+
+
+def test_the_doctor_names_owner_words_stored_with_a_reminder(store, monkeypatch):
+    """What an earlier release stored with the app's reminder is counted for the entry and named by ref, never by its
+    text, until the owner forgets it.  The owner's own words about such a block are no finding."""
+    from scope_recall.adapters.clients import hook_events
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_owner_words
+
+    root, _homes, client, _capture = store
+    hook = _hook(client)
+    try:
+        mention = "TEST 为什么 <system-reminder>…</system-reminder> 会被存下来？"
+        hook.handle_payload(_prompt(mention, prompt_id="TEST-p1"))
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 现在的版本。", prompt_id="TEST-p2"))
+        monkeypatch.setattr(hook_events, "claude_code_person_text", lambda text: text)  # as 3.10.4 stored it
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 以前的版本。", prompt_id="TEST-p3"))
+    finally:
+        hook.close()
+    [(event, revision)] = _rows(
+        root, "SELECT event_id,source_revision FROM source_events WHERE content LIKE '%以前的版本%'"
+    )
+    report = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(report, "claude-code", root, "claude-code")
+    assert report.capability_gaps == ["owner_words_with_client_reminder"]
+    assert report.checks == [{"name": "owner_words", "result": "client_reminders", "detail": f"1: {event}@{revision}"}]
+    for entry in ("tianshu", None):
+        other = DoctorReport(host="claude-code", status="ok")
+        check_owner_words(other, "claude-code", root, entry)
+        assert other.capability_gaps == [] and other.checks == [], "another entry's, or another store's"
+    with closing(sqlite3.connect(root / "memory.sqlite3")) as connection, connection:
+        connection.execute("UPDATE source_events SET read_blocked=1 WHERE event_id=?", (event,))
+    forgotten = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(forgotten, "claude-code", root, "claude-code")
+    assert forgotten.capability_gaps == []
+    monkeypatch.setattr("scope_recall.maintenance.doctor_store._OWNER_WORDS_SCAN_S", -1.0)  # already over
+    stopped = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(stopped, "claude-code", root, "claude-code")
+    assert [check["result"] for check in stopped.checks] == ["unfinished"], "a read cut short never reads as clean"
+    assert stopped.capability_gaps == ["owner_words_unchecked"], "and the report says to look"
+
+
 SUGGESTIONS_PROMPT = (
     "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with "
     "Codex in this local project: C:\\TEST\n\nGet an understanding of the user's intent and goals "
@@ -905,10 +1103,42 @@ def test_codex_s_request_for_suggestions_is_told_from_the_owner_s_words():
     assert len(note) >= 8000 and not is_codex_suggestions_prompt(note)
 
 
-def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, tmp_path):
-    """Codex sends its request for suggestions of what to do next through the prompt hook.  On the pilot four were
-    stored as the owner's words, 11,000 to 15,000 characters each, claims were drawn from them as if the owner had
-    said them, and nine of the model's JSON answers were stored as replies."""
+SUGGESTED_MESSAGE_PROMPT = (
+    "This is an app-generated request for a suggested next user message. The user did not write this message.\n\n"
+    "TEST Read the conversation so far and write the one message the user is most likely to send next.\n"
+    + "- TEST rule about what the suggested message must and must not be.\n" * 16
+    + '\nAnswer with a JSON object of one key: {"suggestion": "<message>"}.'
+)
+
+
+def test_codex_s_request_for_a_suggested_message_is_told_from_the_owner_s_words():
+    """The desktop app's request for one next message opens with Codex saying the user did not write it; that opening
+    tells it, short as it is, and its answer is told by its one key.  The owner quoting it, or answering in JSON of
+    their own, stays theirs."""
+    from scope_recall.adapters.clients.boundary import is_codex_suggestions_prompt, is_codex_suggestions_reply
+
+    assert len(SUGGESTED_MESSAGE_PROMPT) < 8000 and is_codex_suggestions_prompt(SUGGESTED_MESSAGE_PROMPT)
+    assert is_codex_suggestions_prompt("\n  " + SUGGESTED_MESSAGE_PROMPT.replace("message. The", "message.\nThe"))
+    assert not is_codex_suggestions_prompt(f"TEST 为什么这段会被存成我说的话？\n\n{SUGGESTED_MESSAGE_PROMPT}")
+    assert not is_codex_suggestions_prompt("This is an app-generated request for a suggested next user message.")
+    assert is_codex_suggestions_reply('{"suggestion": "TEST 我的测试暗号是什么？"}')
+    assert is_codex_suggestions_reply(' {"suggestions": [{"title": "TEST 建议"}]}\n')
+    for answer in ('{"suggestion": ["TEST"]}', '{"suggestion": "TEST", "why": "TEST"}', '"TEST"', "TEST 收到"):
+        assert not is_codex_suggestions_reply(answer), answer
+
+
+@pytest.mark.parametrize(
+    ("host_request", "answer"),
+    [
+        (SUGGESTIONS_PROMPT, '{"suggestions":[{"title":"TEST 建议"}]}'),
+        (SUGGESTED_MESSAGE_PROMPT, '{"suggestion":"TEST 我的测试暗号是什么？"}'),
+    ],
+    ids=["suggestions", "suggested-message"],
+)
+def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, tmp_path, host_request, answer):
+    """Codex sends its requests for what the owner might do next through the prompt hook, in a thread of their own.
+    Stored as the owner's words, claims would be drawn from them as if the owner had said them, and the model's JSON
+    answers, stored as replies, would come back in recall."""
     root, _homes, _client, _capture = store
     codex = _codex_client(root, tmp_path)
     hook = CodexHookHandler.from_home(str(codex), "codex")
@@ -919,7 +1149,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "hook_event_name": "UserPromptSubmit",
                     "session_id": "TEST-codex-session",
                     "turn_id": "TEST-turn-1",
-                    "prompt": SUGGESTIONS_PROMPT,
+                    "prompt": host_request,
                     "cwd": "C:/TEST",
                 }
             )
@@ -933,7 +1163,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "session_id": "TEST-codex-session",
                     "turn_id": "TEST-turn-1",
                     "cwd": "C:/TEST",
-                    "last_assistant_message": '{"suggestions":[{"title":"TEST 建议"}]}',
+                    "last_assistant_message": answer,
                 }
             )
             == {}
@@ -947,7 +1177,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "session_id": "TEST-unmarked-session",
                     "turn_id": "TEST-turn-1",
                     "cwd": "C:/TEST",
-                    "last_assistant_message": '{"suggestions":[{"title":"TEST 建议"}]}',
+                    "last_assistant_message": answer,
                 }
             )
             == {}
@@ -1016,6 +1246,49 @@ def test_the_rest_of_codex_s_suggestions_thread_is_not_stored_either(store, tmp_
     hook({**tool, "session_id": "TEST-owner-thread", "turn_id": "TEST-turn-1", "tool_use_id": "TEST-tool-2"})
     stored = _rows(root, "SELECT role FROM source_events WHERE entry_id='codex'")
     assert stored == [("tool",)]
+
+
+def test_the_doctor_names_codex_s_requests_stored_as_the_owner_s_words(store, tmp_path, monkeypatch):
+    """What an earlier release stored of Codex's requests for suggestions, and of the model's answers, is counted for
+    the Codex entry and named by ref, never by its text.  The owner's own words that mention such an answer are no
+    finding, and neither is another entry's."""
+    from scope_recall.adapters.clients import hook_events
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_owner_words
+
+    root, _homes, _client, _capture = store
+    codex = _codex_client(root, tmp_path)
+    # As an earlier release stored them: neither the request nor its answer was told apart.
+    monkeypatch.setattr(hook_events, "is_codex_suggestions_prompt", lambda prompt: False)
+    monkeypatch.setattr(hook_events, "is_codex_suggestions_reply", lambda message: False)
+    turns = (
+        (SUGGESTED_MESSAGE_PROMPT, '{"suggestion":"TEST 我的测试暗号是什么？"}'),
+        ('TEST 我自己的话：上次的回答是 {"suggestion": "TEST"}。', "TEST 好的。"),
+        # A key written with an escape is still the answer's one key.
+        (SUGGESTED_MESSAGE_PROMPT, '{"\\u0073uggestion":"TEST 下一句"}'),
+    )
+    hook = CodexHookHandler.from_home(str(codex), "codex")
+    try:
+        for number, (prompt, reply) in enumerate(turns, start=1):
+            thread = {"session_id": f"TEST-thread-{number}", "turn_id": "TEST-turn-1", "cwd": "C:/TEST"}
+            hook.handle_payload({"hook_event_name": "UserPromptSubmit", **thread, "prompt": prompt})
+            hook.handle_payload({"hook_event_name": "Stop", **thread, "last_assistant_message": reply})
+    finally:
+        hook.close()
+    written_by_codex = _rows(
+        root,
+        """SELECT event_id,source_revision FROM source_events WHERE entry_id='codex'
+        AND (content LIKE 'This is an app-generated request%' OR content LIKE '{"%uggestion":%') ORDER BY rowid""",
+    )
+    assert len(written_by_codex) == 4
+    report = DoctorReport(host="codex", status="ok")
+    check_owner_words(report, "codex", root, "codex")
+    assert report.capability_gaps == ["owner_words_from_host_request"]
+    refs = ",".join(f"{event}@{revision}" for event, revision in written_by_codex)
+    assert report.checks == [{"name": "owner_words", "result": "host_requests", "detail": f"4: {refs}"}]
+    other = DoctorReport(host="codex", status="ok")
+    check_owner_words(other, "codex", root, "tianshu")
+    assert other.capability_gaps == [] and other.checks == [], "another entry's"
 
 
 def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store):
@@ -3385,7 +3658,7 @@ def test_the_entry_s_server_recalls_a_workbuddy_prompt_for_the_person_s_words_un
     asked = []
     monkeypatch.setattr(
         "scope_recall.adapters.clients.prompt_recall.PromptRecall.own",
-        lambda self, context, text, request_id, *rest: asked.append((text, request_id)) or {},
+        lambda self, context, text, request_id, *rest, **_kw: asked.append((text, request_id)) or {},
     )
     server = CodexHookHandler.from_home(str(home), "workbuddy")
     try:
@@ -3654,17 +3927,22 @@ def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_rese
     """A WorkBuddy prompt hook that runs past its wait blocks the prompt.  With the entry's server slower than the
     hook's whole budget, the hook still answers inside the budget, with the prompt stored."""
     import io
+    import threading
     import time
 
+    from scope_recall.adapters.clients import handler as handler_module
     from scope_recall.adapters.clients import hook_entry, local_endpoint
     from scope_recall.vector import process_store
 
     monkeypatch.setattr(process_store, "prestart", lambda **kwargs: None)
+    # A real entry's 6 s: on the 2 s default, a slow runner's write of the prompt left no time to ask the server.
+    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 6.0)
     root, home, _projects = workbuddy
     endpoint = local_endpoint.serve(home, "workbuddy", warm=False)
     assert endpoint is not None
+    release, finished = threading.Event(), []
     try:
-        calls = _counted(endpoint, monkeypatch, delay=3.0)
+        calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
         raw = json.dumps(
             {
                 "session_id": WB_SESSION,
@@ -3677,14 +3955,16 @@ def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_rese
         assert hook_entry.main(["--home", str(home), "--host", "workbuddy"]) == 0
         elapsed = time.monotonic() - started
         captured = capsys.readouterr()
-        # No runtime config names a budget here: the hook's own 2 s (``_TOTAL_BUDGET_S``).
-        assert elapsed < 2.0 + 1.0, f"the hook took {elapsed:.1f} s of its 2 s"
+        # No runtime config names a budget here: the hook's own (``_TOTAL_BUDGET_S``).
+        assert elapsed < 6.0 + 1.0, f"the hook took {elapsed:.1f} s of its 6 s"
         assert not captured.out or "additionalContext" in json.loads(captured.out)["hookSpecificOutput"]
         assert "CODEX_RECALL_RESIDENT:late" in captured.err
         assert len(calls) == 1
         assert _wb_said(root, "user") == [("user", "human_direct", "TEST 服务答得太慢。")]
-        time.sleep(3.0)  # the server's late recall ends; it writes nothing
+        release.set()
+        assert _eventually(lambda: finished), "the server's late recall ends; it writes nothing"
     finally:
+        release.set()
         endpoint.stop()
     assert _wb_said(root, "user") == [("user", "human_direct", "TEST 服务答得太慢。")]
 

@@ -3,7 +3,8 @@
 ``init-shared`` makes the store's directory and manifest.  ``attach`` makes a
 host's home an entry of it, carrying over the grants the home's own
 installation had, and writes the runtime configs: the entry's, and the shared
-worker's.  ``detach`` undoes that for one home.  ``adopt`` records the store's
+worker's.  ``grants`` shows an attached entry's grants and changes them from
+an edited copy.  ``detach`` undoes ``attach`` for one home.  ``adopt`` records the store's
 new directory after the directory was copied elsewhere.  ``entries`` lists who
 is attached and when each was last heard from.  ``import-entry`` copies what
 an entry's own store held, moved aside at attach, into the shared store
@@ -21,32 +22,41 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import sys
+from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
+from ..adapters.hermes.audiences import LOCAL_USER_ID
+from ..adapters.hermes.identity import HermesRuntimeScope, resolve_runtime_audience
 from ..adapters.hermes.installation import (
     MANIFEST_FILENAME,
     HermesIdentityError,
+    InstallationManifest,
     build_installation_manifest,
     load_archived_installation,
 )
 from ..adapters.hermes.shared_entries import (
     CLIENT_HOSTS,
     ENTRY_HOSTS,
+    GRANTS_SCHEMA,
     attach_shared_entry,
     attach_shared_record,
     attachment_path,
     client_entry_record,
+    entry_grants,
     new_shared_payload,
     read_attachment,
     read_shared_payload,
+    regranted,
     shared_entry_record,
     write_shared_payload,
 )
@@ -59,7 +69,7 @@ from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from .install_common import RUNTIME_CONFIG_LIMIT
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
 from .shared_import import import_entry
-from .shared_run import Run, SharedStoreError, encoded, write_json
+from .shared_run import Run, SharedStoreError, encoded, replace_file, write_json
 
 #: The shared worker's own names in its runtime config.  Hosts replace the
 #: session with theirs; the worker keeps these.
@@ -497,6 +507,289 @@ def adopt(*, root: Path, now: str | None = None) -> dict[str, Any]:
     return result
 
 
+#: What an entry grants document these commands read may weigh: an entry migrated from 2.x has about a hundred rows.
+_GRANTS_LIMIT = 4 * 1024 * 1024
+
+
+#: What names a row's route, in the order the change shows it.
+_ROUTE_FIELDS = ("platform", "user_id", "chat_type", "chat_id", "thread_id", "gateway_session_key", "agent_workspace")
+#: What an entry's record holds of its grants (``shared_entries.entry_grants``).
+_GRANT_FIELDS = ("owner_principals", "audience_scopes", "audiences")
+
+
+def _row_shown(row: dict[str, Any]) -> str:
+    """One row as the change shows it: its route, its kind and the scopes it reads, writes and captures into."""
+    shown = {field: row[field] for field in _ROUTE_FIELDS}
+    shown.update(
+        kind=row["kind"],
+        read=sorted(row["allowed_scope_ids"]),
+        write=sorted(row["writable_scope_ids"]),
+        capture=row["capture_scope_id"],
+    )
+    return encoded(shown)
+
+
+def _owners(record: dict[str, Any]) -> set[tuple[str, str]]:
+    return {(item["platform"], item["user_id"]) for item in record["owner_principals"]}
+
+
+def _in_order(rows: list[str], common: Counter[str]) -> list[str]:
+    """``rows`` in their order, keeping only those both sides hold, as many times as both do."""
+    left, kept = Counter(common), []
+    for row in rows:
+        if left[row] > 0:
+            left[row] -= 1
+            kept.append(row)
+    return kept
+
+
+def _routes_changed(before: InstallationManifest, after: InstallationManifest) -> list[dict[str, Any]]:
+    """Each route a row names, before or after, that the change lets read, write or capture otherwise, as its
+    session binds (``resolve_runtime_audience``) before and after.  Rows alone did not say it: of the rows a session
+    matches, the first that captures into a scope it may write decides, so two rows on one route, swapped, moved a
+    chat's captures with nothing else shown (review of 3.10.5); an owner principal wakes or silences owner rows.  A
+    route resolved with its own session key stands for every session it matches, unpinned rows included."""
+    routes = {tuple(row[field] for field in _ROUTE_FIELDS) for row in (*before.audiences, *after.audiences)}
+    changed = []
+    for route in sorted(routes):
+        scope = HermesRuntimeScope(
+            **dict(zip(_ROUTE_FIELDS, route, strict=True)),
+            agent_identity=after.agent_id,
+            agent_context="primary",
+            entry_id=str(after.entry_id),
+        )
+        was, now = (resolve_runtime_audience(view, scope) for view in (before, after))
+        shown = [
+            {
+                "read": sorted(audience.allowed_scope_ids),
+                "write": sorted(audience.writable_scope_ids),
+                "capture": audience.capture_scope_id,
+            }
+            for audience in (was, now)
+        ]
+        if shown[0] != shown[1]:
+            changed.append({"route": "/".join(route), "before": shown[0], "after": shown[1]})
+    return changed
+
+
+def _grants_change(
+    before: dict[str, Any], after: dict[str, Any], views: tuple[InstallationManifest, InstallationManifest]
+) -> dict[str, Any]:
+    """What a grants change does: the rows that go and the rows that come, each whole (two rows may share a route,
+    and both count), whether the rows both hold changed order, each route that binds otherwise, the owner principals,
+    the scopes the entry holds, and the owner rows that grant nothing.  Routes and scope ids only.  Whether anything
+    changes is read from the whole records, not from this summary."""
+    shown = [list(map(_row_shown, record["audiences"])) for record in (before, after)]
+    old, new = Counter(shown[0]), Counter(shown[1])
+    owners = _owners(after)
+    return {
+        "entry_id": before["entry_id"],
+        "rows_added": [json.loads(row) for row in sorted((new - old).elements())],
+        "rows_removed": [json.loads(row) for row in sorted((old - new).elements())],
+        "rows_reordered": _in_order(shown[0], old & new) != _in_order(shown[1], old & new),
+        "routes_changed": _routes_changed(*views),
+        "principals_added": sorted("/".join(item) for item in owners - _owners(before)),
+        "principals_removed": sorted("/".join(item) for item in _owners(before) - owners),
+        "audience_scopes_changed": before["audience_scopes"] != after["audience_scopes"],
+        "entry_scopes_added": sorted(set(after["scope_ids"]) - set(before["scope_ids"])),
+        "entry_scopes_removed": sorted(set(before["scope_ids"]) - set(after["scope_ids"])),
+        "owner_rows_granting_nothing": sorted(
+            "/".join(row[field] for field in _ROUTE_FIELDS)
+            for row in after["audiences"]
+            if row["kind"] == "owner_private" and (row["platform"], row["user_id"]) not in owners
+        ),
+        "unchanged": all(encoded({"value": before[name]}) == encoded({"value": after[name]}) for name in _GRANT_FIELDS),
+    }
+
+
+def grants(
+    *,
+    instance_root: Path,
+    grants_from: Path | None = None,
+    out: Path | None = None,
+    apply: bool = False,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Show an attached entry's grants, or change them from an edited copy (#246).
+
+    Without ``grants_from`` the entry's grants come back as a document, written to ``out`` when one is named.  With
+    it the edited document is checked as attach checks a record and the change is shown; with ``apply`` as well it
+    is written: the store's manifest, and the entry's runtime config when the scopes it binds are not the entry's.
+    The store's own scopes never change (``regranted``), so the shared worker's config does not either.  A copy of
+    each file replaced and the entry's grants before the change (``grants-before.json``, which applied the same way
+    puts them back) go with the receipt.  A write that fails puts the copies back; run again, the command also
+    rebinds an entry config a failed run left behind.  Memories keep their scopes; nothing else is written.
+    """
+    if grants_from is None:
+        if apply:
+            raise SharedStoreError("--apply needs --grants-from, the entry's grants as edited")
+        return _shown_grants(instance_root, out)
+    if out is not None:
+        raise SharedStoreError("--out writes the entry's grants to edit; with --grants-from nothing is written there")
+    plan = _planned_grants(instance_root, grants_from)
+    if not plan.manifest_changes and plan.entry_config is None:
+        return {"status": "unchanged", **plan.change}
+    if not apply:
+        return {
+            "status": "preview",
+            **plan.change,
+            "next": "nothing is written: stop this entry's host, run again with --apply, then start it again",
+        }
+    return _applied_grants(plan, now or _now())
+
+
+def _shown_grants(instance_root: Path, out: Path | None) -> dict[str, Any]:
+    document = entry_grants(instance_root)
+    if out is not None:
+        if os.path.lexists(out):
+            raise SharedStoreError(f"{out} exists; name a new file")
+        write_json(out, document)
+    return {
+        "status": "shown",
+        "entry_id": document["entry_id"],
+        "grants": document,
+        "written": str(out) if out is not None else None,
+    }
+
+
+@dataclass(frozen=True)
+class _GrantsPlan:
+    """A checked grants change: the store's manifest after it, and the entry's runtime config when it must follow.
+    ``manifest_digest`` is the manifest it was checked against."""
+
+    store: Path
+    before: dict[str, Any]
+    updated: dict[str, Any]
+    change: dict[str, Any]
+    entry_path: Path
+    entry_config: dict[str, Any] | None
+    manifest_digest: str
+
+    @property
+    def manifest_changes(self) -> bool:
+        return not self.change["unchanged"]
+
+
+def _planned_grants(instance_root: Path, grants_from: Path) -> _GrantsPlan:
+    if not grants_from.is_file() or grants_from.stat().st_size > _GRANTS_LIMIT:
+        raise SharedStoreError(f"{grants_from} is missing or too large")
+    try:
+        document = json.loads(grants_from.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SharedStoreError(f"{grants_from} is not readable JSON") from exc
+    attachment = read_attachment(instance_root)
+    digest = _manifest_digest(attachment.root) if attachment is not None else ""
+    store, view_before, before, after, updated, view = regranted(instance_root, document)
+    if _manifest_digest(store) != digest:
+        raise SharedStoreError("the store's manifest changed while it was read: run the command again")
+    if view.entry_host in CLIENT_HOSTS:
+        _client_route_holds(view)
+    change = _grants_change(before, after, (view_before, view))
+    # The entry's runtime config binds the entry's scopes; compared with the file itself, so a run that failed after
+    # the manifest was written is finished by the next one.
+    entry_path = attachment_path(instance_root).parent / RUNTIME_CONFIG_FILENAME
+    entry_config = None
+    if entry_path.is_file():
+        now_config = _read_json(entry_path)
+        entry_config = _bound(now_config, _store_binding(updated, store, frozenset(after["scope_ids"])))
+        if entry_config == now_config:
+            entry_config = None
+    change["entry_runtime_config_rebound"] = entry_config is not None
+    _fits(entry_config, "entry's")
+    return _GrantsPlan(store, before, updated, change, entry_path, entry_config, digest)
+
+
+def _manifest_digest(store: Path) -> str:
+    try:
+        return hashlib.sha256((store / MANIFEST_FILENAME).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _client_route_holds(view: InstallationManifest) -> None:
+    """Refuse grants under which a client entry's own route, bound as the client binds it (``load_shared_client``),
+    has no owner row of an owner principal that reads and captures.  The client takes whoever types into it for the
+    owner: with a conversation row in its owner row's place, or its owner principal replaced, it still bound, as no
+    owner (review of 3.10.5).  So only the owner rows are counted."""
+    scope = HermesRuntimeScope(
+        platform=view.entry_host,
+        user_id=LOCAL_USER_ID,
+        chat_type="private",
+        chat_id=LOCAL_USER_ID,
+        thread_id="main",
+        agent_identity=view.agent_id,
+        agent_workspace="default",
+        agent_context="primary",
+        entry_id=str(view.entry_id),
+    )
+    owner_rows = tuple(row for row in view.audiences if str(row.get("kind") or "conversation") == "owner_private")
+    audience = resolve_runtime_audience(replace(view, audiences=owner_rows), scope)
+    if not audience.includes_owner_private or not audience.allowed_scope_ids or audience.capture_scope_id is None:
+        raise SharedStoreError(
+            f"a {view.entry_host} entry needs an owner row on its own route, of an owner principal, that reads and "
+            "captures: under these grants the client would not bind as the owner"
+        )
+
+
+def _applied_grants(plan: _GrantsPlan, now: str) -> dict[str, Any]:
+    run = Run(plan.store, f"grants-{plan.before['entry_id']}", now)
+    replaced = {plan.store / MANIFEST_FILENAME: "store", plan.entry_path: "entry"}
+    for path, label in replaced.items():
+        run.keep(path, label)
+    # Planned from one manifest, a change written over another undid what the other command had written (two runs at
+    # once: a revoked route came back).  The copy just kept is the manifest this run would replace.  A writer that
+    # lands between here and the replace is not seen; shared-store commands run one at a time.
+    kept = run.folder / f"store-{MANIFEST_FILENAME}"
+    if not kept.is_file() or hashlib.sha256(kept.read_bytes()).hexdigest() != plan.manifest_digest:
+        run.receipt({"status": "refused", "entry_id": plan.before["entry_id"], "reason": "manifest_changed"})
+        raise SharedStoreError(
+            "the store's manifest changed after this change was checked: nothing was written; run the command again"
+        )
+    rollback = None
+    if plan.manifest_changes:
+        rollback = run.folder / "grants-before.json"
+        previous = {name: plan.before[name] for name in _GRANT_FIELDS}
+        write_json(rollback, {"schema": GRANTS_SCHEMA, "entry_id": plan.before["entry_id"], **previous})
+    try:
+        if plan.manifest_changes:
+            write_shared_payload(plan.store, plan.updated)
+        if plan.entry_config is not None:
+            write_json(plan.entry_path, plan.entry_config)
+        result = {
+            "status": "applied",
+            **plan.change,
+            "rollback": str(rollback) if rollback is not None else None,
+            "next": "start this entry's host again: it binds the new grants when it starts (doctor checks them)",
+        }
+        # The receipt is part of the change: written after it, a receipt that failed left the grants changed and
+        # the command failed, with no word of the grants as they were (review of 3.10.5).
+        result["receipt"] = run.receipt(result)
+    except BaseException as exc:
+        # Half a change binds the entry to scopes its grants do not name, or the other way round.
+        left = _put_back(run, replaced)
+        if left and isinstance(exc, Exception):
+            raise SharedStoreError(f"{exc}; and the change could not be undone: copy back {'; '.join(left)}") from exc
+        raise
+    return result
+
+
+def _put_back(run: Run, replaced: dict[Path, str]) -> list[str]:
+    """Each file a run kept a copy of, as the copy has it, replaced in one step, and retried while a reader holds it
+    (a single try left a change half undone while the worker read the manifest; review of 3.10.5).  Each file is
+    tried; what could not be put back comes back as ``copy -> file``, to copy by hand."""
+    left = []
+    for path, label in replaced.items():
+        kept = run.folder / f"{label}-{path.name}"
+        if kept.is_file():
+            staged = path.with_name(f".{path.name}.restore")
+            try:
+                shutil.copy2(kept, staged)
+                replace_file(staged, path)
+            except OSError:
+                left.append(f"{kept} -> {path}")
+    return left
+
+
 def entries(*, root: Path) -> dict[str, Any]:
     payload = read_shared_payload(root)
     seen: dict[str, dict[str, str]] = {}
@@ -571,6 +864,11 @@ def main(argv: list[str]) -> int:
     join.add_argument("--python", help="the interpreter this home's host runs, recorded for the operator")
     leave = sub.add_parser("detach", help="stop a home being an entry; its memories stay in the store")
     leave.add_argument("--instance-root", required=True)
+    grant = sub.add_parser("grants", help="show an attached entry's grants, or change them from an edited copy")
+    grant.add_argument("--instance-root", required=True)
+    grant.add_argument("--out", help="write the entry's grants to this new file, to edit")
+    grant.add_argument("--grants-from", help="the entry's grants as edited; without --apply the change is only shown")
+    grant.add_argument("--apply", action="store_true", help="write the change (stop the entry's host first)")
     take = sub.add_parser("adopt", help="record the directory a copied shared store now lives in")
     take.add_argument("--root", required=True)
     listing = sub.add_parser("entries", help="list a shared store's entries and when each was last heard from")
@@ -608,6 +906,13 @@ def main(argv: list[str]) -> int:
             )
         elif args.command == "detach":
             result = detach(instance_root=_absolute(args.instance_root, "instance_root"))
+        elif args.command == "grants":
+            result = grants(
+                instance_root=_absolute(args.instance_root, "instance_root"),
+                grants_from=_absolute(args.grants_from, "grants_from") if args.grants_from else None,
+                out=_absolute(args.out, "out") if args.out else None,
+                apply=args.apply,
+            )
         elif args.command == "adopt":
             result = adopt(root=_absolute(args.root, "root"))
         elif args.command == "import-entry":

@@ -126,7 +126,13 @@ scope-recall apply-install --host claude-code --target-plugin-dir %USERPROFILE%\
 The plugin under `~/.claude/skills/` loads in every new Claude Code session of that user, the
 desktop app's included; `claude plugin disable scope-recall@skills-dir` stops it. Its hooks record
 each prompt as the owner's and each final reply as Claude Code's, and put what is remembered in
-front of the prompt. A turn is recorded under its prompt id, which Claude Code sends from 2.1.196.
+front of the prompt. What the model still has word for word is not put there again: an item that
+stands only on this session's messages since its last compaction (the session record names it; with
+none, since the session began) is left out, and other memories take its place. What was said before
+a compaction reaches the model only as the compaction's summary, and is recalled (#249). The
+reminders Claude's desktop app puts in a message (a `<system-reminder>` block that opens a line) are
+not the owner's words: they are neither recorded nor recalled for (#248).
+A turn is recorded under its prompt id, which Claude Code sends from 2.1.196.
 At the end of each turn the Stop hook also reads the session record Claude Code keeps (the hook's
 `transcript_path`) from where the last read stopped, and records what it shows being said: the
 owner's messages, those sent while a turn was running included, and the text Claude Code shows
@@ -139,9 +145,14 @@ by its words and moment) and not stored twice; one that cannot be written now is
 read stopped is kept in `<home>\scope-recall\transcripts`; deleting it only makes the next read
 start from the top. Claude Code runs a hook command through a shell (Git Bash, or
 PowerShell without it), so keep the interpreter, the home and the env file on ASCII paths without
-spaces; `apply-install` refuses others. Its MCP tools read the store. Changing a memory through
-them is refused, because the tools cannot tell which conversation asks: correct or delete through
-a Hermes agent or Codex.
+spaces; `apply-install` refuses others. Its MCP tools read the store. The three that would change
+it (`propose_memory`, `revise`, `forget`) are not offered: the store takes such a change only on the
+word of the person's latest message in the same conversation, and Claude Code does not tell the tools
+which conversation a call comes from, so each was refused (#245). Correct or delete through a Hermes
+agent or Codex; the store is one, so the change holds for every entry. Each answer of the tools that
+are offered names the gap `mcp_session_is_not_claude_code_conversation_id` (`..._workbuddy_...`,
+`..._dsh_...` on those entries): the call is tied to no conversation. It is expected and needs
+nothing.
 
 Each hook is a process of its own, and a prompt hook that starts LanceDB for its recall was often
 not ready before the recall's budget ran out (6 of 8 cold Claude Code prompts on the pilot recalled
@@ -204,7 +215,7 @@ Every process on the store, its worker included, must run 3.5.0 or later before 
 attaches: an older one does not know the host, and cannot replay a capture this entry queued.
 
 WorkBuddy attaches the same way, as the owner at this machine, and runs the same hooks and MCP
-server; its installer adds them to WorkBuddy's own `settings.json` and `mcp.json` rather than
+server, which offers it the same tools as Claude Code, none that changes the store; its installer adds them to WorkBuddy's own `settings.json` and `mcp.json` rather than
 writing a plugin ([install.md](install.md), section 12, which also says what is not recorded):
 
 ```text
@@ -235,7 +246,7 @@ queued.
 
 dsh attaches the same way, as the owner at this machine. A plugin the installer writes runs the
 same hooks (dsh's own hooks name no turn and no reply), and dsh's MCP client runs the same MCP
-server; the installer adds both as rows of dsh's home patch, `cordis.patch.yml`, and switches off
+server, with the same tools as Claude Code's, none that changes the store; the installer adds both as rows of dsh's home patch, `cordis.patch.yml`, and switches off
 dsh's upload of its session logs to its model API ([install.md](install.md), section 13, which
 also says what is not recorded):
 
@@ -266,6 +277,55 @@ scope-recall doctor --host hermes --instance-root <home>
 `entries` lists each entry, whether its home still points here, and when the store last heard
 from it. `doctor` on an attached home reports the shared store it belongs to, the store's health
 and the shared worker's registration.
+
+## Changing an entry's grants
+
+An entry keeps the grants it was attached with: its owner principals, the capture scope of each
+audience kind, and its exact audience rows. To add a route (a gateway DM of the owner), let a row
+read another scope (a conversation another route captured into, or an older scope), or take a
+row away, change them from an edited copy:
+
+```text
+scope-recall grants --instance-root <home> --out D:\grants-desk.json
+rem edit D:\grants-desk.json
+scope-recall grants --instance-root <home> --grants-from D:\grants-desk.json
+rem stop the entry's host (its gateway, or the client)
+scope-recall grants --instance-root <home> --grants-from D:\grants-desk.json --apply
+rem start it again, then doctor
+```
+
+The first command writes the entry's grants to a new file. The second checks the edited copy and
+shows the change and writes nothing: the rows that go and the rows that come, each whole, with
+the scopes it reads, writes and captures into (two rows may share a route, and each counts);
+whether the rows kept changed order (`rows_reordered`); each route a row names that would read,
+write or capture otherwise, as its sessions bind before and after (`routes_changed`: of the rows a
+session matches, the first that captures into a scope it may write decides, so the order of rows
+counts, and an owner row grants only with its principal); the owner principals; the scopes the
+entry gains or gives up; and any owner row that grants nothing.
+With `--apply` it writes the store's manifest, and the entry's runtime config when the scopes it
+binds change, keeping a copy of each file under `receipts\`, with `grants-before.json`, the
+grants as they were: applied the same way, it puts them back. A write that fails, the receipt's
+included, puts the copies back (a file it could not put back is named with its copy, to copy by
+hand); run again, the command also rebinds an entry config that a failed run left behind. If the
+store's manifest changed after the command read it (another command wrote it), it writes nothing
+and says so: run it again. Run one shared-store command at a time.
+
+A row matches a session field by field, as at attach: `platform`, `user_id`, `chat_type`,
+`chat_id`, `thread_id`, `gateway_session_key` (empty does not pin the host's session key) and
+`agent_workspace`; there is no wildcard. An `owner_private` row grants something only when its
+platform and user are among the owner principals, so add the principal with the row; one that
+names no principal grants nothing, and the change lists it (`owner_rows_granting_nothing`), as
+`doctor` does (`audience_owner_unverified`). Write and capture scopes must be among the row's
+read scopes. Only scopes the store already holds are named: a scope comes into the store with an
+entry that holds it. A change that would leave a scope held by no entry is refused: what is in it
+would leave every binding, the worker's included; keep it on a row that only reads, or `detach`
+the entry. So the store's own scopes, and the shared worker's config, never change here, and the
+grants before a change apply back. A client (Codex, Claude Code, WorkBuddy, dsh) takes whoever
+types into it for the owner, so its own route keeps an owner row, of an owner principal, that
+reads and captures; a conversation row beside it is a grant like any other. Memories keep their
+scopes and their entry; only who reads and writes them changes. Whoever can run this can grant
+any route the store's memory, as whoever can write the manifest always could: it is an operator
+command, never a host's.
 
 ## Detach, and going back
 

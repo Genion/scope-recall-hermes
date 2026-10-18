@@ -190,16 +190,26 @@ provider unselected, which `doctor` reports as `host_registration_incomplete`
 
 `--agent-id` must equal the `agent_identity` the host sends on `initialize`: the
 adapter compares them and raises `agent_identity conflict` when they differ
-(`adapters/hermes/identity.py`). `--agent-workspace` defaults to `hermes`, which
-is the value the host's memory-provider init contract uses; override it only if
-your host really sends something else, and then pass the same value to plan and
-apply. A mismatch still installs, but capture is refused later because the
-audience cannot be mapped.
+(`adapters/hermes/identity.py`). Hermes sends the name of the profile that owns
+`HERMES_HOME`: `default` for the default home (`%LOCALAPPDATA%\hermes` on
+Windows, `~/.hermes` elsewhere) and for any home outside it, `<name>` for a home
+at `<root>\profiles\<name>`, and `custom` for any other directory inside the
+default home. Read it for your home with the Python of Hermes's own environment,
+the one the `hermes` command runs:
 
-TODO(verify): which identity string your host actually sends is decided by the
-host's own active-profile lookup, which is not in this source tree. Read it from
-the host rather than guessing; on an isolated home it is commonly `default`, but
-this repository cannot confirm that.
+```powershell
+$env:HERMES_HOME = "C:\path\to\hermes-home"
+& "C:\path\to\hermes\venv\Scripts\python.exe" -c "from hermes_cli.profiles import get_active_profile_name as n; print(n())"
+Remove-Item Env:HERMES_HOME
+```
+
+```bash
+HERMES_HOME=/path/to/hermes-home /path/to/hermes/venv/bin/python -c "from hermes_cli.profiles import get_active_profile_name as n; print(n())"
+```
+
+Hermes always sends `hermes` as `agent_workspace`, which is what
+`--agent-workspace` defaults to: leave it. Another value still installs, but
+capture is refused later because the audience cannot be mapped.
 
 ```powershell
 $Instance = "C:\path\to\hermes-home"
@@ -314,9 +324,10 @@ names no user, with the same backup, and approves nothing else: not that login o
 `tui`, not another login, not a session that names no user. Whoever holds that
 login then reads and writes the owner's private memory there, from any machine
 that reaches the host, so approve only a login that is the owner's own; `revise`
-and `forget` stay with the CLI. A shared store entry keeps the grants it was
-attached with: approve a login in the home's own installation before attaching
-it. `doctor` reports an owner row whose user is no owner principal as
+and `forget` stay with the CLI. An entry of a shared store keeps its grants in
+the store's manifest, which this command does not write: add the login's owner
+row there with `scope-recall grants` ([shared-store.md](shared-store.md)).
+`doctor` reports an owner row whose user is no owner principal as
 `audience_owner_unverified`.
 
 A login that is not the owner's is a user like any gateway user and gets only
@@ -329,7 +340,8 @@ sends: `platform`, `user_id`, `chat_type`, `chat_id`, `thread_id`,
 only for local surfaces and their logins; a gateway route's row is declared with
 the installation API, in the whole manifest, before anything creates the store,
 as a migration does ([AGENT_WORKFLOW.md](../maintenance/AGENT_WORKFLOW.md),
-section 2). A row whose `gateway_session_key` is
+section 2). An entry of a shared store changes its rows with `scope-recall grants`
+([shared-store.md](shared-store.md)). A row whose `gateway_session_key` is
 empty does not pin the host's session key, which is built from the platform, chat
 type and chat the row already matches; a row that names one matches only that key.
 For a plain, unthreaded chat a gateway sends an empty `thread_id`, so the row needs
@@ -411,7 +423,7 @@ to purely lexical. Usually the same file is passed to `autostart enable`.
 - `.codex-plugin\plugin.json`
 - `hooks\hooks.json` and `hooks\scope-recall-hook.cmd` (the Windows launcher)
 - `.mcp.json`, defining the MCP server named `scope-recall`
-- `skills\scope-recall-setup\SKILL.md`
+- `skills\scope-recall-setup\SKILL.md` and `skills\scope-recall-memory\SKILL.md`
 
 The installer owns these files exclusively. Do not hand-edit them or add your own
 scripts to that directory: the next `plan-install` will report them as
@@ -422,27 +434,41 @@ keeps the edit (`kept` in the plan) and installs the rest; once a release change
 that skill, the edit is a conflict again.
 
 Six native hook events are registered, each invoking
-`scope_recall.adapters.codex.hook_entry` through the isolated interpreter with a
-2-second timeout: `Interrupt`, `PostToolUse`, `SessionEnd`, `SessionStart`,
-`Stop`, `UserPromptSubmit`.
+`scope_recall.adapters.codex.hook_entry` through the isolated interpreter. Codex
+waits at most this many seconds for each: `SessionStart` 5, `UserPromptSubmit`
+15, `PostToolUse` 2, `Stop` 10, `Interrupt` 3, `SessionEnd` 3. These are
+ceilings, not waits: a hook answers as soon as its work is done.
 
 **Then enable it in Codex:**
 
-1. Trust the written `hooks\hooks.json` in Codex. The installer generates files;
-   it cannot approve them for you.
-2. For the MCP tools, confirm the wheel was installed with the `[codex]` extra,
-   and allow the server `scope-recall` through Codex's own MCP configuration. Its
-   tools are `recall`, `inspect`, `profile`, `trace`, `entity`,
-   `propose_memory`, `revise`, `forget` and `status`.
+1. List the plugin directory in a Codex marketplace (the personal one is
+   `~/.agents/plugins/marketplace.json`; `source.path` must stay inside the
+   marketplace root). Install and enable the plugin from the Plugins page (in the
+   CLI, `/plugins`), restart the desktop app after any change to the plugin
+   files, and start a new session.
+2. Trust the six hooks. Installing or enabling the plugin does not trust them:
+   Codex skips a plugin's hooks until the current definition of each has been
+   reviewed. In the CLI, answer the start-up prompt "Hooks need review" with
+   **Review hooks** or **Trust all and continue**, or open `/hooks` and press
+   `t`. In the desktop app, open Settings → Hooks (or the plugin's page, or
+   **Review hooks** in the composer) and choose **Trust** or **Trust all**. After
+   a later `apply-install`, check again: Codex marks a hook whose definition
+   changed "review required" and does not run it.
+3. The MCP server needs no approval of its own. `.mcp.json` belongs to the
+   plugin, so Codex starts `scope-recall` once the plugin is enabled, provided the
+   wheel was installed with the `[codex]` extra; do not add a
+   `[mcp_servers.scope-recall]` entry to `config.toml`, which would define a
+   second server. `/mcp` lists it in the CLI, and Settings → MCP servers → From
+   plugins in the desktop app. Its tools are `recall`, `inspect`, `profile`,
+   `trace`, `entity`, `propose_memory`, `revise`, `forget` and `status`. To turn
+   only this server off, set `enabled = false` under
+   `[plugins."<plugin>@<marketplace>".mcp_servers.scope-recall]`;
+   `default_tools_approval_mode` in the same table (`auto`, `prompt`, `writes`,
+   `approve`) sets how Codex asks before a tool call.
 
 `hook_trust_status` stays `pending` in a read-only diagnosis; this project ships
 no GUI and no separate trust command. Whether hooks really run is visible only in
 Codex's own behaviour.
-
-TODO(verify): the concrete Codex-side steps for trusting a plugin's native hooks
-and allowing an MCP server are defined by Codex, not by this repository, and are
-not derivable from this source tree. Follow Codex's own documentation for the
-version you run; this installer only writes the files those steps consume.
 
 The Core data directory is `<instance-root>\data\`, holding `memory.sqlite3`.
 
@@ -475,7 +501,9 @@ by key, and exits `0` only when `status` is `"ok"`.
 | `attention` | 1 | No gap from the actionable set, but at least one from the non-actionable set below, or failed work, pending capture, or partial extractions. Worth a look, not an emergency. |
 | `degraded` | 1 | At least one gap an operator must act on. It is also the fail-safe default when the database cannot be read at all. |
 
-The four gaps that yield `attention` rather than `degraded` are
+The gaps that yield `attention` rather than `degraded` are
+`audience_owner_unverified`, `due_work_unreached`, `owner_words_from_host_request`,
+`owner_words_unchecked`, `owner_words_with_client_reminder`,
 `vector_threshold_unconfigured`, `work_failed_terminal_only`, `work_needs_review`
 and `worker_capability_unavailable`. Everything else forces `degraded`.
 
@@ -606,7 +634,10 @@ Things that look wrong in a healthy report and are not:
 | `schema_header_stale` | The store's tables and its own record say one schema, the SQLite header another: another process stamped the header, typically a 2.0 plugin that opened the store after its migration. Every open is refused. | Stop that process, then run `upgrade-store` with `--backup-dir`: it snapshots the store and puts the recorded schema back into the header. |
 | `vector_threshold_unconfigured` | A vector store and an approved embedding route are configured, but no threshold is set, so every vector hit is refused and recall stays lexical. `attention`. | Set a `vector_threshold` calibrated for that embedding model — see [configuration.md](configuration.md). |
 | `audience_owner_unverified` | An `owner_private` audience row names a user who is no owner principal, so it grants nothing and every session on its route captures and recalls nothing. The `audiences` check counts such rows by platform. `attention`. | If the user is the owner's own dashboard login, approve it with `apply-install --owner-login <platform>=<login>` (section 4); otherwise remove the rows. |
-| `work_failed` | At least one recoverable failure is queued. | Fix the cause, then `scope-recall retry-failures --config <file> --apply`. |
+| `owner_words_with_client_reminder` | Claude Code only. Messages stored as the owner's words before 3.10.5 that hold a `<system-reminder>` block Claude's desktop app put in them (#248): claims drawn from them read as things the owner said, and a recall can bring the block back. The `owner_words` check counts this entry's and names the first 20 refs, never their text. `attention`. | Forget them: in a session that has `forget` (Codex, a Hermes chat), ask for those refs to be deleted, naming each ref in your own message. What was drawn from them goes with them. New messages are stored without the block. |
+| `owner_words_from_host_request` | Codex only. Codex's own requests for suggestions of what to do next, stored as the owner's words, and the model's answers to them, stored as replies: the desktop app's request for one suggested next message (it opens by saying the user did not write it) and the longer request for several suggestions. Claims drawn from them read as things the owner said, and recall brings the answers back. The `owner_words` check counts this entry's and names the first 20 refs, never their text. `attention`. | Forget them: in a Codex session, ask for those refs to be deleted, naming each ref in your own message. What was drawn from them goes with them. New requests and their answers are not stored. |
+| `owner_words_unchecked` | Claude Code and Codex. The read for `owner_words_with_client_reminder` or `owner_words_from_host_request` stopped after 10 s before it reached the end of the store; the `owner_words` check says how many it found by then. `attention`. | Run `doctor` again when the store is less busy. |
+| `work_failed` | At least one item failed for a reason that is not by design: any code but `derivation_invalid`, `input_invalid` and `sensitive_request`, such as an embedding its provider answered with vectors of another width (`vector_dimension_mismatch`). | Fix the cause, then `scope-recall retry-failures --config <file> --apply`, which re-opens every such item. |
 | `work_failed_terminal_only` / `work_needs_review` | All failures are by design, or were already retried once. `attention`. | Inspect them; `--include-terminal` re-runs them only if you mean to. |
 | `work_backlog_stalled` | Work is pending and the worker has not succeeded for more than twice `supervisor_seconds`. | The worker is not running. See the next section. |
 | `worker_capability_unavailable` | Work is pending and the last pass reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
@@ -732,14 +763,21 @@ If an external route is configured, pass its credentials file with `--env-file`
 (absolute), as the wake does, or export the variable named by `credential_env`
 into your shell before running it.
 
-To re-open failures after shipping a fix:
+To re-open failures once their cause is fixed, by a release or at the provider:
 
 ```bash
 scope-recall retry-failures --config /path/to/instance-root/scope-recall/runtime-config.json --apply
 ```
 
-Without `--apply` nothing is written. `--include-terminal` also re-runs failures
-that are terminal by design. Each release gives a failure one re-look: a row this
+Without `--apply` nothing is written. A run re-opens every failure that is not
+terminal by design, whatever its code, up to `--limit`, reading past any number of
+failed rows it leaves alone, and each row it re-opens has the attempts of new work.
+`--include-terminal` also re-runs the terminal ones (`derivation_invalid`,
+`input_invalid`, `sensitive_request`). The worker re-opens a transient failure by
+itself (`max_auto_recoveries`), but not one that would come back until someone
+changes something: an embedding its provider answered with vectors of another width
+while another model served the endpoint (`vector_dimension_mismatch`) waits for this
+command. Each release gives a failure one re-look: a row this
 release re-opened that failed again is left by a later run in the same release,
 which counts it (`already_retried`, the first eight ids in
 `already_retried_work_ids`). To re-run such a row within the release, name it:
@@ -1020,7 +1058,9 @@ where the last read stopped, for the text shown between tool calls and the owner
 prompt hook could not store; `SessionEnd` reads the rest and forgets the session's turns. A turn
 is named by the prompt's `generation_id` when it is new to the session, else by one derived from
 the session, the words and the moment, kept in `<instance-root>\scope-recall\turns\` until the
-session ends (a day at most). The MCP server serves the tools.
+session ends (a day at most). The MCP server serves the tools that read the store, not
+`propose_memory`, `revise` or `forget`: WorkBuddy names no conversation with a call
+([shared-store.md](shared-store.md)).
 
 The prompt's recall comes from a resident recall server (from 3.6.0), which keeps the entry's
 vector search and embedding connection warm. WorkBuddy 5.6.2 runs its MCP servers inside a
@@ -1128,7 +1168,10 @@ and its session log is compressed, so a hook alone cannot record a turn: a dsh p
 installer writes, runs the entry's hooks instead. Before the first step of each turn it runs the
 prompt hook with the person's message and adds what is remembered to that step; it keeps the
 turn's messages as dsh commits them and stores them when the turn ends. dsh's own MCP client runs
-the MCP server, which serves the tools (`mcp__scope-recall__recall` and the rest).
+the MCP server, which serves the tools that read the store (`mcp__scope-recall__recall` and the
+rest). It does not offer `propose_memory`, `revise` or `forget`: dsh's MCP client names no
+conversation with a call, and the store takes such a change only on the word of the person's latest
+message in the same conversation ([shared-store.md](shared-store.md)).
 
 Attach dsh's entry first ([shared-store.md](shared-store.md)), from an environment with the
 `codex` extra, then install:

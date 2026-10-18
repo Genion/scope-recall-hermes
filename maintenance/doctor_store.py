@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from contextlib import closing, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from scope_recall.adapters.clients.boundary import (
+    claude_code_person_text,
+    is_codex_suggestions_prompt,
+    is_codex_suggestions_reply,
+)
 from scope_recall.contracts import TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.failure_retry import NEEDS_REVIEW_COUNT
@@ -594,3 +600,81 @@ def check_ledger(report: DoctorReport) -> None:
     if ratio >= _LEDGER_PRESSURE_WARN:
         record_check(report, "auxiliary_ledger", "pressure", f"{ratio:.0%} of a lifetime cap")
         report.capability_gaps.append("auxiliary_budget_pressure")
+
+
+#: How many stored messages the owner never wrote the doctor names by ref.
+_OWNER_WORDS_REFS = 20
+#: How long the doctor reads the stored messages for them, before it says it did not finish.
+_OWNER_WORDS_SCAN_S = 10.0
+
+
+def _claude_code_reminder(origin: str, content: str) -> bool:
+    """A message of the owner's that holds a reminder Claude's desktop app put in it."""
+    return claude_code_person_text(content) != content
+
+
+def _codex_host_request(origin: str, content: str) -> bool:
+    """Codex's request for suggestions of what to do next, stored as the owner's message, or its answer as a reply."""
+    return is_codex_suggestions_prompt(content) if origin == "human_direct" else is_codex_suggestions_reply(content)
+
+
+#: Per host whose hooks once stored words the host wrote itself: a cheap filter SQLite applies first, which keeps every
+#: row the test could accept (a reply is JSON, and a JSON key may be written with escapes, so only its brace is
+#: certain), the test that tells such a message (the one the hooks now apply before storing), the gap and the result.
+_HOST_WORDS = {
+    "claude-code": (
+        "origin='human_direct' AND instr(content,'<system-reminder')>0",
+        _claude_code_reminder,
+        "owner_words_with_client_reminder",
+        "client_reminders",
+    ),
+    "codex": (
+        "(origin='human_direct' AND (instr(lower(content),'app-generated request')>0"
+        " OR instr(lower(content),'hyperpersonali')>0))"
+        " OR (origin='assistant_visible' AND instr(content,'{')>0)",
+        _codex_host_request,
+        "owner_words_from_host_request",
+        "host_requests",
+    ),
+}
+
+
+def check_owner_words(report: DoctorReport, host: str, data_directory: Path, entry_id: str | None) -> None:
+    """Messages stored for the owner that the host wrote itself: the reminders Claude's desktop app puts in a message,
+    and the requests Codex sends for suggestions of what to do next, with the model's answers stored as replies.
+    Claims drawn from them read as things the owner said, and recall brings them back.  Counted for this entry (its
+    own store's messages when it has one), with the first refs named and never their text; the owner forgets them by
+    ref, and what was drawn from them goes with them.  The read stops after ``_OWNER_WORDS_SCAN_S``; one that did not
+    finish says so with what it found, never that there is nothing."""
+    rule = _HOST_WORDS.get(host)
+    if rule is None:
+        return
+    condition, written_by_host, gap, result = rule
+    count, refs, finished = 0, [], False
+    deadline = time.monotonic() + _OWNER_WORDS_SCAN_S
+    with suppress(sqlite3.Error, OSError, ValueError):
+        with closing(
+            sqlite3.connect(f"file:{(data_directory / 'memory.sqlite3').as_posix()}?mode=ro", uri=True, timeout=5)
+        ) as db:
+            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
+            rows = db.execute(
+                f"""SELECT event_id,source_revision,origin,content FROM source_events
+                WHERE read_blocked=0 AND entry_id IS ? AND ({condition}) ORDER BY rowid""",
+                (entry_id,),
+            )
+            for event_id, revision, origin, content in rows:
+                if time.monotonic() > deadline:
+                    break
+                if type(content) is str and written_by_host(origin, content):
+                    count += 1
+                    if len(refs) < _OWNER_WORDS_REFS:
+                        refs.append(f"{event_id}@{revision}")
+            else:
+                finished = True
+    if count:
+        report.capability_gaps.append(gap)
+    if not finished:
+        report.capability_gaps.append("owner_words_unchecked")
+        record_check(report, "owner_words", "unfinished", f"{count} found before the read stopped: {','.join(refs)}")
+    elif count:
+        record_check(report, "owner_words", result, f"{count}: {','.join(refs)}")

@@ -453,3 +453,86 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
     path.parent.mkdir(parents=True, exist_ok=True)
     _replace_file(path.parent, path, json.dumps(pointer, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     return view
+
+
+# -- an attached entry's grants ---------------------------------------------------------
+#
+# An entry keeps the grants it was attached with until the operator changes them here (#246): its record's
+# owner principals, the capture scope of each audience kind, and its exact audience rows.  ``entry_grants`` gives
+# them as a document to edit, ``regranted`` checks an edited one as attach checks a record, and the
+# command writes the manifest it returns (``maintenance/shared.py``).  What the store holds keeps its scopes; only
+# who reads and writes them changes.
+
+GRANTS_SCHEMA = "scope-recall.entry-grants/1"
+_GRANT_FIELDS = ("owner_principals", "audience_scopes", "audiences")
+
+
+def _attached(hermes_home: Path | str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """The store a home is attached to, its manifest, and the home's entry record; refused for any other home."""
+    home = Path(str(hermes_home)).expanduser().resolve()
+    attachment = read_attachment(home)
+    if attachment is None:
+        raise HermesIdentityError("this home is not attached to a shared store")
+    payload = read_shared_payload(attachment.root)
+    record = next((entry for entry in payload["entries"] if entry["entry_id"] == attachment.entry_id), None)
+    if record is None or record.get("detached_at") or not _same_path(record["home"], home):
+        raise HermesIdentityError("the shared store holds no attached entry of this home")
+    return attachment.root, payload, record
+
+
+def entry_grants(hermes_home: Path | str) -> dict[str, Any]:
+    """The grants of the entry ``hermes_home`` is attached as, as a document to edit and hand to ``regranted``."""
+    _store, _payload, record = _attached(hermes_home)
+    return {
+        "schema": GRANTS_SCHEMA,
+        "entry_id": record["entry_id"],
+        **{name: json.loads(json.dumps(record[name])) for name in _GRANT_FIELDS},
+    }
+
+
+def regranted(
+    hermes_home: Path | str, grants: object
+) -> tuple[Path, InstallationManifest, dict[str, Any], dict[str, Any], dict[str, Any], InstallationManifest]:
+    """The shared store with the entry of ``hermes_home`` holding ``grants`` (an edited ``entry_grants``) in place of
+    its own, checked as a whole as ``attach_shared_record`` checks a record: (store, the entry's view now, record
+    now, record after, manifest after, the entry's view after).  Nothing is written.
+
+    Rows stay exact (``audience_entry``).  An owner row whose user is no owner principal grants nothing; it is
+    allowed, as an installation may hold one (``doctor``'s ``audience_owner_unverified``), so that the grants before a
+    change always apply back, and the command names it.  Only scopes the store holds are named, and none is left
+    held by no entry (what is in it would leave every binding, the worker's included; ``detach`` keeps an entry's
+    scopes on record): the store's own scopes never change here, so the worker's binding stays and the grants before
+    a change can always be applied back.  A client's own route must
+    still read and capture: the caller checks that against the route the client binds with
+    (``maintenance/shared.py``), which this module cannot import."""
+    store, payload, record = _attached(hermes_home)
+    if not isinstance(grants, dict) or grants.get("schema") != GRANTS_SCHEMA:
+        raise HermesIdentityError(f"not an entry grants document ({GRANTS_SCHEMA}): start from the entry's own")
+    if grants.get("entry_id") != record["entry_id"]:
+        raise HermesIdentityError("the grants document is another entry's")
+    if set(grants) != {"schema", "entry_id", *_GRANT_FIELDS}:
+        raise HermesIdentityError("an entry grants document holds schema, entry_id, " + ", ".join(_GRANT_FIELDS))
+    check = dict(REQUIRED_FIELDS)
+    rows = [dict(row) for row in check["audiences"](grants["audiences"])]
+    principals = [dict(item) for item in check["owner_principals"](grants["owner_principals"])]
+    kinds = check["audience_scopes"](grants["audience_scopes"])
+    mapped = sorted({scope_id for row in rows for scope_id in row["allowed_scope_ids"]})
+    if not set(kinds.values()) <= set(mapped):
+        raise HermesIdentityError("audience_scopes names a scope no row of the entry reads")
+    unknown = set(mapped) - set(payload["scope_ids"])
+    if unknown:
+        raise HermesIdentityError(
+            f"{len(unknown)} scope(s) the store does not hold: grants change who reads and writes the store's scopes, "
+            "and a scope comes into the store with an entry that holds it (attach)"
+        )
+    after = {**record, "scope_ids": mapped, "owner_principals": principals, "audience_scopes": kinds, "audiences": rows}
+    entries = [after if entry["entry_id"] == record["entry_id"] else entry for entry in payload["entries"]]
+    held = {scope_id for entry in entries for scope_id in entry["scope_ids"]}
+    orphaned = set(payload["scope_ids"]) - held
+    if orphaned:
+        raise HermesIdentityError(
+            f"{len(orphaned)} scope(s) would be held by no entry, and what is in them would leave every binding: keep "
+            "each on a row of some entry (one that only reads will do), or detach the entry instead"
+        )
+    updated = _checked_shared_payload({**payload, "entries": entries, "scope_ids": sorted(held)})
+    return store, _entry_view(store, payload, record), record, after, updated, _entry_view(store, updated, after)

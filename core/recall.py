@@ -5,12 +5,13 @@ from __future__ import annotations
 import inspect
 import sqlite3
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from itertools import islice
 from typing import Protocol
 
-from ..contracts import ContractError
+from ..contracts import ContractError, utc_timestamp
 from .background_context import background_candidates, current_task_candidate
+from .claim_storage import parse_source_ref
 from .claims import canonical_time
 from .coverage import note_truncation
 from .duplicate_collapse import DistinctContent, note_duplicates
@@ -151,6 +152,24 @@ def _empty_result(context: SearchContext, gap: str) -> RetrievalResult:
     return RetrievalResult((), (), None, (gap,), "unknown", "unknown", 0, 0, request_id=context.request_id)
 
 
+def _in_context(tx, obj: RetrievedObject, context: SearchContext) -> bool:
+    """Whether everything ``obj`` stands on is this session's own and was said since ``context.in_context_since``,
+    so that the asking host's model still holds it word for word.  Anything else is not: an item without evidence,
+    one with any evidence of another session, from before that moment, or that cannot be read."""
+    if not obj.evidence_refs or context.in_context_since is None:
+        return False
+    session = context.trusted_context.session_id
+    for ref in obj.evidence_refs:
+        try:
+            source = tx.source(*parse_source_ref(ref))
+            said = utc_timestamp(source.event.get("occurred_at")) if source is not None else None
+        except ContractError:
+            return False
+        if source is None or source.session_id != session or said is None or said < context.in_context_since:
+            return False
+    return True
+
+
 def _says_only_its_state(content: str) -> bool:
     """Whether an episode body is the placeholder a never-consolidated resume leaves."""
     payload = optional_json(content)
@@ -179,6 +198,16 @@ def _said_after(obj: RetrievedObject, moment: str) -> bool:
 
 #: See ``RetrievalPipeline.RELATION_WEIGHT``.
 RELATION_WEIGHT = 0.5
+
+
+@dataclass
+class _Aside:
+    """What hydration sets aside rather than delivers (``RetrievalPipeline._hydrate_admit``): older copies of the
+    current message, which lead to their turn's replies, and what the asking model still holds, which leads on to
+    what is related to it (#249)."""
+
+    echoes: list[CandidateRef] = field(default_factory=list)
+    held: list[CandidateRef] = field(default_factory=list)
 
 
 class RetrievalPipeline:
@@ -437,7 +466,7 @@ class RetrievalPipeline:
         context: SearchContext,
         *,
         original_query: str | None = None,
-        echoes: list[CandidateRef] | None = None,
+        aside: _Aside | None = None,
     ) -> RetrievedObject | None:
         obj = self.storage_reader.hydrate(tx, candidate, context)
         if obj is None:
@@ -445,12 +474,12 @@ class RetrievalPipeline:
         # The current message already supplies this text. Older copies add no
         # information to automatic context and can crowd out its actual evidence.
         # What such a copy was told in its turn still answers it: the copy is set
-        # aside in ``echoes`` to lead to its turn's replies, never delivered.
+        # aside in ``aside.echoes`` to lead to its turn's replies, never delivered.
         if context.mode == "auto" and obj.kind == "event":
             query = context.query if original_query is None else original_query
             if same_message(obj.content, query):
-                if echoes is not None:
-                    echoes.append(candidate)
+                if aside is not None:
+                    aside.echoes.append(candidate)
                 return None
         # A message of the day a question named was chosen by its day and entry: the entry's name ("pc2") is not an
         # identifier it has to repeat.  Every other candidate still has to.
@@ -462,6 +491,14 @@ class RetrievalPipeline:
         # nothing.  Every plain chat turn opens one.  Named directly it is still
         # delivered, because then the caller asked for that object.
         if candidate.source != "exact_ref" and obj.kind == "episode" and _says_only_its_state(obj.content):
+            return None
+        if context.mode == "auto" and context.in_context_since is not None and _in_context(tx, obj, context):
+            # The asking model still holds everything it stands on, word for word: delivered, it was a second copy in
+            # that model's context, and took a slot from what the model does not have (#249).  Set aside in ``aside``,
+            # it still leads to what is related to it, as it did delivered: left out of that, a session's own messages
+            # stopped leading to the claims and procedures drawn from it before its last compaction.
+            if aside is not None:
+                aside.held.append(candidate)
             return None
         return obj
 
@@ -475,7 +512,7 @@ class RetrievalPipeline:
         *,
         floor: int,
         original_query: str | None = None,
-        echoes: list[CandidateRef] | None = None,
+        aside: _Aside | None = None,
     ) -> None:
         """Hydrate in rank order; once the deadline is gone, only up to ``floor`` items."""
         known = {candidate.key for candidate, _obj in hydrated}
@@ -490,7 +527,7 @@ class RetrievalPipeline:
                 break
             if candidate.key in known:
                 continue
-            obj = self._hydrate_admit(tx, candidate, context, original_query=original_query, echoes=echoes)
+            obj = self._hydrate_admit(tx, candidate, context, original_query=original_query, aside=aside)
             if obj is not None:
                 hydrated.append((candidate, obj))
                 known.add(candidate.key)
@@ -606,16 +643,17 @@ class RetrievalPipeline:
                         and f"{candidate.ref}@{candidate.revision}" in context.current_source_refs
                     ):
                         continue
-                    if self._hydrate_admit(tx, candidate, context) is None:
-                        if bound_reached:
-                            return stopped("relation_bound_reached")
-                        continue
-                    own = rrf_score((candidate.rank + 1,), k=self.policy.rrf_k)
-                    # A seed built by hand in a test may carry no fusion score; a real one always does.
-                    bound = min(own, seed.fusion_score) if seed.fusion_score > 0 else own
-                    candidate = replace(candidate, fusion_score=bound * self.RELATION_WEIGHT)
-                    all_candidates.append(candidate)
-                    next_frontier.append(candidate)
+                    aside = _Aside()
+                    admitted = self._hydrate_admit(tx, candidate, context, aside=aside) is not None
+                    if admitted or aside.held:
+                        own = rrf_score((candidate.rank + 1,), k=self.policy.rrf_k)
+                        # A seed built by hand in a test may carry no fusion score; a real one always does.
+                        bound = min(own, seed.fusion_score) if seed.fusion_score > 0 else own
+                        candidate = replace(candidate, fusion_score=bound * self.RELATION_WEIGHT)
+                        if admitted:
+                            all_candidates.append(candidate)
+                        # One the asking model holds is not delivered, and leads on as it did (``_hydrate_admit``).
+                        next_frontier.append(candidate)
                     if bound_reached:
                         return stopped("relation_bound_reached")
             frontier = next_frontier
@@ -741,11 +779,11 @@ class RetrievalPipeline:
             ) as tx:
                 epoch = self.storage_reader.epoch(tx)
                 working = self._scoped(tx, working, gaps)
-                echoes: list[CandidateRef] = []
-                hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched, echoes=echoes)
+                aside = _Aside()
+                hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched, aside=aside)
                 if len(meaningful_query_terms(working.query)) < ECHO_TURN_MIN_TERMS:
-                    echoes.clear()
-                self._hydrate_related(tx, working, hydrated, gaps, echoes=tuple(echoes))
+                    aside.echoes.clear()
+                self._hydrate_related(tx, working, hydrated, gaps, echoes=tuple(aside.echoes), held=tuple(aside.held))
                 ranked, query_items = self._select(tx, working, hydrated, gaps)
                 return self._result(working, epoch, ranked, query_items, gaps, seed_count, len(hydrated))
         except ContractError as exc:
@@ -781,10 +819,16 @@ class RetrievalPipeline:
         return working if working.scope == scope else replace(working, scope=scope)
 
     def _collect_rounds(
-        self, tx, working: SearchContext, gaps: list[str], *, prefetched=None, echoes: list[CandidateRef] | None = None
+        self,
+        tx,
+        working: SearchContext,
+        gaps: list[str],
+        *,
+        prefetched=None,
+        aside: _Aside | None = None,
     ) -> tuple[list[tuple[CandidateRef, RetrievedObject]], int]:
-        """The first round plus at most one directed follow-up for an open need; older copies of the current
-        message found on the way go to ``echoes``."""
+        """The first round plus at most one directed follow-up for an open need; what hydration sets aside on the
+        way goes to ``aside``."""
         hydrated: list[tuple[CandidateRef, RetrievedObject]] = []
         seen: set[tuple[str, str, int]] = set()
         seed_count = 0
@@ -804,7 +848,14 @@ class RetrievalPipeline:
             seed_count += len(seeds)
             seen.update(candidate.key for candidate in seeds)
             self._hydrate_all(
-                tx, hydrated, seeds, round_context, gaps, floor=floor, original_query=working.query, echoes=echoes
+                tx,
+                hydrated,
+                seeds,
+                round_context,
+                gaps,
+                floor=floor,
+                original_query=working.query,
+                aside=aside,
             )
             if round_index + 1 >= max_rounds:
                 break
@@ -833,8 +884,10 @@ class RetrievalPipeline:
         gaps: list[str],
         *,
         echoes: tuple[CandidateRef, ...] = (),
+        held: tuple[CandidateRef, ...] = (),
     ) -> None:
-        seeds = tuple(candidate for candidate, _obj in hydrated)
+        # What the asking model holds is a seed as well, and never delivered (``_hydrate_admit``).
+        seeds = (*(candidate for candidate, _obj in hydrated), *held)
         known = {candidate.key for candidate in (*seeds, *echoes)}
         expanded = [
             candidate
@@ -924,13 +977,26 @@ class RetrievalPipeline:
         ranked = self._apply_budget(distinct.filtered(self._rank_hydrated(hydrated, working)), working.limits)
         query_items = tuple(obj for _candidate, obj in ranked)
         if working.mode == "auto" and self._remaining(working) > 0:
+            if ranked and all(estimate_tokens(obj.content) > working.limits.budget_tokens for _c, obj in ranked):
+                # Nothing that fits answered: one hit too large for any packet stays, as the hint that it can be
+                # expanded, and the background takes the other slots.  Six such hits took all of them, the compiler
+                # refused each, and the packet came back empty (#249's replay: two prompts whose only hit that fitted
+                # was a message the model still held).
+                ranked = ranked[:1]
             background = background_candidates(
                 tx, working, self.storage_reader, self.clock, gaps, query_evidence=bool(query_items)
             )
             present = {candidate.key for candidate, _obj in ranked}
             # Query evidence comes first; background shares the final byte
-            # budget and can only consume remaining packet slots.
-            ranked.extend(pair for pair in background if pair[0].key not in present and distinct.admits(pair[1]))
+            # budget and can only consume remaining packet slots.  What the
+            # asking model still holds is not background either (``_in_context``).
+            ranked.extend(
+                pair
+                for pair in background
+                if pair[0].key not in present
+                and distinct.admits(pair[1])
+                and not (working.in_context_since is not None and _in_context(tx, pair[1], working))
+            )
             note_truncation(gaps, "packet_slots", considered=working.limits.max_items, available=len(ranked))
             ranked = ranked[: working.limits.max_items]
         note_duplicates(gaps, distinct.collapsed)

@@ -734,6 +734,464 @@ def test_a_workbuddy_file_is_written_back_in_its_own_line_endings_and_byte_order
     assert install_workbuddy.encode_config(value, None).endswith(b"}\n"), "a new file ends with a newline"
 
 
+def _weixin(home, user="TEST-wx-1"):
+    """The owner's Weixin DM on the gateway of ``home``, as Hermes passes it."""
+    return bind_hermes_identity(
+        "TEST-wx-session",
+        hermes_home=str(home),
+        platform="weixin",
+        user_id=user,
+        chat_type="dm",
+        chat_id=user,
+        thread_id="",
+        gateway_session_key=f"agent:main:weixin:dm:{user}",
+        agent_identity=AGENT,
+        agent_workspace="hermes",
+        agent_context="primary",
+    )
+
+
+def test_an_attached_entry_s_grants_change_from_an_edited_copy_and_back(tmp_path, capsys, root):
+    """#246: an attached entry kept the grants it was attached with; a gateway owner route or a read of another
+    scope could not be added.  The operator prints the entry's grants, edits them, sees the change, applies it with a
+    backup and a receipt, and puts the old grants back the same way.  Rows stay exact; what the store holds keeps
+    its scopes."""
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    manifest = root / "installation.json"
+    original = json.loads(manifest.read_text(encoding="utf-8"))
+    edit = tmp_path / "TEST-grants.json"
+    code, shown = _run(capsys, "grants", "--instance-root", str(first), "--out", str(edit))
+    assert (code, shown["status"], shown["entry_id"]) == (0, "shown", "tianshu"), shown
+    document = json.loads(edit.read_text(encoding="utf-8"))
+    record = next(entry for entry in original["entries"] if entry["entry_id"] == "tianshu")
+    assert {key: document[key] for key in ("owner_principals", "audience_scopes", "audiences")} == {
+        key: record[key] for key in ("owner_principals", "audience_scopes", "audiences")
+    }
+    code, again = _run(capsys, "grants", "--instance-root", str(first), "--out", str(edit))
+    assert code == 2 and "exists" in again["error"], "an edit is never overwritten"
+    elsewhere_out = tmp_path / "TEST-grants-unused.json"
+    code, both = _run(
+        capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--out", str(elsewhere_out)
+    )
+    assert code == 2 and "--out" in both["error"] and not elsewhere_out.exists(), "not silently ignored"
+    assert _weixin(first).runtime_audience.capability_gaps, "the gateway DM binds no owner scope yet"
+
+    owner = next(row for row in document["audiences"] if row["kind"] == "owner_private" and row["platform"] == "cli")
+    elsewhere = next(entry for entry in original["entries"] if entry["entry_id"] == "tianquan")["scope_ids"][0]
+    assert elsewhere not in owner["allowed_scope_ids"]
+    document["owner_principals"].append({"platform": "weixin", "user_id": "TEST-wx-1"})
+    owner["allowed_scope_ids"].append(elsewhere)  # the owner reads what tianquan's chats hold, writes as before
+    dm = dict(owner, platform="weixin", user_id="TEST-wx-1", chat_type="dm", chat_id="TEST-wx-1", thread_id="")
+    document["audiences"].append(dm)
+    edit.write_text(json.dumps(document), encoding="utf-8")
+
+    code, preview = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit))
+    assert (code, preview["status"]) == (0, "preview"), preview
+    added = {(row["platform"], row["user_id"], row["kind"]): row for row in preview["rows_added"]}
+    assert set(added) == {("weixin", "TEST-wx-1", "owner_private"), ("cli", owner["user_id"], "owner_private")}
+    assert elsewhere in added[("weixin", "TEST-wx-1", "owner_private")]["read"]
+    assert elsewhere in added[("cli", owner["user_id"], "owner_private")]["read"]
+    [removed] = preview["rows_removed"]
+    assert (removed["platform"], elsewhere in removed["read"]) == ("cli", False), "the owner row as it was"
+    assert preview["principals_added"] == ["weixin/TEST-wx-1"] and preview["entry_scopes_added"] == [elsewhere]
+    assert preview["owner_rows_granting_nothing"] == [] and preview["entry_runtime_config_rebound"]
+    bound = {change["route"].split("/")[0]: change for change in preview["routes_changed"]}
+    assert set(bound) == {"cli", "weixin"}, "the routes that bind otherwise, as they bind"
+    assert bound["weixin"]["before"] == {"read": [], "write": [], "capture": None}
+    assert elsewhere in bound["weixin"]["after"]["read"] and bound["weixin"]["after"]["capture"] is not None
+    assert elsewhere in bound["cli"]["after"]["read"] and elsewhere not in bound["cli"]["before"]["read"]
+    assert json.loads(manifest.read_text(encoding="utf-8")) == original, "a preview writes nothing"
+
+    code, applied = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+    assert (code, applied["status"]) == (0, "applied"), applied
+    assert Path(applied["receipt"]).is_file() and Path(applied["rollback"]).is_file()
+    assert applied["entry_runtime_config_rebound"]
+    worker = root / "runtime-config.json"
+    assert json.loads(worker.read_text(encoding="utf-8"))["binding"]["scope_ids"] == original["scope_ids"]
+    dm_identity = _weixin(first)
+    assert dm_identity.runtime_audience.includes_owner_private and not dm_identity.runtime_audience.capability_gaps
+    assert elsewhere in dm_identity.runtime_audience.allowed_scope_ids
+    assert elsewhere in _bind(first).runtime_audience.allowed_scope_ids, "the CLI reads it too"
+    entry = load_config(first / "scope-recall" / "runtime-config.json")
+    assert entry.binding == _bind(first).binding, "the entry's runtime config binds its new scopes"
+    assert not _weixin(first, "TEST-wx-2").runtime_audience.includes_owner_private, "exact: another user is not it"
+    assert read_shared_payload(root)["scope_ids"] == original["scope_ids"], "no scope moved"
+
+    code, back = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", applied["rollback"], "--apply")
+    assert (code, back["status"]) == (0, "applied"), back
+    restored = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "tianshu")
+    assert restored == record and _weixin(first).runtime_audience.capability_gaps
+    code, same = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", applied["rollback"])
+    assert (code, same["status"]) == (0, "unchanged"), same
+
+
+def test_a_grants_apply_that_fails_puts_back_what_it_replaced_and_a_second_run_finishes(
+    tmp_path, capsys, root, monkeypatch
+):
+    """A write that fails after the manifest changed left the entry bound to its old scopes, and running the command
+    again said unchanged (review of 3.10.5).  The copies go back on a failure; and a run that finds the manifest done
+    but the entry's runtime config not rebinds it."""
+    from scope_recall.maintenance import shared
+
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    manifest, entry = root / "installation.json", first / "scope-recall" / "runtime-config.json"
+    before_manifest, before_entry = manifest.read_bytes(), entry.read_bytes()
+    elsewhere = read_shared_payload(root)["entries"][1]["scope_ids"][0]
+
+    def read_more(document):
+        for row in document["audiences"]:
+            if row["kind"] == "owner_private":
+                row["allowed_scope_ids"].append(elsewhere)
+
+    real = shared.write_json
+
+    def failing(path, value):
+        if Path(path) == entry:
+            raise OSError("TEST disk full")
+        return real(path, value)
+
+    monkeypatch.setattr(shared, "write_json", failing)
+    code, failed = _granted(capsys, tmp_path, first, read_more)
+    assert code == 2 and "disk full" in failed["error"]
+    assert (manifest.read_bytes(), entry.read_bytes()) == (before_manifest, before_entry), "both put back"
+    monkeypatch.setattr(shared, "write_json", real)
+
+    code, applied = _granted(capsys, tmp_path, first, read_more)
+    assert (code, applied["status"]) == (0, "applied")
+    copy = Path(applied["receipt"]).with_suffix("") / f"entry-{entry.name}"
+    entry.write_bytes(copy.read_bytes())  # as a run that died between the two writes left it
+    document = tmp_path / "TEST-grants-tianshu.json"
+    code, again = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(document))
+    assert (code, again["status"], again["entry_runtime_config_rebound"]) == (0, "preview", True), again
+    code, again = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(document), "--apply")
+    assert (code, again["status"], again["rollback"]) == (0, "applied", None), again
+    assert load_config(entry).binding == _bind(first).binding
+
+
+def test_two_grants_changes_planned_from_one_manifest_cannot_both_be_written(tmp_path, capsys, root):
+    """Each change carries the whole manifest: written over the other, the second undid the first (a revoked route
+    came back; review of 3.10.5).  The second is refused and writes nothing."""
+    from scope_recall.maintenance import shared
+
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    mine = read_shared_payload(root)["entries"][0]["audience_scopes"]["owner_private"]
+    plans = []
+    for home, name in ((first, "one"), (second, "two")):
+        code, shown = _run(capsys, "grants", "--instance-root", str(home))
+        document = shown["grants"]
+        if home == second:
+            document["audiences"][0]["allowed_scope_ids"].append(mine)
+        else:
+            document["owner_principals"].append({"platform": "weixin", "user_id": "TEST-wx-1"})
+        edit = tmp_path / f"TEST-plan-{name}.json"
+        edit.write_text(json.dumps(document), encoding="utf-8")
+        plans.append(shared._planned_grants(home, edit))
+    shared._applied_grants(plans[0], "2026-10-15T12:00:00Z")
+    written = (root / "installation.json").read_bytes()
+    with pytest.raises(shared.SharedStoreError, match="changed after this change was checked"):
+        shared._applied_grants(plans[1], "2026-10-15T12:00:01Z")
+    assert (root / "installation.json").read_bytes() == written, "the second wrote nothing"
+
+
+def test_two_rows_on_one_route_are_each_a_grant(tmp_path, capsys, root):
+    """Rows were compared by route, so of two rows on one route one was lost, and taking away the one that read more
+    read as no change and was never written (review of 3.10.5).  An owner row whose user is no owner principal grants
+    nothing and is named, and the grants before a change put such a row back as it was."""
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    elsewhere = read_shared_payload(root)["entries"][1]["scope_ids"][0]
+
+    def doubled(document):
+        owner = next(row for row in document["audiences"] if row["kind"] == "owner_private")
+        document["audiences"].append(dict(owner, allowed_scope_ids=[*owner["allowed_scope_ids"], elsewhere]))
+        document["audiences"].append(
+            dict(owner, kind="conversation", allowed_scope_ids=[elsewhere], writable_scope_ids=[], capture_scope_id="")
+        )
+
+    code, applied = _granted(capsys, tmp_path, first, doubled)
+    assert (code, applied["status"]) == (0, "applied"), applied
+    code, shown = _run(capsys, "grants", "--instance-root", str(first))
+    document = shown["grants"]
+    wider = next(
+        row for row in document["audiences"] if elsewhere in row["allowed_scope_ids"] and row["kind"] == "owner_private"
+    )
+    document["audiences"].remove(wider)
+    edit = tmp_path / "TEST-narrower.json"
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    code, preview = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit))
+    assert (code, preview["status"]) == (0, "preview"), preview
+    assert len(preview["rows_removed"]) == 1 and preview["entry_scopes_removed"] == [], "the scope stays the entry's"
+    code, narrowed = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+    assert (code, narrowed["status"]) == (0, "applied"), narrowed
+
+    code, shown = _run(capsys, "grants", "--instance-root", str(first))
+    document = shown["grants"]
+    owner = next(row for row in document["audiences"] if row["kind"] == "owner_private")
+    document["audiences"].append(
+        dict(
+            owner,
+            platform="desktop",
+            user_id="basic:TEST-guest",
+            chat_type="private",
+            chat_id="basic:TEST-guest",
+            thread_id="main",
+        )
+    )
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    code, inert = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+    assert (code, inert["status"]) == (0, "applied"), inert
+    assert inert["owner_rows_granting_nothing"] == ["desktop/basic:TEST-guest/private/basic:TEST-guest/main//hermes"]
+    document["owner_principals"].append({"platform": "desktop", "user_id": "basic:TEST-guest"})
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    code, active = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+    assert (code, active["status"], active["owner_rows_granting_nothing"]) == (0, "applied", []), active
+    code, back = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", active["rollback"], "--apply")
+    assert (code, back["status"]) == (0, "applied"), back
+    assert back["owner_rows_granting_nothing"] == ["desktop/basic:TEST-guest/private/basic:TEST-guest/main//hermes"]
+
+
+def test_two_runs_of_one_command_in_one_second_keep_apart(tmp_path):
+    from scope_recall.maintenance.shared_run import Run
+
+    at = "2026-10-15T12:00:00Z"
+    one, two = Run(tmp_path, "grants-TEST", at), Run(tmp_path, "grants-TEST", at)
+    assert one.folder != two.folder and one.folder.is_dir() and two.folder.is_dir()
+    receipt = Path(one.receipt({"status": "TEST"}))
+    assert receipt == one.folder.with_name(one.folder.name + ".json") and one.folder.is_dir(), "kept, though empty"
+    assert Run(tmp_path, "grants-TEST", at).folder not in (one.folder, two.folder)
+    # import-entry's moments have fractions of a second: a receipt named by replacing a suffix lost the fraction and
+    # the command, and the second run of one second looked for a free name forever (review of 3.10.5).
+    fine = "2026-10-15T12:00:00.123456+00:00"
+    three, four = Run(tmp_path, "import-TEST", fine), Run(tmp_path, "import-TEST", fine)
+    receipts = {Path(run.receipt({"status": "TEST"})).name for run in (three, four)}
+    assert len(receipts) == 2 and all("import-TEST" in name for name in receipts), receipts
+
+
+def test_a_grants_change_is_refused_whole_when_any_of_it_is_wrong(tmp_path, capsys, root):
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    manifest = root / "installation.json"
+    before = manifest.read_bytes()
+    code, shown = _run(capsys, "grants", "--instance-root", str(first))
+    document = shown["grants"]
+    owner = next(row for row in document["audiences"] if row["kind"] == "owner_private")
+    edit = tmp_path / "TEST-grants.json"
+
+    def refused(change, needle):
+        candidate = json.loads(json.dumps(document))
+        change(candidate)
+        edit.write_text(json.dumps(candidate), encoding="utf-8")
+        code, result = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+        assert code == 2 and needle in result["error"], result
+        assert manifest.read_bytes() == before, "nothing is written"
+
+    refused(lambda d: d.update(entry_id="tianquan"), "another entry")
+    refused(lambda d: d.update(extra=1), "holds schema")
+    refused(lambda d: d["audiences"].append(dict(owner, platform="weixin", user_id="unknown")), "explicit exact")
+    refused(lambda d: d["audiences"].append(dict(owner, writable_scope_ids=["TEST-not-read"])), "subset")
+    other = json.loads(manifest.read_text(encoding="utf-8"))["entries"][1]["scope_ids"][0]
+    only_other = dict(owner, allowed_scope_ids=[other], writable_scope_ids=[], capture_scope_id="")
+    refused(lambda d: d.update(audiences=[only_other]), "no row of the entry reads")
+    refused(lambda d: d.update(audiences=[only_other], audience_scopes={"owner_private": other}), "held by no entry")
+    refused(
+        lambda d: next(r for r in d["audiences"] if r["kind"] == "owner_private")["allowed_scope_ids"].append(
+            "TEST-new-scope"
+        ),
+        "does not hold",
+    )
+    code, result = _run(capsys, "grants", "--instance-root", str(first), "--apply")
+    assert code == 2 and "--grants-from" in result["error"]
+    code, result = _run(capsys, "grants", "--instance-root", str(tmp_path / "TEST-not-attached"))
+    assert code == 2 and "not attached" in result["error"]
+
+
+def test_a_grants_preview_names_a_route_whose_captures_move_when_rows_change_order(tmp_path, capsys, root):
+    """Of the rows a session matches, the first that captures into a scope it may write decides where its messages
+    go.  Two owner rows on one route, swapped, moved the owner's captures into another scope with every row, scope
+    and principal list of the preview empty (review of 3.10.5).  The preview names the route as it binds, before and
+    after."""
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    payload = read_shared_payload(root)
+    mine = payload["entries"][0]["audience_scopes"]["owner_private"]
+    elsewhere = payload["entries"][1]["scope_ids"][0]
+
+    def cli_owner_rows(document):
+        return [row for row in document["audiences"] if row["kind"] == "owner_private" and row["platform"] == "cli"]
+
+    def second_owner_row(document):
+        [owner] = cli_owner_rows(document)
+        document["audiences"].append(
+            dict(owner, allowed_scope_ids=[elsewhere], writable_scope_ids=[elsewhere], capture_scope_id=elsewhere)
+        )
+
+    code, applied = _granted(capsys, tmp_path, first, second_owner_row)
+    assert (code, applied["status"], applied["rows_reordered"]) == (0, "applied", False), applied
+    [wider] = applied["routes_changed"]
+    assert wider["route"].startswith("cli/") and wider["before"]["capture"] == wider["after"]["capture"] == mine
+    assert set(wider["after"]["read"]) - set(wider["before"]["read"]) == {elsewhere}, wider
+    assert _bind(first).runtime_audience.capture_scope_id == mine, "the first row still decides"
+    code, shown = _run(capsys, "grants", "--instance-root", str(first))
+    document = shown["grants"]
+    one, two = (document["audiences"].index(row) for row in cli_owner_rows(document))
+    document["audiences"][one], document["audiences"][two] = document["audiences"][two], document["audiences"][one]
+    edit = tmp_path / "TEST-swapped.json"
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    code, preview = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit))
+    assert (code, preview["status"]) == (0, "preview"), preview
+    assert preview["rows_added"] == preview["rows_removed"] == [] and preview["rows_reordered"], preview
+    [moved] = preview["routes_changed"]
+    assert moved["route"].startswith("cli/") and (moved["before"]["capture"], moved["after"]["capture"]) == (
+        mine,
+        elsewhere,
+    ), moved
+    assert (moved["before"]["read"], moved["before"]["write"]) == (moved["after"]["read"], moved["after"]["write"])
+    code, swapped = _run(capsys, "grants", "--instance-root", str(first), "--grants-from", str(edit), "--apply")
+    assert (code, swapped["status"]) == (0, "applied"), swapped
+    assert _bind(first).runtime_audience.capture_scope_id == elsewhere, "the preview said what binding does"
+
+
+def test_a_grants_apply_whose_receipt_fails_puts_back_what_it_replaced(tmp_path, capsys, root, monkeypatch):
+    """The receipt was written after the change, outside what a failure puts back: a full disk at that moment left
+    the grants changed and the command failed, with no word of the grants as they were (review of 3.10.5)."""
+    from scope_recall.maintenance import shared_run
+
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    manifest, entry = root / "installation.json", first / "scope-recall" / "runtime-config.json"
+    before = (manifest.read_bytes(), entry.read_bytes())
+    elsewhere = read_shared_payload(root)["entries"][1]["scope_ids"][0]
+
+    def read_more(document):
+        for row in document["audiences"]:
+            if row["kind"] == "owner_private":
+                row["allowed_scope_ids"].append(elsewhere)
+
+    real = shared_run.Run.receipt
+
+    def failing(self, body):
+        if body.get("status") == "applied":
+            raise OSError("TEST disk full")
+        return real(self, body)
+
+    monkeypatch.setattr(shared_run.Run, "receipt", failing)
+    code, failed = _granted(capsys, tmp_path, first, read_more)
+    assert code == 2 and "disk full" in failed["error"], failed
+    assert (manifest.read_bytes(), entry.read_bytes()) == before, "both put back"
+    monkeypatch.setattr(shared_run.Run, "receipt", real)
+    code, applied = _granted(capsys, tmp_path, first, read_more)
+    assert (code, applied["status"], applied["entry_runtime_config_rebound"]) == (0, "applied", True), applied
+    assert Path(applied["receipt"]).is_file() and Path(applied["rollback"]).is_file()
+
+
+def test_a_grants_apply_puts_back_past_a_reader_and_names_what_it_could_not(tmp_path, capsys, root, monkeypatch):
+    """Putting the copies back was a single try: a worker reading the manifest at that moment, which Windows refuses
+    a replace for, left the change half undone (review of 3.10.5).  It is tried again as every write is, and a file
+    it still could not put back is named with its copy."""
+    import os
+
+    from scope_recall.maintenance import shared
+
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    manifest, entry = root / "installation.json", first / "scope-recall" / "runtime-config.json"
+    before = (manifest.read_bytes(), entry.read_bytes())
+    elsewhere = read_shared_payload(root)["entries"][1]["scope_ids"][0]
+
+    def read_more(document):
+        for row in document["audiences"]:
+            if row["kind"] == "owner_private":
+                row["allowed_scope_ids"].append(elsewhere)
+
+    real_write, real_replace = shared.write_json, os.replace
+    refusals = {"left": 3}
+
+    def failing(path, value):
+        if Path(path) == entry:
+            raise OSError("TEST disk full")
+        return real_write(path, value)
+
+    def held(source, target):
+        if Path(target) == manifest and Path(source).name.endswith(".restore") and refusals["left"]:
+            refusals["left"] -= 1
+            raise PermissionError("TEST a reader holds the manifest")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(shared, "write_json", failing)
+    monkeypatch.setattr(os, "replace", held)
+    code, failed = _granted(capsys, tmp_path, first, read_more)
+    assert code == 2 and "disk full" in failed["error"] and refusals["left"] == 0, failed
+    assert (manifest.read_bytes(), entry.read_bytes()) == before, "put back once the reader let go"
+
+    refusals["left"] = 10_000
+    code, failed = _granted(capsys, tmp_path, first, read_more)
+    assert code == 2 and "disk full" in failed["error"] and "could not be undone" in failed["error"], failed
+    assert f"store-installation.json -> {manifest}" in failed["error"], "the file left changed, with its copy"
+    assert entry.read_bytes() == before[1], "the other file is still put back"
+
+
+def _granted(capsys, tmp_path, home, change):
+    code, shown = _run(capsys, "grants", "--instance-root", str(home))
+    document = shown["grants"]
+    change(document)
+    edit = tmp_path / f"TEST-grants-{shown['entry_id']}.json"
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    return _run(capsys, "grants", "--instance-root", str(home), "--grants-from", str(edit), "--apply")
+
+
+def test_a_client_entry_s_grants_change_and_keep_its_own_route(tmp_path, capsys, root):
+    """A client writes only where every owner row reads: with two Hermes entries whose chats keep apart, the one
+    has to read the other's owner scope first, which is a grants change too.  Then the client's own row reads more."""
+    first, second = _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-elsewhere")
+    payload = read_shared_payload(root)
+    mine = next(e for e in payload["entries"] if e["entry_id"] == "tianshu")["audience_scopes"]["owner_private"]
+    elsewhere = next(e for e in payload["entries"] if e["entry_id"] == "tianquan")["audience_scopes"]["owner_private"]
+    client = (tmp_path / "TEST-claude-code-home").resolve()
+    code, result = _attach_client(capsys, root, client, like="tianshu", capture="tianshu")
+    assert code == 2, "tianquan's owner rows do not read tianshu's scope"
+
+    def read_mine(document):
+        for row in document["audiences"]:
+            if row["kind"] == "owner_private":
+                row["allowed_scope_ids"].append(mine)
+
+    code, applied = _granted(capsys, tmp_path, second, read_mine)
+    assert (code, applied["status"]) == (0, "applied"), applied
+    code, result = _attach_client(capsys, root, client, like="tianshu", capture="tianshu")
+    assert code == 0, result
+    assert elsewhere not in load_shared_client(client, "claude-code").audience.allowed_scope_ids
+    code, shown = _run(capsys, "grants", "--instance-root", str(client))
+    document = shown["grants"]
+    document["audiences"][0]["allowed_scope_ids"].append(elsewhere)
+    edit = tmp_path / "TEST-client-grants.json"
+    edit.write_text(json.dumps(document), encoding="utf-8")
+    code, applied = _run(capsys, "grants", "--instance-root", str(client), "--grants-from", str(edit), "--apply")
+    assert (code, applied["status"]) == (0, "applied"), applied
+    assert elsewhere in load_shared_client(client, "claude-code").audience.allowed_scope_ids
+    for field, value in (("chat_id", "TEST-someone"), ("gateway_session_key", "TEST-key")):
+        moved = json.loads(json.dumps(document))
+        moved["audiences"][0][field] = value
+        edit.write_text(json.dumps(moved), encoding="utf-8")
+        code, refused = _run(capsys, "grants", "--instance-root", str(client), "--grants-from", str(edit))
+        assert code == 2 and "its own route" in refused["error"], (field, refused)
+    # A conversation row in the owner row's place still read and captured, so it passed, the owner principal replaced
+    # too (review of 3.10.5): the client takes whoever types into it for the owner, so its route keeps an owner row.
+    someone = {"platform": "weixin", "user_id": "TEST-wx-1"}
+    for name, kind, principals in (
+        ("conversation", "conversation", document["owner_principals"]),
+        ("another owner", "owner_private", [someone]),
+        ("both", "conversation", [someone]),
+    ):
+        demoted = json.loads(json.dumps(document))
+        demoted["audiences"][0]["kind"] = kind
+        demoted["owner_principals"] = principals
+        edit.write_text(json.dumps(demoted), encoding="utf-8")
+        code, refused = _run(capsys, "grants", "--instance-root", str(client), "--grants-from", str(edit))
+        assert code == 2 and "its own route, of an owner principal" in refused["error"], (name, refused)
+    beside = json.loads(json.dumps(document))
+    beside["audiences"].append(
+        dict(beside["audiences"][0], kind="conversation", writable_scope_ids=[], capture_scope_id="")
+    )
+    edit.write_text(json.dumps(beside), encoding="utf-8")
+    code, preview = _run(capsys, "grants", "--instance-root", str(client), "--grants-from", str(edit))
+    assert (code, preview["status"]) == (0, "preview"), "a conversation row beside the owner row is a grant"
+
+
 def test_a_client_writes_only_where_every_owner_row_reads(tmp_path, capsys, root):
     _hermes_pair(tmp_path, capsys, root, second_workspace="TEST-other-workspace")
     client = (tmp_path / "TEST-claude-code-home").resolve()

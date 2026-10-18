@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1014,6 +1014,125 @@ def test_a_client_clock_ahead_neither_hides_its_messages_nor_holds_back_their_wo
         {"record": {"start": 0, "lines": [[10, transcript.said_to_wire(said)]]}}
     )
     assert parse(lines.lines[0][1].occurred_at) <= latest
+
+
+def test_a_fast_client_s_context_moment_is_not_used():
+    """A client whose clock runs ahead has its times moved back, each request by its own lead, which differs with
+    the network's delay: its in-context moment cannot be compared with them safely, and a message from before the
+    compaction could read as held (review of 3.10.5).  Such a client's recall leaves nothing out, as before."""
+    from scope_recall.adapters.clients.boundary import IN_CONTEXT_FIELD
+
+    ahead = datetime.now(UTC) + timedelta(hours=1)
+    stamp = lambda moment: moment.isoformat().replace("+00:00", "Z")  # noqa: E731
+    _observed, _record, lead = remote_server.client_times_and_lead({"observed_at": stamp(ahead)})
+    assert timedelta(minutes=59) < lead < timedelta(minutes=61)
+    since = {IN_CONTEXT_FIELD: stamp(ahead - timedelta(minutes=10)), "TEST": 1}
+    assert remote_server._context_since_kept(since, lead) == {"TEST": 1}
+    assert remote_server._context_since_kept(since, timedelta(0)) == since, "a client on time keeps it"
+    _observed, _record, on_time = remote_server.client_times_and_lead({"observed_at": stamp(datetime.now(UTC))})
+    assert on_time == timedelta(0)
+
+
+def test_an_older_client_s_reminders_are_taken_out_by_the_server(store):
+    """#248: a client on another machine still on 3.10.4 sends the prompt as its hook got it and the person's messages
+    as its record has them, with the <system-reminder> Claude's desktop app put in them; the entry's server stores only
+    the person's words, and nothing for a message that is only reminders."""
+    root, homes = store
+    remote_server.write_server_config(
+        homes["claude-code"], "claude-code", listen="127.0.0.1", port=_free_port(), token_sha256="0" * 64
+    )
+    config = remote_server.load_server_config(homes["claude-code"], "claude-code")
+    at = _moments()
+    reminder = (
+        "<system-reminder>\nTEST The user started this session without choosing a project folder.\n</system-reminder>"
+    )
+    for prompt_id, text in (("TEST-p1", f"{reminder}\n\nTEST 第一问"), ("TEST-p2", reminder)):
+        remote_server.handle_request(
+            config,
+            {
+                "payload": {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "TEST-work-session",
+                    "prompt_id": prompt_id,
+                    "prompt": text,
+                    "cwd": "C:/work",
+                },
+                "observed_at": at(0),
+            },
+        )
+    lines = [
+        transcript.Said("TEST-u1", "user", f"{reminder}\n\nTEST 第一问", at(0), "TEST-p1"),
+        transcript.Said("TEST-u2", "user", reminder, at(1), "TEST-p2"),
+        transcript.Said("TEST-q1", "user", f"{reminder}\nTEST 顺便一问", at(5)),
+        transcript.Said("TEST-a1", "assistant", "TEST 答了", at(9)),
+    ]
+    answer = remote_server.handle_request(
+        config,
+        {
+            "payload": {
+                "hook_event_name": "Stop",
+                "session_id": "TEST-work-session",
+                "prompt_id": "TEST-p2",
+                "cwd": "C:/work",
+                "last_assistant_message": "TEST 答了",
+            },
+            "record": {
+                "start": 0,
+                "lines": [[10 * (index + 1), transcript.said_to_wire(said)] for index, said in enumerate(lines)],
+            },
+            "observed_at": at(10),
+        },
+    )
+    assert answer["through"] == 40, "every line was read, the reminder alone among them"
+    assert sorted((role, content) for role, _origin, content, _at in _rows(root, "workpc-claude-code")) == sorted(
+        [("user", "TEST 第一问"), ("user", "TEST 顺便一问"), ("assistant", "TEST 答了")]
+    )
+
+
+def test_a_remote_prompt_s_recall_leaves_out_what_the_client_s_model_still_holds(store, tmp_path):
+    """#249: the server opens no path a request names, so a Claude Code client reads since when its model holds the
+    session's turns from its own record and sends it with the prompt; the server's recall leaves those turns out.  A
+    client that cannot read its record sends nothing, and keeps nothing a payload carried of its own."""
+    from scope_recall.adapters.clients.boundary import IN_CONTEXT_FIELD
+
+    root, homes = store
+    remote_server.write_server_config(
+        homes["claude-code"], "claude-code", listen="127.0.0.1", port=_free_port(), token_sha256="0" * 64
+    )
+    config = remote_server.load_server_config(homes["claude-code"], "claude-code")
+    record = tmp_path / "TEST-work-session.jsonl"
+    record.write_text("", encoding="utf-8")
+    at = _moments()
+
+    def prompt(text, prompt_id, seconds, **extra):
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "TEST-work-session",
+            "prompt_id": prompt_id,
+            "prompt": text,
+            "cwd": "C:/work",
+            "transcript_path": str(record),
+            **extra,
+        }
+        answer = remote_server.handle_request(config, {"payload": payload, "observed_at": at(seconds)})
+        return answer["result"].get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    prompt("TEST 机器清单：构建机是 QX-17。", "TEST-p1", 0)
+    prompt("TEST 机器清单：部署机是 KZ-42。", "TEST-p2", 10)
+    question = "TEST 机器清单"
+    unknown = prompt(question, "TEST-p3", 20)
+    assert "QX-17。" in unknown and "KZ-42。" in unknown, "a prompt that carries nothing is recalled for as before"
+    since = remote_client._with_context_since(
+        {"session_id": "TEST-work-session", "transcript_path": str(record), IN_CONTEXT_FIELD: "TEST-forged"}
+    )
+    assert IN_CONTEXT_FIELD not in since, "an empty record says nothing, and what the payload carried is dropped"
+    record.write_text(
+        json.dumps({"type": "system", "subtype": "compact_boundary", "timestamp": at(5)}) + "\n", encoding="utf-8"
+    )
+    since = remote_client._with_context_since({"session_id": "TEST-work-session", "transcript_path": str(record)})
+    assert since[IN_CONTEXT_FIELD] == at(5).replace("+00:00", "Z")
+    held = prompt(question, "TEST-p4", 30, **{IN_CONTEXT_FIELD: since[IN_CONTEXT_FIELD]})
+    assert "QX-17。" in held and "KZ-42。" not in held, held
 
 
 def test_a_fast_client_s_turn_keeps_its_order(store, monkeypatch):

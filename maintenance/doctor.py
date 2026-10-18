@@ -36,6 +36,7 @@ from .doctor_store import (
     check_index,
     check_ledger,
     check_model_output,
+    check_owner_words,
     check_runtime_config_present,
     check_schema,
     check_storage,
@@ -289,6 +290,9 @@ _NON_ACTIONABLE_GAPS = frozenset(
     {
         "audience_owner_unverified",
         "due_work_unreached",
+        "owner_words_from_host_request",
+        "owner_words_unchecked",
+        "owner_words_with_client_reminder",
         "vector_threshold_unconfigured",
         "work_failed_terminal_only",
         "work_needs_review",
@@ -772,6 +776,7 @@ def run_doctor(
         check_candidates(report)
         check_model_output(report)
         check_ledger(report)
+        check_owner_words(report, host, data_directory, report.shared_store.get("entry_id"))
         _classify_status(report)
     check_index(report, data_directory, store_readable=readable, config=config)
     return report

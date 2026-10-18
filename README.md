@@ -20,7 +20,7 @@
 5. 在 Rune 仓库用既有同步脚本同步这个已验证的固定 fork 提交，校验源码及来源清单。未授权推送时，可从 origin/upstream 身份正确、main 干净且 HEAD 等于固定提交的独立仓库通过 `--local-repository` 离线导入；清单必须明确记录本地来源和尚未发布，不能冒充 GitHub 可下载提交。同步前发现快照内有修改时停止，先把修复转入 fork，不强制覆盖。
 6. 同步 Rune 的运行版本说明、记忆管理文档和适用回归；最后按已确认时机用 Rune 的正常开发入口启动并验证实际加载。源码同步通过不等于普通用户窗口已加载更新。
 
-本轮审查基线为正式版 `3.10.4`，提交 `af088f1ec34d488d9db34dd977269d157bf96aae`（`v3.10.4`）；schema 保持 1110，基础依赖声明及 `uv.lock` 未变化，包描述与关键词有更新。Rune bridge 继续显式消费 Core 管理/记录接口，并将丢弃无证据 claim 或摘要的结果统一反馈为部分提炼；指定模型不可用时保留工作、等待配置修复。Core 原生月预算、长模型时限及独立宿主安装诊断不自动成为 Rune 新设置；Rune 保留自己的持久预算和请求时限。Rune 实际固定的 fork 提交以其来源清单为准，不把上游版本号、fork HEAD、依赖环境回执或进程实际加载版本混为一谈。
+当前审查基线为正式版 `3.10.6`，提交 [`8d0f62c906213c2959e18fd5a05dc7fb8ab702d6`](https://github.com/410979729/scope-recall-hermes/commit/8d0f62c906213c2959e18fd5a05dc7fb8ab702d6)（`v3.10.6`）；schema 保持 1110，基础及可选依赖声明、`uv.lock` 均未变化。Rune 直接复用 Core 的人工失败重试：除三类终态拒绝外均可重新打开，能越过被跳过的旧记录，重开后从新的尝试次数开始；源码升级本身不执行真实失败重试。Rune bridge 继续保留部分提炼反馈、指定模型不可用时等待配置修复及自己的持久预算和请求时限。Core 的可选上下文时间参数仍使用默认未知值，独立宿主的提醒/建议过滤、HTTP 模型路由、共享授权和向量诊断不自动成为 Rune 新设置。Rune 实际固定的 fork 提交以其来源清单为准，远程发布状态与普通进程加载结果分别核验。
 
 Rune 的具体命令和验证边界见 [源码同步与适配](https://github.com/Genion/rune/blob/main/docs/scope-recall-sync.md)、[记忆管理](https://github.com/Genion/rune/blob/main/docs/memory-management.md) 和 [运行环境](https://github.com/Genion/rune/blob/main/docs/runtime-environments.md)。
 
@@ -32,7 +32,7 @@ Rune 的具体命令和验证边界见 [源码同步与适配](https://github.co
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, and for Codex, Claude Code, WorkBuddy and DeepSeek Harness (dsh), which share one adapter of hooks and an MCP server (the MCP tools need the optional `codex` extra; dsh runs the hooks through a plugin). The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This checkout is `3.10.4`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
+This checkout is `3.10.6`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). An agent that is not
 attached keeps its own store. A tool's output is kept and found, but not turned into facts. Each release's notes
@@ -65,7 +65,8 @@ New users go directly to installation; only detected legacy databases go through
 `scope-recall-setup` skill makes this routing discoverable in Hermes and Codex.
 A second installed skill, `scope-recall-memory`, which Claude Code gets too, is for the owner's everyday questions:
 what is remembered about me, did I say it or was it worked out, does it still hold, and
-what correcting, muting or deleting one memory does before it is done.
+what correcting, muting or deleting one memory does before it is done. Claude Code, WorkBuddy and dsh only read
+memory through their tools; the change is made in Codex or a Hermes chat on the same store.
 Perform path discovery, backup, audience binding, migration, indexing and host
 checks yourself; do not ask the user to execute commands or govern old memories.
 

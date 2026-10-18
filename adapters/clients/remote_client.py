@@ -43,10 +43,10 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import transcript
-from .boundary import EMPTY_ANSWER, is_workbuddy_agent_run, without_lone_surrogates
+from .boundary import EMPTY_ANSWER, IN_CONTEXT_FIELD, is_workbuddy_agent_run, without_lone_surrogates
 
 HOSTS = ("claude-code", "codex", "workbuddy", "dsh")
 #: Hosts whose Stop and SessionEnd send the lines of their own session record (``transcript``).
@@ -357,6 +357,19 @@ def _error_reply(payload: dict[str, Any]) -> bool:
     return record is not None and transcript.workbuddy_error_reply(record, reply)
 
 
+def _with_context_since(payload: dict[str, Any]) -> dict[str, Any]:
+    """A Claude Code prompt's payload with since when the model here still holds the session's own turns, read from
+    the session record on this machine (``transcript.context_since``): the server opens no path a request names, and
+    without it recalls them again (#249)."""
+    kept = {key: value for key, value in payload.items() if key != IN_CONTEXT_FIELD}
+    session_id = payload.get("session_id")
+    if type(session_id) is not str or not session_id.strip():
+        return kept
+    record = transcript.record_path(payload.get("transcript_path"), session_id.strip())
+    since = transcript.context_since(record) if record is not None else None
+    return kept if since is None else {**kept, IN_CONTEXT_FIELD: since}
+
+
 def run_hook(config: dict[str, Any], raw: bytes, *, started: float | None = None) -> dict[str, Any]:
     started = time.monotonic() if started is None else started
     try:
@@ -367,7 +380,7 @@ def run_hook(config: dict[str, Any], raw: bytes, *, started: float | None = None
         return {}
     # Half of a broken emoji (a lone surrogate, which JavaScript writes) cannot be sent as UTF-8: the request would fail
     # and the turn have no recall.  It is sent, kept and stored as U+FFFD, as a hook here stores it.
-    payload = without_lone_surrogates(payload)
+    payload = cast(dict[str, Any], without_lone_surrogates(payload))
     event = payload.get("hook_event_name")
     host = config["host"]
     wait = HOOK_TIMEOUTS[host].get(event)
@@ -377,6 +390,8 @@ def run_hook(config: dict[str, Any], raw: bytes, *, started: float | None = None
     # Every request carries the moment the hook ran here.  A request that timed out here may still have been
     # stored there, and its replay must then be the same event, not a second one with a later time.
     observed_at = _now()
+    if host == "claude-code" and event == "UserPromptSubmit":
+        payload = _with_context_since(payload)
     body: dict[str, Any] = {"payload": payload, "observed_at": observed_at}
     cursor = None
     if (

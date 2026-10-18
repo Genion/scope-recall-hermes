@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from scope_recall.core.failure_retry import TERMINAL_FAILURES
 from scope_recall.core.schema import SCHEMA_VERSION, STATEMENTS, UPGRADE_CHAIN, stale_header_schema
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.core.writer_lease import TruthWriterBusyError
@@ -86,6 +87,7 @@ _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "init-shared": ("create a shared store, the one store every agent attaches to", _shared),
     "attach": ("make a host's home an entry of a shared store, with the grants it had", _shared),
     "detach": ("stop a home being an entry of a shared store; its memories stay", _shared),
+    "grants": ("show an attached entry's grants, or change them from an edited copy", _shared),
     "adopt": ("record the directory a copied shared store now lives in", _shared),
     "entries": ("list a shared store's entries and when each was last heard from", _shared),
     "import-entry": ("copy an entry's own store, moved aside at attach, into its shared store", _shared),
@@ -221,7 +223,7 @@ def _add_retry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--include-terminal",
         action="store_true",
-        help="also re-run by-design terminal failures (derivation_invalid, budget_checked)",
+        help=f"also re-run the by-design failures ({', '.join(sorted(TERMINAL_FAILURES))})",
     )
     parser.add_argument("--apply", action="store_true", help="write the re-opened rows; without it nothing is changed")
 
