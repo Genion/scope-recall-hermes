@@ -18,6 +18,7 @@ from .episodes import source_origin, source_watermark
 from .evidence_quote import resolve_evidence_quotes
 from .failure_retry import validation_feedback as safe_feedback
 from .mutate import Mutation, MutationReceipt, apply_claim_frames, validate_claims
+from .secret_patterns import cut_between_runs
 from .worker_outcomes import DerivationFence, claim_versions_mark, claims_changed, derivation_changed
 
 if TYPE_CHECKING:
@@ -128,8 +129,9 @@ def consolidation_messages(sources, *, episode_ref=None, budget=CONSOLIDATION_IN
         "claim 的 subject、predicate、value_text 必须逐字出自其 evidence_spans 的 quote（可取连续片段），不得改写、翻译或概括这些帧字段；"
         "subject、predicate、value_text 必须在同一有序断言中形成完整关系；分别找到名称和数值、文件名和哈希不证明二者所属关系；"
         "偏好中的“X使用Y”应提取主体X、谓词使用、值Y，不以“我的长期偏好”等说明性标签替代X，不把整个关系重复塞入value_text。"
-        "明确的项目、版本和使用场景写入conditions；同一段里的不同条件偏好应各自提取，不因有一次性要求或未确认猜测而遗漏其他明确的长期偏好。"
-        "conditions 必须由支持该 value_text 的同一断言明确表达，不得从别句拼接或自行补条件；"
+        "conditions限定值在什么情况下成立：项目/版本/环境/场景/时间/说话者处境或如果/当/除非等前提，逐字取值所在同句连续原文，不跨句、不丢任何一个条件；"
+        "只交代原因、后果、其他要求或步骤而不限定值是否成立的不是条件：步骤入procedure.method，其他长期要求另立claim或省略；"
+        "不同条件偏好分别提取，不因临时要求或猜测漏提长期偏好。"
         "当前执行请求、问句、猜测、传闻、假设和他人转述不得输出为当前长期事实；statement_kind=request 不得用于 claim_proposals；"
         "origin=human_direct 只说明来源类型，不证明具体人物；不得仅因原文使用“我”或把 subject 写成 user/current_user/用户/我就猜测 owner 身份；"
         "未知 valid_from/valid_to 使用 null，不得为填字段猜日期；其余可选字段（如 evidence_spans 的 location）未知时省略该字段本身，不要输出 null；"
@@ -173,8 +175,8 @@ def consolidation_messages(sources, *, episode_ref=None, budget=CONSOLIDATION_IN
     # Sources lead the input.  Providers cache prompts by prefix, and the system
     # text above is byte-identical on every call, so the longest prefix two
     # requests can share is that text followed by the same sources.  The refs and
-    # watermark differ as soon as any one source does; placed first, they ended
-    # the shared prefix before a single source.  Replayed over one store's 1,850
+    # watermark differ as soon as any one source does; placed first, they would
+    # end the shared prefix before a single source.  Replayed over one store's 1,850
     # candidate evaluations of a day, an ideal prefix cache could reuse 68% of
     # prompt tokens in this order against 54% in the other.
     body = dict(
@@ -194,21 +196,16 @@ def consolidation_messages(sources, *, episode_ref=None, budget=CONSOLIDATION_IN
     return [dict(role="system", content=system), dict(role="user", content=user)]
 
 
-#: Candidate re-evaluation carries the whole consolidation prompt (about 11.5 KB
-#: of instruction prose and inlined schema) plus a candidate block of its own,
-#: so the shared 16 KB consolidation ceiling left roughly 3.4 KB for evidence.
-#: Measured against one instance's live database that admitted none of the 115
-#: oversized evaluations: the smallest was already 2,892 characters of evidence.
-#: This ceiling counts all message contents, including the candidate block.
-#: The transport's separate byte cap must also allow JSON escaping and its
-#: request envelope; it is not interchangeable with this content-byte bound.
+#: Candidate re-evaluation uses a larger content budget than consolidation so the shared prompt and candidate block
+#: leave room for evidence.  The 64,000-byte ceiling counts all message contents.  The transport needs a separate byte
+#: allowance for JSON escaping and the request envelope.
 CANDIDATE_EVALUATION_INPUT_BUDGET = 64000
 
 
 #: A source longer than this reaches a candidate evaluation as a window around
 #: the candidate's first verified saved quote, falling back to its value or
 #: subject when no saved quote matches this source version.
-#: Tool output dominated the evidence: replayed over one instance's evaluations, the
+#: Tool output dominated the evidence: replayed over one store's evaluations, the
 #: calls still made after the verdict limit carried 28 M characters, and windows
 #: of this size keep 44% of them.  Qualification reads the complete stored source
 #: around each quote, so a window changes what the model reads, never what a
@@ -261,6 +258,11 @@ def evidence_window(source: StoredSource, needles, evidence_spans=()) -> StoredS
     if anchor is not None:
         start = max(0, anchor[0] - EVIDENCE_WINDOW_RADIUS)
         end = min(total, anchor[1] + EVIDENCE_WINDOW_RADIUS)
+    # Each edge moves inward, never past what the window is built around, to where the request guard reads the window
+    # as the source reads: cut inside a value or a key's name, the evaluation would be refused every time it is asked.
+    keep = anchor or (start, start)
+    start = cut_between_runs(content, start, toward=keep[0])
+    end = cut_between_runs(content, end, toward=keep[1])
     return ChunkedSource(
         **dict(source.__dict__, event=dict(source.event, content=content[start:end])),
         consolidation_window=ConsolidationChunk(start, end, total),
@@ -343,8 +345,8 @@ def _fence_consolidation(tx, value, fence: ConsolidationWorkFence, *, now: str) 
             raise ContractError("DERIVATION_INVALID", "source_refs")
         tx.claims.require_live_source(*parse_source_ref(ref))
     # Captures and unrelated writes move memory_epoch without touching anything
-    # this result was derived from.  Only a changed dependency rejects it, with
-    # the same retryable conflict the epoch comparison raised.  A non-final
+    # this result was derived from.  Only a changed dependency rejects it, as
+    # the retryable ``VERSION_CONFLICT`` (``memory_epoch``).  A non-final
     # page only stages its summaries; the final page applies all of them.
     applies_summaries = fence.chunk is None or fence.chunk.final
     if (
@@ -425,8 +427,8 @@ def accept_consolidation(
                 claim_refs.update(item.ref for item in applied)
                 items.extend(applied)
         except ContractError as exc:
-            # A rejection caused by a claim written during the call stays the
-            # retryable conflict the epoch comparison used to report first.
+            # A rejection caused by a claim written during the call is the
+            # retryable ``VERSION_CONFLICT`` (``memory_epoch``) as well.
             if work_fence is not None and claims_changed(tx, work_fence.dependencies, until=mark):
                 raise ContractError("VERSION_CONFLICT", "memory_epoch") from exc
             raise

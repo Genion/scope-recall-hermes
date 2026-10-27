@@ -7,7 +7,7 @@ import math
 import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +17,11 @@ from ..contracts import (
     InstanceBinding,
     TrustedContext,
 )
-from .delete_storage import Deletions
+from .deadline import remaining_seconds as request_remaining_seconds
+from .delete_storage import Deletions, watch_mirrored_tombstones
 from .failure_retry import failure_kind, retry_class
 from .registry_storage import Registry
+from .restore import restore_pending
 from .schema import (
     APPLICATION_ID,
     SCHEMA_VERSION,
@@ -31,6 +33,8 @@ from .schema import (
     upgrade_1107,
     upgrade_1108,
     upgrade_1109,
+    upgrade_1110,
+    upgrade_1111,
 )
 from .source_records import SOURCE_COLUMNS, StoredSource, source_size, stored_source
 from .source_storage import Sources
@@ -84,9 +88,8 @@ class StoreStatus:
 
 #: Source versions ``Transaction.prefetch_sources`` loads per statement.
 _PREFETCH_PAGE = 400
-#: What one read transaction keeps (``Transaction.remember``), its text counted in characters, which Python holds in
-#: a little over twice the room.  Over 483 recalls on a copy of the shared store: median 24 answers and 22,000 characters,
-#: the largest 7,595 and 13 million.
+#: Read-transaction memo limits (``Transaction.remember``): entry count and total text size, counted in characters
+#: rather than encoded bytes.  Values beyond either bound are used without being cached.
 _MEMO_ENTRIES = 16384
 _MEMO_BYTES = 32 << 20
 
@@ -106,6 +109,18 @@ class Transaction:
         #: transaction.
         self.__memo: dict | None = None if writable else {}
         self.__memo_bytes = 0
+        self.__parent: Transaction | None = None
+
+    def with_context(self, context: TrustedContext, *, writable: bool = False) -> Transaction:
+        """Borrow this transaction for an authorized partition, without widening its scopes or lifetime."""
+        connection = self._check(write=writable)
+        if context.binding != self.context.binding or not context.allowed_scope_ids <= self.context.allowed_scope_ids:
+            raise ContractError("ACCESS_DENIED", "transaction_scope")
+        view = Transaction(connection, context, writable=writable)
+        view.__parent = self
+        if self.__writable:
+            view.__memo = None
+        return view
 
     def entry_label(self, entry_id: str) -> dict[str, str] | None:
         """The ``{id, name}`` a reader is shown for a source's entry, or None.
@@ -123,6 +138,8 @@ class Transaction:
         return dict(label) if label is not None else None
 
     def _check(self, *, write: bool = False) -> sqlite3.Connection:
+        if self.__parent is not None:
+            self.__parent._check(write=write)
         if not self.__active or self.__poisoned:
             raise ContractError("STORAGE_UNAVAILABLE", "transaction_closed")
         if write and not self.__writable:
@@ -368,8 +385,7 @@ class Transaction:
         ]
 
         scopes = sorted(self.context.allowed_scope_ids)
-        # The ``+`` keeps SQLite on the primary key: with a few scopes it started from the scope index, and read every
-        # source of them, 0.24 s for a single pair on tianji's.
+        # Unary ``+`` prevents the scope predicates from selecting a scope-index scan instead of primary-key lookups.
         for start in range(0, len(wanted), _PREFETCH_PAGE):
             page = wanted[start : start + _PREFETCH_PAGE]
             admitted = allowed_refs(self, "event", (ref for ref, _revision in page))
@@ -397,12 +413,11 @@ class Transaction:
                     self.remember(("head", ref, revision), bool(item["head"]))
 
     def remembered(self, key: tuple, load, *, size=None):
-        """``load()``'s answer for ``key``, loaded once in a read transaction.
+        """``load()``'s answer for ``key``, memoized within a read transaction.
 
-        A read transaction reads one snapshot, so what it loaded stays true until it ends.  A recall loaded each of its
-        evidence sources up to five times, three statements each: 16,222 statements for one of yuheng's questions, and
-        in a busy Hermes gateway every statement waited for the GIL, so the recall ran past its deadline in every stage
-        (3.7.7).  A write transaction changes what it reads and remembers nothing.
+        A read transaction reads a fixed snapshot, so its loaded values remain valid
+        until it ends.  Cached values can be reused within the memo's size bounds.
+        Write transactions bypass memoization because their reads can change.
         """
         memo = self.__memo
         if memo is None:
@@ -453,14 +468,10 @@ def _store_bytes(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
 
 
-#: How much of the store a connection reads through a memory map.  Each operation opens its own connection, and on a
-#: shared store another process writes between any two recalls, so SQLite's own page cache never carries over: a hook
-#: recall read every page it touched with a read call of its own, 151,000 of them (586 MiB) for a 3,800-character
-#: prompt.  Through the map those pages come straight from the system's file cache.  On a copy of the shared store that
-#: recall took 0.73-0.76 s instead of 1.20-1.76 s with the cache warm, and 1.64-1.69 s instead of 2.68-3.11 s with it
-#: cold, the state meant to model a server's first recall after an idle stretch.  SQLite maps no more than the file
-#: holds and at most its build's limit (2,147,418,112 bytes in Python's builds); the rest is read as before, and
-#: writes are unchanged.  An I/O error on a mapped page ends the process, and a mapped file cannot shrink.
+#: Requested memory-map size.  Operations open separate connections, so they do not share SQLite's page cache.
+#: Mapped reads use the system's file cache.  SQLite maps no more than the file holds or its build supports;
+#: remaining pages use ordinary reads, and writes are unchanged.  An I/O error on a mapped page ends the process,
+#: and a mapped file cannot shrink.
 STORE_MMAP_BYTES = 8 << 30
 
 
@@ -481,7 +492,14 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
 
 
 class SQLiteStorage:
-    def __init__(self, binding: InstanceBinding, *, timeout_seconds: float = 1.0, upgrade_on_open: bool = True) -> None:
+    def __init__(
+        self,
+        binding: InstanceBinding,
+        *,
+        timeout_seconds: float = 1.0,
+        upgrade_on_open: bool = True,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         if not isinstance(binding, InstanceBinding):
             raise ContractError("IDENTITY_UNBOUND")
         if (
@@ -500,6 +518,9 @@ class SQLiteStorage:
         #: ``pip install -U`` alone is enough.  The doctor turns this off: it
         #: reports a pending upgrade and never applies one.
         self.upgrade_on_open = upgrade_on_open
+        #: The monotonic clock a writer's wait for the lease is timed on: the one its ``MemoryCore`` runs on, so that
+        #: the store and the recalls and worker passes over it keep one time.
+        self.monotonic = clock if clock is not None else time.monotonic
         self.__pending_close: list[sqlite3.Connection] = []
 
     @property
@@ -524,9 +545,22 @@ class SQLiteStorage:
         if not context.allowed_scope_ids:
             raise ContractError("ACCESS_DENIED")
 
+    def _timeout(self, remaining_seconds: float | None) -> float:
+        """Refuse expired callers, including a request whose positive lock wait outlives its deadline."""
+        timeout = self.timeout_seconds
+        for remaining in (remaining_seconds, request_remaining_seconds()):
+            if remaining is None:
+                continue
+            if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
+                raise ContractError("DEADLINE_EXCEEDED")
+            timeout = min(timeout, remaining)
+        return timeout
+
     def _open(
         self, mode: TruthDatabaseMode, remaining_seconds: float | None = None, *, restoring: bool = False
     ) -> sqlite3.Connection:
+        # Commit, rollback and connection/lease cleanup finish outside this entry check.
+        timeout = self._timeout(remaining_seconds)
         # A failed close cannot silently abandon an acquired writer lease. No
         # new connection is opened until the prior close succeeds.
         while self.__pending_close:
@@ -537,33 +571,32 @@ class SQLiteStorage:
                 raise ContractError("STORAGE_UNAVAILABLE", "connection_cleanup") from exc
             self.__pending_close.pop()
         self._path_check()
-        restore_marker = self.binding.data_directory / "restore-required.json"
-        if not restoring and (restore_marker.exists() or restore_marker.is_symlink()):
+        if not restoring and restore_pending(self.binding.data_directory):
             raise ContractError("RESTORE_UNVERIFIED")
-        timeout = self.timeout_seconds
-        if remaining_seconds is not None:
-            if (
-                type(remaining_seconds) not in (int, float)
-                or not math.isfinite(remaining_seconds)
-                or remaining_seconds <= 0
-            ):
-                raise ContractError("DEADLINE_EXCEEDED")
-            timeout = min(timeout, remaining_seconds)
         # The writer lease is taken without blocking and held for one
         # transaction, so writers in separate processes -- a host and its
         # worker, the entries of a shared store -- take turns.  A turn ends in
         # milliseconds; failing at once on one sent captures to the memory-only
         # retry (one in ten with three entries writing).  A writer waits for the
-        # lease as SQLite waits for its own lock: within this timeout.
-        deadline = time.monotonic() + timeout
+        # lease as SQLite waits for its own lock: within this timeout, counted from the first refusal, so that an
+        # open that finds the lease free reads no clock.  The polls are counted as well, since the clock a caller
+        # gives need not move while this sleeps: a poll is slept only while the polls so far and it fit in the
+        # timeout, so no wait sleeps past it on any clock.  On one that keeps time, the polls so far have taken at
+        # least their own length, so the count gives up only where the clock does too.
+        deadline: float | None = None
+        polls = 0
         while True:
             try:
-                conn = connect_truth_database(
-                    self.path, mode=mode, timeout=max(0.0, deadline - time.monotonic()), isolation_level=None
-                )
+                left = timeout if deadline is None else max(0.0, deadline - self.monotonic())
+                if left <= 0:
+                    raise TruthWriterBusyError()
+                conn = connect_truth_database(self.path, mode=mode, timeout=left, isolation_level=None)
             except TruthWriterBusyError:
-                if time.monotonic() + _LEASE_POLL_SECONDS >= deadline:
+                now = self.monotonic()
+                deadline = now + timeout if deadline is None else deadline
+                if now + _LEASE_POLL_SECONDS >= deadline or (polls + 1) * _LEASE_POLL_SECONDS >= timeout:
                     raise
+                polls += 1
                 time.sleep(_LEASE_POLL_SECONDS)
                 continue
             try:
@@ -573,7 +606,10 @@ class SQLiteStorage:
                 raise
             return conn
 
-    def _verify(self, conn: sqlite3.Connection, *, expected_schema: int = SCHEMA_VERSION) -> None:
+    def verify(self, conn: sqlite3.Connection, *, expected_schema: int = SCHEMA_VERSION) -> None:
+        """Refuse the database ``conn`` reads unless it is this binding's store at ``expected_schema``: its header,
+        its recorded schema, its kind, its identity and its scopes.  Its file need not be the store's own: a
+        snapshot of the store is checked the same way before it is copied over it (``maintenance/restore.py``)."""
         if (
             conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
             or conn.execute("PRAGMA user_version").fetchone()[0] != expected_schema
@@ -630,6 +666,22 @@ class SQLiteStorage:
                 raise
             _cleanup_error(original, cleanup, "close")
 
+    def _upgrade_schema(self, conn: sqlite3.Connection) -> None:
+        """Apply each supported migration in order after checking its input identity."""
+        migrations = (
+            upgrade_1105,
+            upgrade_1106,
+            upgrade_1107,
+            upgrade_1108,
+            upgrade_1109,
+            upgrade_1110,
+            upgrade_1111,
+        )
+        for version, migrate in zip(UPGRADE_CHAIN, migrations, strict=True):
+            if conn.execute("PRAGMA user_version").fetchone()[0] == version:
+                self.verify(conn, expected_schema=version)
+                migrate(conn)
+
     def initialize(self) -> StoreStatus:
         conn = self._open("rwc")
         original = None
@@ -639,27 +691,13 @@ class SQLiteStorage:
                 # Verified as this store's own before anything is written, and
                 # switched to WAL first, so readers keep reading through a
                 # long upgrade instead of waiting on the rollback journal.
-                self._verify(conn, expected_schema=version)
+                self.verify(conn, expected_schema=version)
                 _ensure_wal(conn)
             conn.execute("BEGIN IMMEDIATE")
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone()
             if exists:
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1105:
-                    self._verify(conn, expected_schema=1105)
-                    upgrade_1105(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1106:
-                    self._verify(conn, expected_schema=1106)
-                    upgrade_1106(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1107:
-                    self._verify(conn, expected_schema=1107)
-                    upgrade_1107(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1108:
-                    self._verify(conn, expected_schema=1108)
-                    upgrade_1108(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1109:
-                    self._verify(conn, expected_schema=1109)
-                    upgrade_1109(conn)
-                self._verify(conn)
+                self._upgrade_schema(conn)
+                self.verify(conn)
             else:
                 if (
                     conn.execute("PRAGMA user_version").fetchone()[0] != 0
@@ -704,8 +742,8 @@ class SQLiteStorage:
         """Record this binding's directory as where a copied shared store now lives.
 
         A shared store is its fixed id, so a copy opens nowhere until this runs:
-        ``_verify`` refuses it with ``store_moved:run_adopt``.  Everything
-        ``_verify`` checks is checked here except the directory, which is then
+        ``verify`` refuses it with ``store_moved:run_adopt``.  Everything
+        ``verify`` checks is checked here except the directory, which is then
         written.  Returns the directory the store recorded before.  A local store
         is its directory and is never adopted.
         """
@@ -783,18 +821,20 @@ class SQLiteStorage:
             conn = self._open("rw" if writable else "ro", remaining_seconds, restoring=restoring)
         tx = Transaction(conn, context, writable=writable)
         original = None
+        mirror = False
         try:
             conn.execute("BEGIN IMMEDIATE" if writable else "BEGIN")
-            self._verify(conn)
+            self.verify(conn)
             # A restore can establish its fence while this connection waits
             # for the writer lease. Recheck after acquiring the transaction.
-            restore_marker = self.binding.data_directory / "restore-required.json"
-            if not restoring and (restore_marker.exists() or restore_marker.is_symlink()):
+            if not restoring and restore_pending(self.binding.data_directory):
                 raise ContractError("RESTORE_UNVERIFIED")
-            yield tx
+            with watch_mirrored_tombstones(conn) as touched:
+                yield tx
             if writable:
                 tx._assert_committable()
                 conn.commit()
+                mirror = bool(touched)
             else:
                 conn.rollback()
         except BaseException as exc:
@@ -808,9 +848,40 @@ class SQLiteStorage:
         finally:
             tx._finish()
             self._close(conn, original)
+        if mirror:
+            self._after_commit_deletions()
+
+    def _after_commit_deletions(self) -> None:
+        """Try bounded mirroring after lease cleanup; I/O errors leave durable catch-up."""
+        try:
+            from .deletion_mirror import mirror_committed_deletions
+
+            mirror_committed_deletions(self.binding.data_directory, self.path)
+        except Exception:  # noqa: BLE001
+            pass
 
     def write(self, context: TrustedContext, *, remaining_seconds: float | None = None):
         return self._transaction(context, writable=True, remaining_seconds=remaining_seconds)
 
     def read(self, context: TrustedContext, *, remaining_seconds: float | None = None):
         return self._transaction(context, writable=False, remaining_seconds=remaining_seconds)
+
+    def truncate_wal(self, context: TrustedContext, *, remaining_seconds: float, restoring: bool = False) -> bool:
+        """Copy the write-ahead log into the store and truncate it; whether that was done.
+
+        A commit's page images go to ``memory.sqlite3-wal`` and the store's pages keep their earlier images until a
+        checkpoint copies the new ones over them; a frame stays in the log until it is written over or the log is
+        truncated.  Done, no frame from before this call is left, and the commits after it start the log again.  A
+        reader still on an older snapshot holds the truncation back: SQLite waits for it within this connection's
+        timeout, then reports it busy.  The writer lease is held meanwhile, as for a write.  ``restoring`` is the
+        replay's (``core/restore.py``), which truncates the log while admission is still closed.
+        """
+        self._context_check(context)
+        conn = self._open("rw", remaining_seconds, restoring=restoring)
+        try:
+            busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        except BaseException as exc:
+            self._close(conn, exc)
+            raise
+        self._close(conn, None)
+        return busy == 0

@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING
 
 from scope_recall.contracts import ContractError
+from scope_recall.core.deadline import fits
 
 from .audiences import LOCAL_PLATFORMS
 from .boundary import (
@@ -20,10 +21,12 @@ from .boundary import (
     host_notice,
     interim_messages,
     interim_source_event,
+    interim_source_key,
     person_steers,
     pre_llm_source_event,
     steer_source_event,
     steer_source_key,
+    sync_assistant_key,
     sync_turn_source_events,
     tool_call_source_event,
     unanswered_messages,
@@ -34,21 +37,22 @@ from .tool_surface import TOOL_NAMES
 if TYPE_CHECKING:
     from .provider import ScopeRecallHermesAdapter
 
-#: The adapter's log name, which these lines carried before the adapter was split: a host writes it into each line,
-#: and a logging configuration may name it.
+#: The adapter's log name, the provider module's, which this module logs under as well: a host writes it into each
+#: line, and a logging configuration may name it.
 _log = logging.getLogger("scope_recall.adapters.hermes.provider")
 
 #: Turns whose opening message ``pre_llm_call`` stored, remembered across a compression's session switch.
 _USER_CAPTURED_TURNS = 64
 #: What one turn showed between tool calls, written message by message after the reply: the first ones are
 #: kept, the answer is always written, and a turn past this says so (``capture_gap:interim_limit``).  With no
-#: bound a turn of three hundred tool steps held the adapter lock for minutes while each waited for the store.
+#: bound a turn of three hundred tool steps would hold the adapter lock for minutes while each waited for the store.
 _INTERIM_PER_TURN = 64
 #: Steers this process wrote or found stored, by their key: read again at every turn's end, compression and session
 #: end, each is looked up and written once.
 _STEERS_WRITTEN = 4096
-#: How long one hook spends on the steers it reads, the look-up and the writes.  Past it each is still written, without
-#: waiting: one the store cannot take at once is kept to retry (``CaptureWriter``), and the hook returns.
+#: How long one hook spends on the steers it reads, the look-up and the writes.  A steer it has no time left for is kept
+#: to retry without a store call (``CaptureWriter.defer``), and the hook returns: the buffer's next pass, the next hook
+#: or, past a shutdown, the next start writes it.
 _STEERS_SECONDS = 2.0
 
 
@@ -58,8 +62,9 @@ def steer_deadline() -> float:
 
 
 def _budget(deadline: float) -> float:
-    """What one store call may wait of a hook's steer budget: a capture's own at most, next to nothing once spent."""
-    return max(0.001, min(CAPTURE_TIMEOUT_S, deadline - time.monotonic()))
+    """What one store call may have of a hook's steer budget: a capture's own at most, and nothing once it is spent,
+    which the store refuses."""
+    return min(CAPTURE_TIMEOUT_S, deadline - time.monotonic())
 
 
 def _steers(identity, messages: object) -> tuple[Steer, ...]:
@@ -102,9 +107,9 @@ def _is_scope_recall_tool_name(tool_name: object) -> bool:
 
 #: Hermes' own tools that hand back what was already said or remembered: its search over past
 #: sessions and its built-in memory notes.  Their output is recall, not a new observation.  Captured
-#: as one, a session search on the pilot came back as a page of old conversation, and consolidation
-#: turned it into six new facts that then filled the next automatic recall.  Like Scope Recall's own
-#: output it is kept as a source only.
+#: as one, a session search comes back as a page of old conversation, and consolidation would turn
+#: it into new facts (six from one search in one store) that then fill the next automatic recall.
+#: Like Scope Recall's own output it is kept as a source only.
 _HOST_MEMORY_TOOL_NAMES = frozenset({"session_search", "memory"})
 
 
@@ -210,8 +215,9 @@ class TurnCapture:
 
         A call that failed is kept as well, as Codex's are.  Hermes calls a result failed for a non-zero exit code or
         an error field, and what such a call printed (a traceback, a failing test) is what the agent saw and acted
-        on; dropped as having no scope, it was about 6% of the five instances' tool results, each logged as a
-        failed capture.  It is stored ``partial``, which also keeps it from ending its task (``core/episodes.py``).
+        on; dropped as having no scope, such results were about 6% of the tool results of five installations, each
+        logged as a failed capture.  It is stored ``partial``, which also keeps it from ending its task
+        (``core/episodes.py``).
         """
         identity = self._adapter._require_identity()
         if identity.read_only or not identity.runtime_audience.allowed_scope_ids:
@@ -274,8 +280,8 @@ class TurnCapture:
 
         Hermes calls this once, when a turn that has an answer ends, with a copy of the conversation, and
         before it sends the reply.  It reads that copy and writes nothing, so it takes only ``_said_lock``: under
-        the adapter lock the reply waited behind whatever held it, a capture on a busy store or a recall, and
-        a callback Hermes gave up on was then skipped for a minute, for every session (Hermes 0.21.5).
+        the adapter lock the reply would wait behind whatever held it, a capture on a busy store or a recall, and
+        a callback Hermes gives up on is then skipped for a minute, for every session (Hermes 0.21.5).
         """
         identity = self._adapter._require_identity()
         if identity.read_only or not identity.runtime_audience.allowed_scope_ids:
@@ -285,8 +291,47 @@ class TurnCapture:
             return
         answer = kwargs.get("assistant_response")
         history = kwargs.get("conversation_history")
-        said = interim_messages(history, answer=answer if isinstance(answer, str) else "")
-        steered = _said_aside(identity, history)
+        observed_at = self._adapter._utc_now()
+        session = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
+        context = identity.trusted_context(session_id=session)
+        # The ledger keeps only identity and first-observation times. Even a
+        # refused reply needs that witness so delayed sync cannot date it anew.
+        if isinstance(answer, str) and answer.strip():
+            key = sync_assistant_key(context, session, turn_id)
+            self._adapter._ledger.witness((key, 1), observed_at, observed_at)
+        # Conversation history is retrospective. Only a host timestamp or an
+        # earlier witness establishes when its message occurred.
+        said = tuple(
+            (
+                text,
+                self._adapter._ledger.witness(
+                    (interim_source_key(context, session, turn_id, ordinal), 1), observed_at, moment
+                )[1],
+            )
+            for ordinal, (text, moment) in enumerate(
+                interim_messages(history, answer=answer if isinstance(answer, str) else ""), start=1
+            )
+        )
+        steered = tuple(
+            steer._replace(
+                occurred_at=self._adapter._ledger.witness(
+                    (steer_source_key(context, steer), 1), observed_at, steer.occurred_at
+                )[1]
+            )
+            for steer in _said_aside(identity, history)
+        )
+        try:
+            check = self._adapter._require_core().private_check
+            moments = [moment for _text, moment in said] + [steer.occurred_at for steer in steered]
+            # Keep no body if any of this observation is private or unverified.
+            refused = any(
+                check(context, moments[start : start + 64])["capture_blocked"]
+                for start in range(0, max(1, len(moments)), 64)
+            )
+        except (ContractError, OSError, RuntimeError, sqlite3.Error):
+            refused = True
+        if refused:
+            return
         with self._adapter._said_lock:
             if turn_id != self._adapter._active_turn_id:
                 return
@@ -300,18 +345,18 @@ class TurnCapture:
 
         Hermes runs this on its memory worker after the reply, with no time limit, while the next turn may already
         start.  Held for the whole turn (up to 64 interim messages, the steers, the reply and the retries, each
-        waiting up to 1 s for a busy store) it kept the next turn's hooks, its start and its prefetch waiting.
+        waiting up to 1 s for a busy store) it would keep the next turn's hooks, its start and its prefetch waiting.
         The captures keep the binding the turn was said under (``bound``).  One turn is written at a time, and a
-        shutdown waits for it (the adapter's ``_sync_lock``): one that came between two captures closed the runtime
-        under the rest of the turn, the reply included.
+        shutdown waits for it (the adapter's ``_sync_lock``): one that came between two captures would close the
+        runtime under the rest of the turn, the reply included.
         """
         adapter = self._adapter
         with adapter._lock:
             identity = adapter._require_identity()
             if identity.read_only:
                 return
-            # The turn's message and reply are dated when its writing begins: dated as each was reached, the reply
-            # came after the next turn's message, written between this turn's captures.
+            # The turn's message and reply are dated when its writing begins: dated as each is reached, the reply
+            # could come after the next turn's message, written between this turn's captures.
             said_at = adapter._utc_now()
             effective_session = adapter._effective_session_id(session_id)
             active_turn = adapter._active_turn_id
@@ -319,9 +364,6 @@ class TurnCapture:
             if not identity.runtime_audience.allowed_scope_ids:
                 adapter._diagnostics.capability_gaps = identity.runtime_audience.capability_gaps
                 return
-        # Hermes runs this on its memory worker, after the reply: the place to write again what a busy store
-        # kept in memory, before the turn's own sources.
-        adapter._retry.write_buffered(release=True)
         context = identity.trusted_context(session_id=effective_session, mutation=True)
         shown = identity.trusted_context(session_id=effective_session, actor_origin="assistant_visible", mutation=True)
         opened = (
@@ -333,12 +375,21 @@ class TurnCapture:
             interim, adapter._interim_said = adapter._interim_said, {}
             steers, adapter._steer_said = adapter._steer_said, {}
         limited = self._write_messages(
-            interim_source_event, interim, identity, shown, effective_session, limit=_INTERIM_PER_TURN
+            interim_source_event,
+            interim,
+            identity,
+            shown,
+            effective_session,
+            limit=_INTERIM_PER_TURN,
         )
         # The conversation sync_turn is handed, and what post_llm_call kept when it was not.
         steered = [steer for said in steers.values() for steer in said]
         self._write_steers([*steered, *_said_aside(identity, messages)], identity, context, "sync_turn")
         self._write_turn(identity, opened, shown, effective_session, turn_id, user_content, assistant_content, said_at)
+        # Hermes runs this on its memory worker, after the reply: the place to write again what a busy store kept in
+        # memory, once the turn's own sources are written.  Before them, a pass over a store that cannot take the
+        # buffer would hold the turn's message and reply back by its whole time.
+        adapter._retry.write_buffered(release=True)
         with adapter._lock:
             if adapter._active_turn_id == active_turn:
                 # The next turn may have begun between these writes; its pre_llm marker is its own.
@@ -404,7 +455,8 @@ class TurnCapture:
 
     def _write_steers(self, steers, identity, context, hook: str, deadline: float | None = None) -> None:
         """Each steer the store does not hold yet (``_held``), one capture per hold of the lock, its store I/O
-        without it, all by the hook's ``deadline``.  Only a write the store took marks one written: a write still in
+        without it, all by the hook's ``deadline``: one it has no time left for is kept to retry with no store call
+        (``CaptureWriter.defer``).  Only a write the store took marks one written: a write still in
         flight in another hook may fail, and one the retry buffer kept may be given up.  The next hook reads either
         again; meanwhile the observation ledger and the retry buffer keep it from being written twice."""
         adapter = self._adapter
@@ -423,6 +475,20 @@ class TurnCapture:
                 )
             reads[key] = (steer, key)
         unread = list(reads.values())
+        if not unread:
+            return
+        began = time.monotonic()
+        guard = adapter._writer.capture_guard(
+            context,
+            _budget(deadline),
+            observations=[
+                (
+                    context,
+                    [{"occurred_at": steer.occurred_at, "recorded_at": adapter._utc_now()} for steer, _key in unread],
+                )
+            ],
+        )
+        took = time.monotonic() - began
         for (steer, key), held in zip(unread, self._held(unread, identity, context, deadline), strict=True):
             with adapter._lock, adapter._calls.holding(hook):
                 taken = held
@@ -435,7 +501,20 @@ class TurnCapture:
                         # Being stored by another hook, or the ledger is full for now.
                         if gaps:
                             adapter._merge_gaps(gaps)
+                    elif not fits(deadline, took):
+                        # The hook's time is spent, or what is left would not hold another write as long as the last
+                        # (``fits``): kept to retry with no store call.
+                        adapter._writer.defer(
+                            context,
+                            event,
+                            identity=ledger_identity,
+                            gaps=gaps,
+                            scope_id=identity.local_scope_id,
+                            bound=identity,
+                            guard=guard,
+                        )
                     else:
+                        began = time.monotonic()
                         receipt = adapter._writer.write(
                             context,
                             event,
@@ -446,6 +525,7 @@ class TurnCapture:
                             bound=identity,
                             release=True,
                         )
+                        took = time.monotonic() - began
                         taken = receipt is not None
                 if taken:
                     adapter._steers_written[key] = None

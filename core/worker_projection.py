@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from ..contracts import ContractError
-from .delete_storage import purge_work_parts
+from . import private
+from .delete_storage import purge_finished, purge_work_parts
 from .file_lock import advisory_file_lock
 from .retained_artifacts import RetainedBlob, erase_retained
 from .source_records import StoredSource
@@ -23,6 +24,7 @@ from .worker_outcomes import (
     derivation_changed,
     epoch_changed,
     finalize_work,
+    hold_for_private_mode,
     mark_obsolete,
     port_failure,
     read_derivation_fence,
@@ -139,18 +141,26 @@ def prepare_embed_group(storage, clock, context, items, *, embed, started: float
 
     A refusal that is the provider's -- capacity or budget -- raises ``EmbedGroupRefused``
     instead.  Asking again one member at a time is the same refusal times the group's size:
-    a group of five hundred sent that way after one refused request spent its whole pass on
-    sixty-seven members and let the rest of the group's leases run out.
+    a group of five hundred sent that way after one refused request would spend its whole pass
+    on sixty-seven members and let the rest of the group's leases run out.
     """
     if len(items) < 2 or budget_left(started, clock, budget) <= 0:
         return {}
     subjects: dict[str, list] = {"source": [], "claim": []}
     try:
         with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+            intervals = private.active_intervals(tx, clock.utc_now())
             for item in items:
                 kind = _subject_kind(item)
                 subject = _EMBED_SUBJECTS[kind].live(tx, item.subject_ref, item.subject_revision)
-                if subject is not None:
+                if subject is None:
+                    continue
+                blocked = (
+                    private.source_blocked(intervals, subject)
+                    if kind == "source"
+                    else private.claim_blocked(tx, intervals, subject)
+                )
+                if not blocked:
                     subjects[kind].append(subject)
     except ContractError:
         return {}
@@ -158,31 +168,46 @@ def prepare_embed_group(storage, clock, context, items, *, embed, started: float
     for kind, members in subjects.items():
         batch = getattr(embed, _GROUP_METHODS[kind][0], None)
         if callable(batch):
-            prepared_group.update(_prepare_in_halves(batch, members, clock=clock, started=started, budget=budget))
+            prepared_group.update(
+                _prepare_in_halves(
+                    batch,
+                    members,
+                    clock=clock,
+                    started=started,
+                    budget=budget,
+                    blocked=lambda subjects, kind=kind: private.outbound_blocked(
+                        storage, clock, context, **{("sources" if kind == "source" else "claims"): subjects}
+                    ),
+                )
+            )
     return prepared_group
 
 
-def _prepare_in_halves(batch, members: list, *, clock, started: float, budget: float) -> dict:
+def _prepare_in_halves(batch, members: list, *, clock, started: float, budget: float, blocked) -> dict:
     """Prepare ``members`` in one request, or, when it fails for its payload, each half the same way.
 
     One text the request guard refuses -- a message holding something shaped like a key -- or
     one the provider rejects fails the whole request.  Falling back to one request per member
-    made a single such text cost the group's size in requests, and a group larger than its lease
-    covers went back and failed the same way the next pass.  Halving costs a few requests and
-    leaves the one bad text, alone, to fail for itself.  A half of one is left to ask for itself.
+    would make a single such text cost the group's size in requests, and a group larger than its
+    lease covers would go back and fail the same way the next pass.  Halving costs a few requests
+    and leaves the one bad text, alone, to fail for itself.  A half of one is left to ask for
+    itself.
     """
     if len(members) < 2 or budget_left(started, clock, budget) <= 0:
         return {}
+    if blocked(members):
+        return {}
     try:
-        prepared = batch(members, remaining_seconds=budget_left(started, clock, budget))
+        with private.using_outbound_check(lambda: blocked(members)):
+            prepared = batch(members, remaining_seconds=budget_left(started, clock, budget))
     except Exception as exc:
         _disposition, error_code = port_failure(exc)
         if _provider_refusal(error_code):
             raise EmbedGroupRefused(error_code) from exc
         middle = len(members) // 2
         return {
-            **_prepare_in_halves(batch, members[:middle], clock=clock, started=started, budget=budget),
-            **_prepare_in_halves(batch, members[middle:], clock=clock, started=started, budget=budget),
+            **_prepare_in_halves(batch, members[:middle], clock=clock, started=started, budget=budget, blocked=blocked),
+            **_prepare_in_halves(batch, members[middle:], clock=clock, started=started, budget=budget, blocked=blocked),
         }
     if len(prepared) != len(members):
         return {}
@@ -194,11 +219,11 @@ def publish_embed_group(
 ) -> dict:
     """Write a group's vectors in one fenced commit per kind; answer with each written member's fence.
 
-    The store's write API is plural and the adapter used it one row at a time, so a pass paid
-    a lock-held handshake and a dataset commit per source -- nine times the cost of one commit
-    carrying the group.  The fence does not weaken: the guard verifies every member's lease,
-    subject and derivation while the helper holds the lock, and a group it refuses writes
-    nothing, leaving every member to publish on its own fence exactly as before.
+    The store's write API is plural; used one row at a time, a pass would pay a lock-held
+    handshake and a dataset commit per source -- nine times the cost of one commit carrying
+    the group.  The fence does not weaken: the guard verifies every member's lease, subject
+    and derivation while the helper holds the lock, and a group it refuses writes nothing,
+    leaving every member to publish on its own fence.
 
     The result maps ``(subject_ref, subject_revision)`` to the derivation fence read before the
     commit, which is what recording the member afterwards checks against.
@@ -289,7 +314,7 @@ def _publish_kind(
             remaining_seconds=budget_left(started, clock, budget),
         )
     except Exception:
-        # Nothing was written, or the guard refused the group: each member now
+        # Nothing was written, or the guard refused the group: each member
         # publishes on its own fence and records its own outcome.
         return {}
     return {(item.subject_ref, item.subject_revision): fences[item.work_id] for item, _subject in members}
@@ -298,14 +323,14 @@ def _publish_kind(
 def complete_embed_group(storage, clock, context, items, *, published: dict, started: float, budget: float) -> dict:
     """Record the group's published members together; each one's outcome by work id.
 
-    Each member used to answer for itself in three transactions -- read it, guard it, complete
-    it -- after the group's requests and its one commit had done the work.  At about sixty
-    milliseconds a member, a group of five hundred spent thirty seconds on that, and a group of
-    a thousand outlived its sixty-second lease: vectors already paid for were dropped as stale
-    and embedded again the next pass.  The checks are the single path's last ones, made under
-    the write transaction that records the verdict: the subject is still live, its derivation
-    has not moved since the commit's fence was read, and ``complete`` verifies the lease.  A
-    chunk that fails records nothing, and its members answer for themselves as before.
+    Answering for itself in three transactions -- read it, guard it, complete it -- after the
+    group's requests and its one commit had done the work, each member would take about sixty
+    milliseconds: thirty seconds for a group of five hundred, and a group of a thousand would
+    outlive its sixty-second lease, its vectors already paid for dropped as stale and embedded
+    again the next pass.  The checks are the single path's last ones, made under the write
+    transaction that records the verdict: the subject is still live, its derivation has not
+    moved since the commit's fence was read, and ``complete`` verifies the lease.  A chunk that
+    fails records nothing, and its members answer for themselves.
     """
     members = [item for item in items if (item.subject_ref, item.subject_revision) in published]
     outcomes: dict = {}
@@ -329,6 +354,42 @@ def complete_embed_group(storage, clock, context, items, *, published: dict, sta
             continue
         outcomes.update(recorded)
     return outcomes
+
+
+@dataclass
+class _EmbedFence:
+    """The fresh lease and derivation check required at physical vector publication."""
+
+    storage: Any
+    clock: Any
+    context: Any
+    item: Any
+    kind: _EmbedSubject
+    dependencies: Any
+    started: float
+    budget: float
+    dependency_changed: bool = False
+
+    def __call__(self) -> bool:
+        self.dependency_changed = False
+        remaining = budget_left(self.started, self.clock, self.budget)
+        if remaining <= 0:
+            return False
+        try:
+            with self.storage.read(self.context, remaining_seconds=remaining) as tx:
+                if not tx.work._verify_lease(*self.item.lease, now=self.clock.utc_now()):
+                    return False
+                current = self.kind.live(tx, self.item.subject_ref, self.item.subject_revision)
+                if current is None or current.scope_id not in self.context.allowed_scope_ids:
+                    return False
+                if (current.project_id, current.branch_id) != (self.context.project_id, self.context.branch_id):
+                    return False
+                if derivation_changed(tx, self.dependencies) is not None:
+                    self.dependency_changed = True
+                    return False
+                return True
+        except ContractError:
+            return False
 
 
 def process_embed(
@@ -375,43 +436,31 @@ def process_embed(
         return finish("retry", "model_unavailable")
     prepared = None if prepared_group is None else prepared_group.get((item.subject_ref, item.subject_revision))
     if prepared is None:
+        if private.outbound_blocked(
+            storage, clock, context, **{("sources" if kind.keyword == "source" else "claims"): (subject,)}
+        ):
+            return hold_for_private_mode(storage, clock, context, item, started=started, budget=budget)
         try:
-            prepared = prepare(subject, remaining_seconds=budget_left(started, clock, budget))
+            with private.using_outbound_check(
+                lambda: private.outbound_blocked(
+                    storage, clock, context, **{("sources" if kind.keyword == "source" else "claims"): (subject,)}
+                )
+            ):
+                prepared = prepare(subject, remaining_seconds=budget_left(started, clock, budget))
         except Exception as exc:
             return finish(*port_failure(exc), error_detail=_refusal_field(exc))
     if budget_left(started, clock, budget) <= 0:
         return deadline_result(storage, context, item)
 
-    dependency_changed = False
-
-    def lease_guard() -> bool:
-        nonlocal dependency_changed
-        dependency_changed = False
-        remaining = budget_left(started, clock, budget)
-        if remaining <= 0:
-            return False
-        try:
-            with storage.read(context, remaining_seconds=remaining) as tx:
-                if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
-                    return False
-                current = kind.live(tx, item.subject_ref, item.subject_revision)
-                if current is None or current.scope_id not in context.allowed_scope_ids:
-                    return False
-                if (current.project_id, current.branch_id) != (context.project_id, context.branch_id):
-                    return False
-                if derivation_changed(tx, dependencies) is not None:
-                    dependency_changed = True
-                    return False
-                return True
-        except ContractError:
-            return False
+    lease_guard = _EmbedFence(storage, clock, context, item, kind, dependencies, started, budget)
 
     if not lease_guard():
         if budget_left(started, clock, budget) <= 0:
             return deadline_result(storage, context, item)
-        if dependency_changed:
-            return finish("retry", "memory_epoch_changed")
-        return finish("obsolete", "authority_revoked")
+        disposition, code = (
+            ("retry", "memory_epoch_changed") if lease_guard.dependency_changed else ("obsolete", "authority_revoked")
+        )
+        return finish(disposition, code)
     already_published = published_group is not None and (item.subject_ref, item.subject_revision) in published_group
     try:
         if not already_published:
@@ -424,7 +473,7 @@ def process_embed(
                 remaining_seconds=budget_left(started, clock, budget),
             )
     except Exception as exc:
-        if dependency_changed and isinstance(exc, ContractError):
+        if lease_guard.dependency_changed and isinstance(exc, ContractError):
             return finish("retry", "memory_epoch_changed")
         return finish(*port_failure(exc), error_detail=_refusal_field(exc))
     now = clock.utc_now()
@@ -544,9 +593,13 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
         remaining = budget_left(started, clock, budget)
         if remaining <= 0:
             return deadline_result(storage, context, item)
-        now = clock.utc_now()
         try:
-            with storage.write(context, remaining_seconds=remaining) as tx:
+            # The scrub is committed: truncated now, the log keeps no frame from before it, so the page images that
+            # still held the deleted words leave the store's files; the frames this pass writes after it hold none of
+            # them.  A reader on an older snapshot holds the truncation back, and the purge stays queued.
+            truncated = storage.truncate_wal(context, remaining_seconds=remaining)
+            now = clock.utc_now()
+            with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
                 if not tx.work._verify_lease(*item.lease, now=now):
                     return stale_result(tx, item)
                 receipt = tx.deletions.receipt(operation_id)
@@ -555,7 +608,8 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
                 if receipt["layers"].get("vector_active") != "removed":
                     receipt = tx.deletions.mark_vector_active_removed(operation_id)
                 receipt = tx.deletions.finalize_attachments(operation_id, attachment_plan, erased=True)
-                if not receipt["active_content_removed"]:
+                receipt = tx.deletions.mark_sqlite_history(operation_id, removed=truncated)
+                if not purge_finished(receipt):
                     return work_result(
                         tx.work.fail(*item.lease, error_code="storage_unavailable", now=now, recoverable=True)
                     )
@@ -563,5 +617,6 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
         except Exception:
             # Physical layers may already be gone when the final CAS fails.
             # Keep the one work item retryable; the next pass inventories and
-            # idempotently acknowledges both native and attachment layers.
+            # idempotently acknowledges the native and attachment layers, and
+            # truncates the log again.
             return finish("retry", "storage_unavailable")

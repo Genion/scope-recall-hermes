@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import pytest
-from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
+from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall, kept_captures
+
+from tests.store_clock import StoreMeteredClock
 
 
 @dataclass
@@ -17,7 +20,7 @@ class FixedClock:
         return self.now
 
     def monotonic(self) -> float:
-        return self._mono
+        return time.monotonic() if isinstance(time.monotonic, StoreMeteredClock) else self._mono
 
 
 @pytest.fixture
@@ -42,6 +45,7 @@ def initialize_kwargs(hermes_home):
 
 @pytest.fixture
 def installed_core(hermes_home, initialize_kwargs):
+    """Install a synthetic core sharing the admission clock with its adapter."""
     clock = FixedClock()
     _binding, core = install_hermes_scope_recall(
         hermes_home,
@@ -53,6 +57,26 @@ def installed_core(hermes_home, initialize_kwargs):
         clock=clock,
     )
     return core, clock
+
+
+@pytest.fixture
+def kept_capture_seconds(monkeypatch):
+    """Real seconds spent writing kept captures to disk so far, as a function to call.
+
+    A shutdown writes each capture it could not store to its own file and syncs it at the file system's speed, after
+    its store budget; no store transaction meters that time, so a shutdown budget check leaves it out.
+    """
+    write, spent = kept_captures.keep, []
+
+    def timed(*args, **kwargs):
+        began = time.perf_counter()
+        try:
+            return write(*args, **kwargs)
+        finally:
+            spent.append(time.perf_counter() - began)
+
+    monkeypatch.setattr(kept_captures, "keep", timed)
+    return lambda: sum(spent)
 
 
 @pytest.fixture

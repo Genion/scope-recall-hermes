@@ -14,10 +14,9 @@ _MAX_TOOL_CHARS = 65536
 #: of the prompt unless it carries ``additionalContext`` (its ``executeUserPromptSubmitHooks``), so "{}" would stand
 #: before every prompt with nothing recalled; for it an empty answer is nothing at all.
 EMPTY_ANSWER = {"codex": "{}", "claude-code": "{}", "workbuddy": "", "dsh": "{}"}
-#: Where each client's hooks differ.  Claude Code's were the model for Codex's and send the
-#: same fields, except that a turn is named by ``prompt_id``.  Its tool output is not recorded:
-#: a tool result never becomes a memory, and a coding session's tool traffic would be most of
-#: the store for an embedding each.
+#: Turn identifiers use the host-specific fields below.  Claude Code uses ``prompt_id``, while Codex uses
+#: ``turn_id``.  Claude Code tool output is not captured, avoiding large volumes of tool traffic and the embedding
+#: work those captures would generate.
 TURN_FIELD = {"codex": "turn_id", "claude-code": "prompt_id", "workbuddy": "generation_id", "dsh": "turn_id"}
 
 
@@ -80,7 +79,7 @@ _BLANK_LINES = re.compile(r"(?:[ \t]*\r?\n)*")
 
 #: Where a prompt's payload carries since when the host's model still holds the session's own turns
 #: (``transcript.context_since``) to a recall that runs where the session record cannot be opened: the entry's resident
-#: server, or the server of a client on another machine.  Only this package's own hook and client write it (#249).
+#: server, or the server of a client on another machine.  Only this package's own hook and client write it.
 IN_CONTEXT_FIELD = "scope_recall_in_context_since"
 
 
@@ -98,8 +97,8 @@ def in_context_since(payload: dict[str, Any]) -> str | None:
 
 def claude_code_person_text(text: str) -> str:
     """The person's own words in a Claude Code prompt or session-record message: without the ``<system-reminder>``
-    blocks the app put in it, or the text as it came when it holds none.  Stored as theirs, a reminder became things
-    they had said, and claims were drawn from it (#248).  A block that never closes, and what follows it, stay."""
+    blocks the app put in it, or the text as it came when it holds none.  Complete reminder blocks are excluded from
+    the evidence used to derive the person's claims.  A block that never closes, and what follows it, stay."""
     kept: list[str] = []
     position = 0
     while (opening := _CLAUDE_CODE_REMINDER_OPEN.search(text, position)) is not None:
@@ -256,8 +255,10 @@ def assistant_stop_source_event(
     turn_id: str,
     message: str,
     recorded_at: str,
+    occurred_at: str | None = None,
     host: str = "codex",
 ) -> tuple[SourceEvent | None, tuple[str, ...]]:
+    """A turn's reply under the turn's key, said at ``occurred_at`` when the client says when, else when recorded."""
     gaps: list[str] = []
     if not message.strip():
         gaps.append("outcome_gap:missing_assistant_body")
@@ -275,7 +276,7 @@ def assistant_stop_source_event(
         "origin": "assistant_visible",
         "role": "assistant",
         "content": message,
-        "occurred_at": recorded_at,
+        "occurred_at": recorded_at if occurred_at is None else occurred_at,
         "recorded_at": recorded_at,
         "time_precision": "instant",
         "capture_state": "complete",

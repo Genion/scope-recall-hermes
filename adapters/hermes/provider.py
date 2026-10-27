@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import threading
 import time
@@ -11,12 +10,13 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from scope_recall.core import MemoryCore
+from scope_recall.core.deadline import fits
 
 from .backpressure import HostBackpressure
 from .boundary import (
     SourceObservationLedger,
 )
-from .capture import CAPTURE_TIMEOUT_S, CaptureWriter, label
+from .capture import CAPTURE_TIMEOUT_S, CaptureWriter
 from .capture_retry import SHUTDOWN_RETRY_SECONDS, CaptureRetry
 from .identity import HermesIdentity, HermesIdentityError
 from .outcomes import TurnOutcomeTracker
@@ -58,6 +58,7 @@ _MemoryProviderBase = _memory_provider_base()
 @dataclass
 class AdapterDiagnostics:
     last_prefetch_request_id: str | None = None
+    last_prefetch_skip_reason: str | None = None
     last_render_ref: str | None = None
     unsupported_fields: dict[str, str] | None = None
     pending_outcome_gaps: tuple[str, ...] = ()
@@ -149,12 +150,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
     @property
     def name(self) -> str:
         return self.PROVIDER_NAME
-
-    @property
-    def installation_token(self) -> str:
-        if self._identity is None:
-            return ""
-        return self._identity.binding.installation_id
 
     @property
     def diagnostics(self) -> AdapterDiagnostics:
@@ -253,11 +248,13 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             self._turns.sync(user_content, assistant_content, session_id=session_id, messages=messages)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # The steers first, their store I/O without the lock; then the short process launch, serialized with
-        # shutdown, never the drain.
-        self._turns.steers(messages, hook="on_session_end")
+        # One capture pass (``steer_deadline``) for the steers and the retry inside ``end``. The steers' store
+        # I/O runs without the lock; ``end`` then holds it, serialized with shutdown, and never drains. The worker
+        # start in ``end`` keeps its own budget and is not this pass.
+        deadline = steer_deadline()
+        self._turns.steers(messages, hook="on_session_end", deadline=deadline)
         with self._lock:
-            self._binding.end(messages)
+            self._binding.end(messages, deadline=deadline)
 
     @_serialized_host_event
     def on_session_switch(
@@ -295,7 +292,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         return ""
 
     def shutdown(self) -> None:
-        # A turn being written is finished first (``sync_turn``), as when it held the adapter lock throughout, and so
+        # A turn being written is finished first (``sync_turn``), as if it held the adapter lock throughout, and so
         # is a tool hook's capture whose store I/O runs without the lock, for at most ``_CAPTURE_DRAIN_WAIT_S``: its
         # bookkeeping needs the session it was said in.  One still writing after that is counted, not waited out.
         with self._sync_lock, self._lock:
@@ -306,37 +303,41 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             while self._captures_in_flight and time.monotonic() < deadline:
                 self._captures_done.wait(max(0.0, deadline - time.monotonic()))
             still_writing = self._captures_in_flight
-            # What the buffer still holds is written once more, in the time the drain left and at least a capture's:
-            # dropped here, it would be lost at every gateway restart.  An agent Hermes evicts keeps its
-            # adapter without a shutdown; the retry thread writes its buffer.
+            # What the buffer still holds is written once more, in the time the drain left and at least a capture's.
+            # What that pass cannot store is kept on disk for replay at the next start.
+            # An evicted agent keeps its adapter without a shutdown; the retry thread writes its buffer.
             self._retry.wake.set()
+            seconds = min(SHUTDOWN_RETRY_SECONDS, max(CAPTURE_TIMEOUT_S, deadline - time.monotonic()))
+            pass_deadline = time.monotonic() + seconds
             try:
-                self._retry.write_buffered(
-                    seconds=min(SHUTDOWN_RETRY_SECONDS, max(CAPTURE_TIMEOUT_S, deadline - time.monotonic())),
-                    force=True,
-                )
+                self._retry.write_buffered(seconds=seconds, force=True)
             except Exception as exc:  # noqa: BLE001 - the shutdown goes on; what is left is said below
                 _log.warning("scope-recall: a retry of buffered captures failed at shutdown (%s)", type(exc).__name__)
             pending = self._retry.pending_identities()
-            for key in tuple(self._retry.captures)[:16]:
-                if key in self._retry.in_flight:
-                    _log.warning("scope-recall: not stored yet (still being written at shutdown): %s", label(key))
-                else:
-                    _log.warning("scope-recall: not stored (still failing at shutdown), lost: %s", label(key))
-            self._retry.captures.clear()
-            durable_pending = self._retry.durable_pending_count()
+            kept_on_disk, _retained = self._retry.keep_all_on_disk(guard=self._retry.private_guard)
+            # Read only while one more store call fits the pass's time (``fits``): a count is not worth running past it.
+            durable_pending = (
+                self._retry.durable_pending_count(remaining_seconds=pass_deadline - time.monotonic())
+                if fits(pass_deadline, self._retry.last_took)
+                else None
+            )
             state = self._worker.shutdown()
             if self._host_runtime is not None:
                 self._host_runtime.close()
                 self._host_runtime = None
             if pending:
+                # Observed but neither stored nor on disk: still being written, or kept nowhere.
+                unpersisted = len(pending) - kept_on_disk
                 state = {
                     **state,
                     "pending_captures": len(pending),
-                    "pending_capture_status": "unpersisted",
-                    "pending_capture_durability": "memory_only",
+                    "pending_capture_status": "unpersisted" if unpersisted else "kept_on_disk",
+                    "pending_capture_durability": "memory_only" if unpersisted else "on_disk",
                 }
-                self._merge_gaps(("capability_gap:durable_capture_ingress_unavailable",))
+                if kept_on_disk:
+                    state["kept_on_disk_captures"] = kept_on_disk
+                if unpersisted:
+                    self._merge_gaps(("capability_gap:durable_capture_ingress_unavailable",))
             if self._diagnostics.capture_failures:
                 state = {
                     **state,
@@ -352,39 +353,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
                 state["captures_still_writing"] = still_writing
             self._diagnostics.shutdown_state = state
             self._initialized = False
-
-
-def public_signatures_match(provider: PublicMemoryProvider) -> bool:
-    """Return whether a fixture provider exposes the documented public surface."""
-
-    required = {
-        "name": property,
-        "is_available": callable,
-        "initialize": callable,
-        "prefetch": callable,
-        "queue_prefetch": callable,
-        "sync_turn": callable,
-        "on_session_end": callable,
-        "on_session_switch": callable,
-        "on_pre_compress": callable,
-        "shutdown": callable,
-        "get_tool_schemas": callable,
-        "handle_tool_call": callable,
-    }
-    for attr, kind in required.items():
-        value = getattr(provider, attr, None)
-        if kind is property and not isinstance(getattr(type(provider), attr, None), property):
-            return False
-        if kind is callable and not callable(value):
-            return False
-    initialize_params = inspect.signature(provider.initialize).parameters
-    if "session_id" not in initialize_params:
-        return False
-    if "kwargs" not in initialize_params and not any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in initialize_params.values()
-    ):
-        return False
-    return True
 
 
 def register_adapter(ctx: Any) -> ScopeRecallHermesAdapter:

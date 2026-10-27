@@ -109,6 +109,33 @@ def test_bootstrap_with_a_handed_deadline_still_waits_for_the_release_token(tmp_
         assert stdout == stderr == b""
 
 
+def test_backup_child_publishes_with_a_budget_independent_of_the_model_drain(tmp_path, capsys):
+    from scope_recall.runtime.backup_bundle import verify_backup_bundle
+
+    config_path, _ = _runtime_payload(tmp_path, drain_seconds=0.1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    data = Path(config["binding"]["data_directory"])
+    (data / "backup-config.json").write_text(json.dumps({"backup_dir": str(tmp_path / "backups")}))
+    result = {}
+    assert (
+        worker_watchdog._run_once(
+            config_path,
+            Path(sys.executable),
+            cleanup_config=False,
+            timeout_seconds=30,
+            result_sink=result,
+            job_kind="backup",
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert result["backup_outcome"] == "backed_up"
+    state = json.loads((data / "backup-state.json").read_text())
+    assert verify_backup_bundle(Path(state["last_bundle"]))["status"] == "verified"
+    assert not (data / "runtime-worker-day.json").exists()
+    assert not (data / "runtime-worker-status.json").exists()
+
+
 # The real bootstrap and worker entry, with only the Core drain replaced: "busy"
 # uses the whole window it is given, "hung" never returns.
 _OWNED_CHILD = """import json, runpy, sys, time
@@ -337,8 +364,8 @@ def test_worker_config_cleanup_is_explicit_and_bounded(tmp_path: Path):
 
 
 def test_cleanup_config_never_deletes_a_config_it_did_not_write(tmp_path: Path):
-    """#118: --cleanup-config deleted whatever --config named.  Given an operator's real
-    runtime-config.json it deleted that without a trace, and every host dropped to basic mode."""
+    """--cleanup-config deletes only a config the run wrote.  Given an operator's real
+    runtime-config.json, deleting it would leave no trace, and every host would drop to basic mode."""
     from scope_recall.runtime.worker_launch import is_ephemeral_worker_config
 
     real, _installation = _runtime_payload(tmp_path / "real", drain_seconds=30.0)
@@ -358,7 +385,7 @@ def test_cleanup_config_never_deletes_a_config_it_did_not_write(tmp_path: Path):
     ephemeral.unlink()
 
 
-# --- #87: the interpreter is executed as given ---------------------------------
+# --- the interpreter is executed as given --------------------------------------
 
 
 def _linked_interpreter(tmp_path: Path) -> Path:
@@ -442,8 +469,8 @@ def test_a_child_that_dies_before_its_receipt_names_the_reason(tmp_path: Path, m
 
 def test_a_pass_that_yielded_to_another_writer_is_not_a_failed_exit(tmp_path: Path):
     """A pass that met another writer, or a held worker lock, exits 75 with status busy and the supervisor tries
-    again after a pause: nothing failed.  The doctor called it ``worker_last_exit_failed`` (yuheng's audit of 3.4.2);
-    any other non-zero exit still is one."""
+    again after a pause: nothing failed, so the doctor does not call it ``worker_last_exit_failed``; any other
+    non-zero exit still is one."""
     from scope_recall.maintenance.doctor import run_doctor
     from scope_recall.runtime.worker_entry import load_config, persist_worker_status
 
@@ -484,7 +511,7 @@ class _Running:
 
 def test_a_teardown_starts_taskkill_without_a_console_window(monkeypatch):
     """The worker's teardown runs ``taskkill`` from a process with no console; started without ``CREATE_NO_WINDOW``
-    it got a console window of its own, which flashed on the desktop at every pass (#222)."""
+    it would get a console window of its own, which would flash on the desktop at every pass."""
     calls = []
     monkeypatch.setattr(worker_launch.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     worker_launch.taskkill_tree(_Running())

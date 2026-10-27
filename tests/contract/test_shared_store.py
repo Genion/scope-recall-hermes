@@ -4,6 +4,7 @@ Storage-level only.  What an adapter puts in a source key, and what recall shows
 a reader, are tested where they are built.  Sources are synthetic.
 """
 
+import itertools
 import os
 import shutil
 import sqlite3
@@ -47,8 +48,8 @@ def shared(tmp_path):
     storage = SQLiteStorage(binding)
     storage.initialize()
     with storage.write(shared_context(binding)) as tx:
-        tx.registry.register_entry("tianshu", "天枢", "hermes", now=NOW)
-        tx.registry.register_entry("tianxuan", "天璇", "hermes", now=NOW)
+        tx.registry.register_entry("agent3", "天三", "hermes", now=NOW)
+        tx.registry.register_entry("agent4", "天四", "hermes", now=NOW)
     return storage, binding
 
 
@@ -79,7 +80,7 @@ def test_a_local_store_marks_every_row_local(tmp_path):
     put(storage, ctx, "TEST-local/1")
     assert rows(storage) == [("TEST-local/1", "local")]
     assert meta(storage, "installation_kind") == "local"
-    assert meta(storage, "schema_version") == SCHEMA_VERSION == 1110
+    assert meta(storage, "schema_version") == SCHEMA_VERSION
 
 
 def test_a_local_store_refuses_a_source_that_names_an_entry(tmp_path):
@@ -87,7 +88,7 @@ def test_a_local_store_refuses_a_source_that_names_an_entry(tmp_path):
     storage = SQLiteStorage(ctx.binding)
     storage.initialize()
     with pytest.raises(ContractError) as exc:
-        put(storage, replace(ctx, entry_id="tianshu"), "TEST-local/1")
+        put(storage, replace(ctx, entry_id="agent3"), "TEST-local/1")
     assert (exc.value.code, exc.value.field) == ("IDENTITY_UNBOUND", "entry_unexpected")
 
 
@@ -111,7 +112,7 @@ def test_a_local_store_is_never_adopted_and_takes_no_entries(tmp_path):
     assert (exc.value.code, exc.value.field) == ("ACCESS_DENIED", "local_store")
     with storage.write(ctx) as tx:
         for call in (
-            lambda: tx.registry.register_entry("tianshu", "天枢", "hermes", now=NOW),
+            lambda: tx.registry.register_entry("agent3", "天三", "hermes", now=NOW),
             lambda: tx.registry.register_scopes({"TEST-other"}),
         ):
             with pytest.raises(ContractError) as exc:
@@ -141,21 +142,21 @@ def test_the_two_kinds_do_not_open_each_other(tmp_path, shared):
 
 def test_each_source_names_the_entry_it_came_in_through(shared):
     storage, binding = shared
-    put(storage, shared_context(binding, "tianshu"), "hermes:shared:tianshu:TEST-session:m:1@1")
-    put(storage, shared_context(binding, "tianxuan"), "hermes:shared:tianxuan:TEST-session:m:1@1")
+    put(storage, shared_context(binding, "agent3"), "hermes:shared:agent3:TEST-session:m:1@1")
+    put(storage, shared_context(binding, "agent4"), "hermes:shared:agent4:TEST-session:m:1@1")
     assert rows(storage) == [
-        ("hermes:shared:tianshu:TEST-session:m:1@1", "tianshu"),
-        ("hermes:shared:tianxuan:TEST-session:m:1@1", "tianxuan"),
+        ("hermes:shared:agent3:TEST-session:m:1@1", "agent3"),
+        ("hermes:shared:agent4:TEST-session:m:1@1", "agent4"),
     ]
 
 
 def test_a_capture_records_when_its_entry_was_last_seen(shared):
     storage, binding = shared
-    put(storage, shared_context(binding, "tianshu"), "TEST-entry/1")
+    put(storage, shared_context(binding, "agent3"), "TEST-entry/1")
     with storage.read(shared_context(binding)) as tx:
         seen = tx.registry.entries()
-    assert seen["tianshu"] == {"name": "天枢", "host": "hermes", "first_seen": NOW, "last_seen": NOW}
-    assert seen["tianxuan"]["last_seen"] == NOW
+    assert seen["agent3"] == {"name": "天三", "host": "hermes", "first_seen": NOW, "last_seen": NOW}
+    assert seen["agent4"]["last_seen"] == NOW
 
 
 def test_a_shared_store_refuses_a_source_that_names_no_entry(shared):
@@ -169,7 +170,7 @@ def test_a_shared_store_refuses_a_source_that_names_no_entry(shared):
 def test_a_shared_store_refuses_an_entry_it_never_registered(shared):
     storage, binding = shared
     with pytest.raises(ContractError) as exc:
-        put(storage, shared_context(binding, "yuheng"), "TEST-stranger/1")
+        put(storage, shared_context(binding, "agent5"), "TEST-stranger/1")
     assert (exc.value.code, exc.value.field) == ("IDENTITY_UNBOUND", "entry_unregistered")
     assert rows(storage) == []
 
@@ -177,16 +178,16 @@ def test_a_shared_store_refuses_an_entry_it_never_registered(shared):
 def test_renaming_an_entry_keeps_when_it_first_attached(shared):
     storage, binding = shared
     with storage.write(shared_context(binding)) as tx:
-        tx.registry.register_entry("tianshu", "天枢二号", "hermes", now=LATER)
-        assert tx.registry.entries()["tianshu"] == {
-            "name": "天枢二号",
+        tx.registry.register_entry("agent3", "天三二号", "hermes", now=LATER)
+        assert tx.registry.entries()["agent3"] == {
+            "name": "天三二号",
             "host": "hermes",
             "first_seen": NOW,
             "last_seen": NOW,
         }
 
 
-@pytest.mark.parametrize("entry_id", ["Tianshu", "t", "1abc", "tian_shu", "x" * 33, ""])
+@pytest.mark.parametrize("entry_id", ["Agent3", "t", "1abc", "agent_3", "x" * 33, ""])
 def test_an_entry_id_is_short_lowercase_ascii(entry_id, shared):
     storage, binding = shared
     with pytest.raises(ContractError):
@@ -247,7 +248,7 @@ def test_a_shared_binding_carries_every_entry_s_scopes_and_a_local_one_what_it_d
 
 def test_a_copied_shared_store_opens_only_after_adopt(tmp_path, shared):
     storage, binding = shared
-    put(storage, shared_context(binding, "tianshu"), "TEST-before-move/1")
+    put(storage, shared_context(binding, "agent3"), "TEST-before-move/1")
     shutil.copytree(tmp_path / "TEST-shared", tmp_path / "TEST-new-machine")
     moved_binding = replace(binding, data_directory=tmp_path / "TEST-new-machine")
     moved = SQLiteStorage(moved_binding)
@@ -258,8 +259,8 @@ def test_a_copied_shared_store_opens_only_after_adopt(tmp_path, shared):
     # The store records a directory the way it compares one: absolute, case-folded where the
     # filesystem folds case.
     assert moved.adopt() == os.path.normcase(os.path.abspath(tmp_path / "TEST-shared"))
-    put(moved, shared_context(moved_binding, "tianxuan"), "TEST-after-move/1")
-    assert rows(moved) == [("TEST-after-move/1", "tianxuan"), ("TEST-before-move/1", "tianshu")]
+    put(moved, shared_context(moved_binding, "agent4"), "TEST-after-move/1")
+    assert rows(moved) == [("TEST-after-move/1", "agent4"), ("TEST-before-move/1", "agent3")]
 
 
 def test_adopt_refuses_a_store_with_another_id(tmp_path, shared):
@@ -277,7 +278,7 @@ def test_a_replayed_capture_keeps_the_entry_that_captured_it(shared):
     """The shared worker replays with its own context, which names no entry.  The
     capture is still filed under the entry that made it, not under the replayer."""
     storage, binding = shared
-    capturer = shared_context(binding, "tianxuan")
+    capturer = shared_context(binding, "agent4")
     capture_inbox.enqueue(
         storage,
         Clock(),
@@ -289,14 +290,14 @@ def test_a_replayed_capture_keeps_the_entry_that_captured_it(shared):
     worker = shared_context(binding)
     receipts = capture_inbox.replay_inbox(storage, Clock(), worker, authorize=lambda _: binding.scope_ids)
     assert [r.durability for r in receipts] == ["persisted"]
-    assert rows(storage) == [("TEST-waited/1", "tianxuan")]
+    assert rows(storage) == [("TEST-waited/1", "agent4")]
 
 
 def test_a_local_inbox_row_is_byte_for_byte_what_it_was(tmp_path):
     ctx = context(tmp_path / "TEST-local")
-    assert "entry_id" not in capture_inbox._context_payload(ctx)
-    shared_ctx = shared_context(shared_binding(tmp_path / "TEST-shared"), "tianshu")
-    assert capture_inbox._context_payload(shared_ctx)["entry_id"] == "tianshu"
+    assert "entry_id" not in capture_inbox.context_payload(ctx)
+    shared_ctx = shared_context(shared_binding(tmp_path / "TEST-shared"), "agent3")
+    assert capture_inbox.context_payload(shared_ctx)["entry_id"] == "agent3"
 
 
 # --- upgrade -------------------------------------------------------------------------------
@@ -313,7 +314,7 @@ def test_a_1109_store_upgrades_with_every_row_local(tmp_path):
     assert "entry_id" not in columns
     storage.initialize()
     assert rows(storage) == [("TEST-old/1", "local")]
-    assert (meta(storage, "installation_kind"), meta(storage, "schema_version")) == ("local", 1110)
+    assert (meta(storage, "installation_kind"), meta(storage, "schema_version")) == ("local", SCHEMA_VERSION)
     put(storage, ctx, "TEST-new/1")
     assert rows(storage) == [("TEST-new/1", "local"), ("TEST-old/1", "local")]
 
@@ -344,16 +345,16 @@ def test_a_shared_recall_says_which_entry_each_item_came_in_through(tmp_path):
     binding = shared_binding(tmp_path / "TEST-shared")
     core = _core(binding)
     with core.storage.write(shared_context(binding)) as tx:
-        tx.registry.register_entry("tianshu", "天枢", "hermes", now=NOW)
-        tx.registry.register_entry("tianxuan", "天璇", "hermes", now=NOW)
-    _record(core, shared_context(binding, "tianxuan"), "天璇记下的 TEST 部署口令是 H100-ZEBRA。", "TEST-recall/1")
+        tx.registry.register_entry("agent3", "天三", "hermes", now=NOW)
+        tx.registry.register_entry("agent4", "天四", "hermes", now=NOW)
+    _record(core, shared_context(binding, "agent4"), "天四记下的 TEST 部署代号是 H100-ZEBRA。", "TEST-recall/1")
     packet = core.recall_packet(
-        shared_context(binding, "tianshu"),
-        recall_request(query="H100-ZEBRA 部署口令", mode="current"),
+        shared_context(binding, "agent3"),
+        recall_request(query="H100-ZEBRA 部署代号", mode="current"),
         deadline_seconds=5,
     )
     assert packet["items"], packet
-    assert packet["items"][0]["entries"] == [{"id": "tianxuan", "name": "天璇"}]
+    assert packet["items"][0]["entries"] == [{"id": "agent4", "name": "天四"}]
     validate_payload("recall_packet", packet)
 
 
@@ -362,8 +363,8 @@ def test_a_local_recall_packet_carries_no_entries(tmp_path):
 
     ctx = context(tmp_path / "TEST-local")
     core = _core(ctx.binding)
-    _record(core, ctx, "本地库的 TEST 部署口令是 H100-ZEBRA。", "TEST-recall/1")
-    packet = core.recall_packet(ctx, recall_request(query="H100-ZEBRA 部署口令", mode="current"), deadline_seconds=5)
+    _record(core, ctx, "本地库的 TEST 部署代号是 H100-ZEBRA。", "TEST-recall/1")
+    packet = core.recall_packet(ctx, recall_request(query="H100-ZEBRA 部署代号", mode="current"), deadline_seconds=5)
     assert packet["items"] and all("entries" not in item for item in packet["items"])
 
 
@@ -374,14 +375,14 @@ def test_an_item_with_evidence_from_several_entries_names_each_once(tmp_path):
     binding = shared_binding(tmp_path / "TEST-shared")
     core = _core(binding)
     with core.storage.write(shared_context(binding)) as tx:
-        tx.registry.register_entry("tianshu", "天枢", "hermes", now=NOW)
-        tx.registry.register_entry("tianxuan", "天璇", "hermes", now=NOW)
-    a = _record(core, shared_context(binding, "tianxuan"), "TEST 第一句。", "TEST-many/1")
-    b = _record(core, shared_context(binding, "tianshu"), "TEST 第二句。", "TEST-many/2")
-    c = _record(core, shared_context(binding, "tianxuan"), "TEST 第三句。", "TEST-many/3")
+        tx.registry.register_entry("agent3", "天三", "hermes", now=NOW)
+        tx.registry.register_entry("agent4", "天四", "hermes", now=NOW)
+    a = _record(core, shared_context(binding, "agent4"), "TEST 第一句。", "TEST-many/1")
+    b = _record(core, shared_context(binding, "agent3"), "TEST 第二句。", "TEST-many/2")
+    c = _record(core, shared_context(binding, "agent4"), "TEST 第三句。", "TEST-many/3")
     refs = [f"{r.ref}@{r.revision}" for r in (a, b, c)] + ["not-a-source-ref"]
     with core.storage.read(shared_context(binding)) as tx:
-        assert evidence_entries(tx, refs) == [{"id": "tianshu", "name": "天枢"}, {"id": "tianxuan", "name": "天璇"}]
+        assert evidence_entries(tx, refs) == [{"id": "agent3", "name": "天三"}, {"id": "agent4", "name": "天四"}]
     local = context(tmp_path / "TEST-local")
     local_core = _core(local.binding)
     d = _record(local_core, local, "TEST 本地一句。", "TEST-many/4")
@@ -392,9 +393,8 @@ def test_an_item_with_evidence_from_several_entries_names_each_once(tmp_path):
 # --- writers in separate processes take turns ----------------------------------------------
 
 
-def _busy_for(monkeypatch, attempts, times=None):
-    """Another process holds the writer lease for the next ``attempts`` writable opens; ``times`` gets when each
-    writable open was tried."""
+def _busy_for(monkeypatch, attempts):
+    """Another process holds the writer lease for the next ``attempts`` writable opens."""
     from scope_recall.core import storage as module
     from scope_recall.core.writer_lease import TruthWriterBusyError
 
@@ -403,8 +403,6 @@ def _busy_for(monkeypatch, attempts, times=None):
     def connect(path, *, mode, **kwargs):
         if mode != "ro":
             calls.append(mode)
-            if times is not None:
-                times.append(time.monotonic())
             if attempts is None or len(calls) <= attempts:
                 raise TruthWriterBusyError(role="truth_connection", scope="other_process")
         return real(path, mode=mode, **kwargs)
@@ -413,28 +411,89 @@ def _busy_for(monkeypatch, attempts, times=None):
     return calls
 
 
+class _StoreClock:
+    """A clock a test gives the store: only the store's sleeps move it, each by what it asked, so a writer's waits for
+    the lease are counted and timed exactly, on a machine slow or fast."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _on_a_stepped_clock(monkeypatch, binding) -> tuple[SQLiteStorage, _StoreClock]:
+    """The shared store opened on a ``_StoreClock``, and that clock."""
+    from scope_recall.core import storage as module
+
+    clock = _StoreClock()
+    monkeypatch.setattr(module.time, "sleep", clock.sleep)
+    return SQLiteStorage(binding, clock=clock.monotonic), clock
+
+
 def test_a_writer_waits_for_another_process_s_turn_to_end(monkeypatch, shared):
-    """Soak of 2026-09-22: three entries and a worker, one capture in ten failed at once on a lease
-    released milliseconds later, and waited in memory for a retry the process might never reach."""
-    storage, binding = shared
-    times: list[float] = []
-    calls = _busy_for(monkeypatch, 3, times)
-    saved = put(storage, shared_context(binding, "tianshu"), "TEST-turns/1")
+    """With three entries and a worker, a capture that meets a lease released milliseconds later must not fail at
+    once and wait in memory for a retry the process might never reach.  Between the refused opens it waits the
+    lease's polls, 10 ms each, not the open's one-second timeout."""
+    from scope_recall.core import storage as module
+
+    _storage, binding = shared
+    storage, clock = _on_a_stepped_clock(monkeypatch, binding)
+    calls = _busy_for(monkeypatch, 3)
+    saved = put(storage, shared_context(binding, "agent3"), "TEST-turns/1")
     assert saved.disposition == "inserted" and len(calls) == 4
-    # The lease's polls (10 ms apart), not the open's one-second timeout: from the first refused open to the one that
-    # succeeded, without the write's own time.
-    assert times[-1] - times[0] < 0.5
+    assert clock.slept == [module._LEASE_POLL_SECONDS] * 3
 
 
 def test_a_writer_gives_up_when_the_turn_outlasts_its_deadline(monkeypatch, shared):
+    """A writer whose lease another process keeps polls for it until its own time is up: its 0.1 s, not the store's
+    one second."""
+    from scope_recall.core import storage as module
     from scope_recall.core.writer_lease import TruthWriterBusyError
 
-    storage, binding = shared
+    _storage, binding = shared
+    storage, clock = _on_a_stepped_clock(monkeypatch, binding)
     _busy_for(monkeypatch, None)
-    started = time.monotonic()
     with pytest.raises(TruthWriterBusyError):
-        with storage.write(shared_context(binding, "tianshu"), remaining_seconds=0.1):
+        with storage.write(shared_context(binding, "agent3"), remaining_seconds=0.1):
             pass
-    assert 0.05 <= time.monotonic() - started < 0.5
+    assert set(clock.slept) == {module._LEASE_POLL_SECONDS} and 0.08 < sum(clock.slept) < 0.11
     with storage.read(shared_context(binding)) as tx:
         assert tx.status() is not None, "a reader never waits for the writer lease"
+
+
+def test_a_writer_times_its_wait_on_the_clock_it_is_given(monkeypatch, shared):
+    """Ten seconds pass on its clock between two readings: the first refusal sets the deadline, the second finds it
+    gone, and the writer gives up without waiting out a real second."""
+    from scope_recall.core.writer_lease import TruthWriterBusyError
+
+    _storage, binding = shared
+    jumping = SQLiteStorage(binding, timeout_seconds=1.0, clock=itertools.count(0, 10).__next__)
+    calls = _busy_for(monkeypatch, None)
+    with pytest.raises(TruthWriterBusyError):
+        with jumping.write(shared_context(binding, "agent3")):
+            pass
+    assert len(calls) == 1
+
+
+def test_a_writer_on_a_clock_that_stands_still_never_sleeps_past_its_timeout(monkeypatch, shared):
+    """The clock a store is given need not move while a writer waits (one that counts its readings hardly does):
+    the wait then ends on its count of polls, and the polls it sleeps add up to no more than its timeout."""
+    from scope_recall.core import storage as module
+    from scope_recall.core.writer_lease import TruthWriterBusyError
+
+    _storage, binding = shared
+    _busy_for(monkeypatch, None)
+    for timeout, polls in ((0.005, 0), (0.015, 1), (0.105, 10)):
+        slept: list[float] = []
+        monkeypatch.setattr(module.time, "sleep", slept.append)
+        standing = SQLiteStorage(binding, timeout_seconds=timeout, clock=lambda: 7.0)
+        with pytest.raises(TruthWriterBusyError):
+            with standing.write(shared_context(binding, "agent3")):
+                pass
+        assert len(slept) == polls and sum(slept) <= timeout, (timeout, slept)

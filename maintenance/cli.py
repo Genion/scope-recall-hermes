@@ -6,12 +6,15 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from scope_recall.core.failure_retry import TERMINAL_FAILURES
 from scope_recall.core.schema import SCHEMA_VERSION, STATEMENTS, UPGRADE_CHAIN, stale_header_schema
 from scope_recall.core.storage import SQLiteStorage
+from scope_recall.core.truth_connection import connect_truth_database
 from scope_recall.core.writer_lease import TruthWriterBusyError
 
 from .backup import BackupError, backup_sqlite
@@ -22,7 +25,6 @@ from .install_common import absolute
 from .install_dsh import default_home as dsh_home
 from .install_hermes import LOCAL_PLATFORM_CHOICES
 from .install_workbuddy import default_home
-from .rollback import RollbackError, plan_rollback, rollback_to_verified_snapshot
 
 
 def _emit(payload: dict) -> None:
@@ -76,7 +78,43 @@ def _resident(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _restore(argv: list[str]) -> int:
+    from .restore import main
+
+    return main(argv[1:])
+
+
+def _backup_cli_entry(argv: list[str]) -> int:
+    from .backup_cli import main
+
+    return main(argv)
+
+
+def _memory(argv: list[str]) -> int:
+    from .memory import main
+
+    return main(argv[1:])
+
+
+def _private(argv: list[str]) -> int:
+    from .private import main
+
+    return main(argv[1:])
+
+
+def _ui(argv: list[str]) -> int:
+    from .ui import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "ui": ("open the local owner's memory management page", _ui),
+    "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),
+    "private": (
+        "turn private full or read-only capture and recall on or off for a session, project or the whole store",
+        _private,
+    ),
     "setup": ("agent-operated fresh install/update/migration routing", _upgrade_cli),
     "migrate": ("prepare, resume, verify and index a legacy migration job", _upgrade_cli),
     "package-upgrade": ("offline wheel replacement after stopping all target writers", _package_upgrade),
@@ -92,6 +130,8 @@ _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "entries": ("list a shared store's entries and when each was last heard from", _shared),
     "import-entry": ("copy an entry's own store, moved aside at attach, into its shared store", _shared),
     "resident": ("see or stop an entry's resident prompt recall server, as before a package upgrade", _resident),
+    "backup": ("create or verify consistent snapshot or full backup bundle", _backup_cli_entry),
+    "restore": ("go back to a snapshot backup took, keeping every deletion made since", _restore),
 }
 
 
@@ -161,6 +201,19 @@ def _retire_rootless(args: argparse.Namespace) -> int:
     return _run_core(
         args,
         lambda core, config: core.operations.retire_rootless_proposals(
+            config.context(),
+            after_ref=args.after_ref,
+            limit=args.limit,
+            dry_run=not args.apply,
+            remaining_seconds=config.request_seconds,
+        ),
+    )
+
+
+def _restore_displaced(args: argparse.Namespace) -> int:
+    return _run_core(
+        args,
+        lambda core, config: core.operations.restore_displaced_values(
             config.context(),
             after_ref=args.after_ref,
             limit=args.limit,
@@ -269,36 +322,6 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
     )
 
 
-def _add_backup_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--database", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--manifest")
-
-
-def _backup(args: argparse.Namespace) -> int:
-    target = _path(args.output, "output")
-    manifest = _path(args.manifest, "manifest") if args.manifest else target.with_suffix(target.suffix + ".json")
-    _emit(backup_sqlite(_path(args.database, "database"), target, manifest=manifest))
-    return 0
-
-
-def _add_rollback_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--current-db", required=True)
-    parser.add_argument("--snapshot", required=True)
-    parser.add_argument("--output")
-    parser.add_argument("--apply", action="store_true")
-
-
-def _rollback(args: argparse.Namespace) -> int:
-    current, snapshot = _path(args.current_db, "current_db"), _path(args.snapshot, "snapshot")
-    output = _optional_path(args.output, "output")
-    result = plan_rollback(current, snapshot, destination=output)
-    if args.apply:
-        result = rollback_to_verified_snapshot(current, snapshot, destination=output)
-    _emit(result)
-    return 0
-
-
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"))
     parser.add_argument(
@@ -343,7 +366,7 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="PLATFORM=LOGIN",
-        help="Hermes only, repeatable: approve a dashboard login on a local surface (desktop=basic:alice) as the "
+        help="Hermes only, repeatable: approve a dashboard login on a local surface (desktop=basic:nameone) as the "
         "owner's own. The host passes the login as the session's user; without this such a session binds no "
         "memory. Whoever holds that login gets the owner's private memory there, from any machine that reaches "
         "the host.",
@@ -410,13 +433,10 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _restamp_header(database: Path, recorded: int, *, timeout: float) -> bool:
     """Write ``recorded`` into the header if, inside the write transaction, it is still what the store records."""
-    import sqlite3
     from contextlib import closing
 
     # mode=rw: a store that disappeared meanwhile is an error, never a new empty file.
-    with closing(
-        sqlite3.connect(f"{database.as_uri()}?mode=rw", uri=True, timeout=timeout, isolation_level=None)
-    ) as db:
+    with closing(connect_truth_database(database, mode="rw", timeout=timeout, isolation_level=None)) as db:
         db.execute("BEGIN IMMEDIATE")
         if stale_header_schema(db) != recorded:
             db.execute("ROLLBACK")
@@ -477,7 +497,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
     """
     import sqlite3
     import time
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from scope_recall.contracts import ContractError
 
@@ -505,7 +525,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
         )
         _emit(result)
         return 2
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     snapshot = _path(args.backup_dir, "backup_dir") / f"memory-{before}-{stamp}.sqlite3"
     backup_sqlite(database, snapshot, manifest=snapshot.with_suffix(".json"))
     result["backup"] = str(snapshot)
@@ -515,7 +535,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
         # header back, in a write transaction that checks it again, and carry on from there.
         try:
             restamped = _restamp_header(database, recorded, timeout=wait)
-        except sqlite3.OperationalError as exc:
+        except (sqlite3.OperationalError, TruthWriterBusyError) as exc:
             result.update(
                 status="not_upgraded",
                 error="store_busy",
@@ -656,6 +676,12 @@ _COMMANDS: tuple[
         _retire_rootless,
     ),
     (
+        "restore-displaced-values",
+        "withdraw a page of denials holding a claim's head without being its value, restoring what they displaced",
+        _add_requalify_arguments,
+        _restore_displaced,
+    ),
+    (
         "unindex-withheld-outputs",
         "drop the lexical postings of withheld tool outputs' placeholders, a bounded page at a time",
         _add_unindex_arguments,
@@ -672,13 +698,6 @@ _COMMANDS: tuple[
         "re-embed what was embedded so far into a new embedding space, a worker page at a time",
         _add_respace_arguments,
         _respace_embeddings,
-    ),
-    ("backup", "create a new consistent SQLite snapshot and manifest", _add_backup_arguments, _backup),
-    (
-        "rollback",
-        "inspect rollback; --apply may stop writes when new data must be reconciled",
-        _add_rollback_arguments,
-        _rollback,
     ),
     ("plan-install", None, _add_install_arguments, _plan_install),
     ("apply-install", None, _add_install_arguments, _apply_install),
@@ -713,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     try:
         return handlers[args.command](args)
-    except (InstallError, BackupError, RollbackError) as exc:
+    except (InstallError, BackupError) as exc:
         _emit({"status": "error", "error": str(exc)})
         return 2
 

@@ -32,29 +32,63 @@ Rune 的具体命令和验证边界见 [源码同步与适配](https://github.co
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, and for Codex, Claude Code, WorkBuddy and DeepSeek Harness (dsh), which share one adapter of hooks and an MCP server (the MCP tools need the optional `codex` extra; dsh runs the hooks through a plugin). The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This checkout is `3.10.6`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
+This checkout is `3.15.1`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). An agent that is not
 attached keeps its own store. A tool's output is kept and found, but not turned into facts. Each release's notes
 are a line or two in [CHANGELOG.md](CHANGELOG.md) and in full on its
-[GitHub release](https://github.com/410979729/scope-recall-hermes/releases). Upgrading from `3.2.x` or later is
-`pip install -U`, `apply-install` and a host restart, and the store's schema does not change; on a shared store in
+[GitHub release](https://github.com/410979729/scope-recall-hermes/releases). Upgrading from `3.2.x` or later to `3.15.1` is
+`pip install -U`, `apply-install` and a host restart; the first store open adds the local management audit and private-interval tables. Back up
+before upgrading and follow the [management migration and rollback guide](docs/manage.md#migration-and-rollback).
+On a shared store in
 the shipped embedding space, set `vector_threshold` from 0.653 to 0.70 by hand
-([docs/configuration.md](docs/configuration.md#vector_threshold)). From `3.1.x` the store moves to schema 1110 the
-first time it is opened, after which a 3.1 process cannot open it.
-3.1 is a rebuild rather than a patch on 2.0: production
-code went from 141,044 lines to 48,289, memory now accumulates evidence before a
-fact is written rather than judging one sentence on sight, and hosts sit behind
-adapters instead of the core being shaped around Hermes. Section 9 of the
+([docs/configuration.md](docs/configuration.md#vector_threshold)). Older supported stores migrate in order to schema 1112;
+an earlier release cannot open the upgraded store. Section 9 of the
 [3.1.0 release notes](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.1.0) is the
-migration procedure for a 2.0.1 memory database. SQLite remains the only fact
-authority; host adapters share the same contracts.
+migration procedure for a 2.0.1 memory database.
+Facts are drawn from accumulated evidence rather than judged one sentence on
+sight; only the owner's explicit correction or confirmation changes a fact as it
+is captured. SQLite is the only fact authority; host adapters share the same
+contracts.
 
-**What is not verified.** `scripts/check.py --tier release` runs about 3,600 tests with
-none failing. They check contracts, storage and the hosts' wiring; none of them
-measures recall quality. Every accuracy figure in the notes was measured by us, on
-copies of our own stores; the question sets hold private conversations, so there is
-no recall-quality suite you can re-run.
+Automatic recall injects zero to six items that clear a lexical coverage or
+vector similarity floor. Background preferences and tasks accompany passing
+query evidence; a session's first resume request can recover its current task.
+Acknowledgments, approvals, praise, bare continuation and session status prompts
+within an existing session start no search or query embedding. Explicit recall
+keeps its admission behavior. The thresholds and diagnostic counts are described
+in [the recall configuration](docs/configuration.md#vector_threshold).
+
+**Recall-quality checks.** The [synthetic recall benchmark](CONTRIBUTING.md#the-recall-benchmark)
+provides reproducible development and held-out splits for retrieval, answerability,
+scope isolation, packet size and latency. It uses proposed claims and a word-hashing
+embedder without a model or network, so it does not establish consolidation quality,
+semantic embedding quality or performance on private conversations. The test tiers
+also check contracts, storage and host integration.
+
+## Manage your memories
+
+Use `scope-recall ui` with the same store selection to open the [local management page](docs/ui.md).
+It provides Chinese and English browsing, reviewed actions, private rules, export and backup status in your browser.
+
+Use `scope-recall memory` to browse, search, inspect history, correct a fact, mute it or delete a conversation.
+It runs as the local store owner and makes no model request. Deletion shows the dependent sources and facts before
+`--yes` applies it. `scope-recall memory export --out <new directory or .zip>` writes the visible store as a portable
+package with original sources, facts, history, episodes, readable Markdown and optional retained attachments.
+`scope-recall memory secrets` lists stored credential matches by reference, provenance, time and pattern names.
+After upgrading, review its findings, remove them with `scope-recall memory forget <refs>` and change any credential found.
+[The management guide](docs/manage.md) covers store selection, filters, version checks and receipts; the
+[export guide](docs/export.md) covers package layout, hashes and filtering.
+
+Use `scope-recall private on --session <id> | --project <path> | --all` to stop keeping a session,
+directory or the whole store. `--mode full` refuses capture, recall and background model work;
+`--mode read-only` refuses capture while recall continues; `--all --for 2h` sets a duration and `off`
+closes a rule. Rules are stored as metadata only, overlap takes the stricter mode, and an event is
+refused by its own occurrence time even when a later retry or transcript read arrives after the
+rule ends. Undated events are refused when earlier private history could cover them. Directory
+identity follows junctions and symbolic links on the owning machine; recalls and outbound
+requests check again before release. [The private-mode guide](docs/private-mode.md) lists every host path, injection notice,
+migration and what is stored or sent in each mode.
 
 ## For agents: install or upgrade on the user's behalf
 
@@ -114,7 +148,7 @@ The two console names `scope-recall` and `hermes-scope-recall` invoke the same v
 
 Use explicit absolute paths for installation planning. Hermes `--agent-id` must match the host active profile (`get_active_profile_name()`, commonly `default` on an isolated home). Hermes default `--agent-workspace` is `hermes` to match the host memory-provider init contract; pass the same value on plan and apply if you override it. Codex does not accept `--agent-workspace`.
 
-If you talk to Hermes through the Desktop app or `hermes --tui` rather than the CLI, add `--local-platform desktop` (or `tui`) to both commands. Those surfaces name no user unless a dashboard login exists, and a session that names no user is refused everywhere but the CLI until the installer approves the surface; [docs/install.md](docs/install.md) says what the approval does and does not cover. If you reach the host through a dashboard login instead (`hermes serve` with `dashboard.basic_auth`, the Desktop app on another machine), the session is that login: approve it as yours with `--owner-login desktop=basic:<name>`. A Hermes with its package
+If you talk to Hermes through the Desktop app or `hermes --tui` rather than the CLI, add `--local-platform desktop` (or `tui`) to both commands. Those surfaces name no user unless a dashboard login exists, and a session that names no user is refused everywhere but the CLI until the installer approves the surface; where Hermes's gateway runs those conversations over its local session transport, it names the account the gateway runs as, which binds as the owner on an approved surface and binds nothing on another. [docs/install.md](docs/install.md) says what the approval does and does not cover. If you reach the host through a dashboard login instead (`hermes serve` with `dashboard.basic_auth`, the Desktop app on another machine), the session is that login: approve it as yours with `--owner-login desktop=basic:<name>`. A Hermes with its package
 manager (Hermes Desktop, and gateways on a Hermes that has one) builds the Python environment it runs plugins in, and
 builds it again on updates: pass it `--target-plugin-dir <home>\plugins\scope-recall`, where Hermes finds the plugin
 and the core it declares, vector dependencies included, then let Hermes sync that environment and restart it
@@ -149,7 +183,7 @@ On Windows, choose a short data directory such as `C:\ScopeRecall\my-agent`. Lan
 
 ## Profile and entity read views
 
-3.1.0 adds two shared read-only Core methods, `profile` and `entity`, and exposes them on both Hermes tools and Codex MCP. They return a deterministic categorized current-fact view, or an exact one-hop statement view, over admitted consolidated claims only. Raw chat is never silently turned into a profile. Incoming relations match the full scalar `value_text` only and keep recorded conditions and validity. Explicit project-name aliases may resolve when they are already admitted and still live; person aliases are not generalized. A `budget_tokens` value too small for even the minimal truthful envelope is a validation error, not an oversized view. See [docs/profile-entity.zh-CN.md](docs/profile-entity.zh-CN.md). An older installed wheel does not gain these tools until 3.1.0 is installed.
+Two shared read-only Core methods, `profile` and `entity`, are exposed as Hermes tools and on Codex MCP. They return a deterministic categorized current-fact view, or an exact one-hop statement view, over admitted consolidated claims only. Raw chat is never silently turned into a profile. Incoming relations match the full scalar `value_text` only and keep recorded conditions and validity. Explicit project-name aliases may resolve when they are already admitted and still live; person aliases are not generalized. A `budget_tokens` value too small for even the minimal truthful envelope is a validation error, not an oversized view. See [docs/profile-entity.zh-CN.md](docs/profile-entity.zh-CN.md).
 
 ## Bounded multi-hop evidence paths
 
@@ -165,9 +199,10 @@ joined. Node, path, time and explicit byte budgets bound its cost. See
 Several agents can share one store instead of each keeping its own: each attaches as an
 entry, every memory is marked with the agent it came in through, and a deletion through
 any of them applies to all. Moving the memory to another machine is copying one directory.
-Hermes homes attach as entries, and from 3.3.0 so do Codex and Claude Code
+Hermes homes attach as entries, and so do Codex and Claude Code
 (`attach --host codex|claude-code`). See [docs/shared-store.md](docs/shared-store.md).
-WorkBuddy and dsh attach the same way (`attach --host workbuddy|dsh`).
+WorkBuddy and dsh attach the same way (`attach --host workbuddy|dsh`). Full backup bundles
+and disaster recovery restore to fresh destinations are in [docs/backup-restore.md](docs/backup-restore.md).
 
 ## Agent-operated migration
 
@@ -190,5 +225,3 @@ The package root holds only the entry (`__init__.py`), the version and the proto
 ## Development checks
 
 The clean wheel must be tested outside the source checkout. At minimum, verify both CLI aliases, a read-only doctor result, Core capture and recall against a temporary installation, and the stdlib HTTP helper's bounded invalid-input response. Host registration, real gateway lifecycle, and production data are separate acceptance boundaries.
-
-Historical release notes and the former v2 packaging contract remain available in the repository history at the `v2.0.1` tag. They are not current v3 usage instructions.

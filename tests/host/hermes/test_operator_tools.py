@@ -30,6 +30,37 @@ def _payload(text: str, *, key: str) -> dict:
     }
 
 
+def test_inspect_tool_withholds_legacy_secret_and_preserves_clean_content(adapter, monkeypatch):
+    from scope_recall.core import events
+
+    provider, _clock = adapter
+    core, identity = provider._core, provider._identity
+    context = identity.trusted_context()
+    with monkeypatch.context() as patch:
+        patch.setattr(events, "capture_contains_secret", lambda value: False)
+        flagged = core.record_event(
+            context,
+            _payload("NameOne 密码：Xk9mP2qa", key="TEST-secret"),
+            scope_id=identity.local_scope_id,
+            remaining_seconds=5,
+        ).event_refs[0]
+    clean = core.record_event(
+        context,
+        _payload("NameOne uses green.", key="TEST-clean"),
+        scope_id=identity.local_scope_id,
+        remaining_seconds=5,
+    ).event_refs[0]
+    for item, secret in ((flagged, True), (clean, False)):
+        reply = json.loads(provider.handle_tool_call("inspect", {"protocol_version": "1.1", "ref": item.ref}))
+        assert "result" in reply, reply
+        result = reply["result"]
+        if secret:
+            assert result["value"] is None and result["gaps"] == ["secrets_withheld:1"]
+            assert "Xk9mP2qa" not in json.dumps(result, ensure_ascii=False)
+        else:
+            assert result["value"]["event"]["content"] == "NameOne uses green."
+
+
 def test_operator_tools_expose_frozen_names_and_strict_boundary(adapter):
     provider, _clock = adapter
     schemas = provider.get_tool_schemas()
@@ -151,6 +182,37 @@ def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
     assert forgotten["result"]["requested_refs"] == [claim.ref]
     assert forgotten["result"]["mode"] == "delete"
     assert forgotten["result"]["memory_epoch"] > revised["result"]["memory_epoch"]
+
+
+def test_a_revise_refused_for_a_denial_says_what_to_do_instead(adapter):
+    """A correction to a value that only says what TEST-project's CI service is not is refused, and the refusal tells
+    the model what it can do instead: give the value that holds, or withdraw the claim."""
+    provider, _clock = adapter
+    core = provider._core
+    context = provider._identity.trusted_context()
+    provider.observe_pre_llm(
+        session_id="TEST-session-1", turn_id="human-1", user_message="TEST-project CI 是 Jenkins。"
+    )
+    said = provider._current_source_refs[-1]
+    source_ref, source_revision = said.rsplit("@", 1)
+    span = {"source_ref": source_ref, "source_revision": int(source_revision), "quote": "TEST-project CI 是 Jenkins。"}
+    fact = {"kind": "fact", "subject": "TEST-project", "predicate": "CI", "value_text": "Jenkins", "conditions": []}
+    times = {"statement_kind": "assertion", "valid_from": None, "valid_to": None}
+    proposal = {"protocol_version": "1.1", "source_refs": [said], "resume_proposals": [], "reference_proposals": []}
+    proposal["claim_proposals"] = [{**fact, **times, "evidence_spans": [span]}]
+    scope = provider._identity.local_scope_id
+    claim = core.records.accept_claim_proposals(context, proposal, scope_id=scope, remaining_seconds=5).items[0]
+    provider.observe_pre_llm(
+        session_id="TEST-session-1", turn_id="human-2", user_message="更正：TEST-project CI 不是 CircleCI。"
+    )
+    request = {"protocol_version": "1.1", "target_ref": claim.ref, "expected_revision": claim.revision}
+    request |= {"new_value": "不是 CircleCI", "conditions": [], "valid_from": None}
+    refused = json.loads(
+        provider.handle_tool_call("revise", {**request, "source_evidence_refs": [provider._current_source_refs[-1]]})
+    )
+    assert refused["error"]["code"] == "DERIVATION_INVALID", refused
+    assert (claim.state, refused["error"]["field"]) == ("active", "denial_of_another_value")
+    assert "give the value that holds" in refused["error"]["hint"] and "new_value null" in refused["error"]["hint"]
 
 
 def test_a2a_same_named_mutators_reject_before_private_ref_lookup(hermes_home, initialize_kwargs):
@@ -416,9 +478,9 @@ def _untyped_properties(schema, trail=()):
 
 def test_every_tool_parameter_declares_a_type_for_a_strict_provider(adapter):
     """Kimi Code's k3 endpoint refuses a tool whose parameter has no explicit
-    type, and every tool travels with every request, so the trace tool's
-    untyped direction enum failed all chat on that route after the 3.1.0
-    upgrade (#89).  The tools a host receives are checked here as a set."""
+    type, and every tool travels with every request, so one untyped parameter
+    (the trace tool's direction enum, say) fails all chat on that route.  The
+    tools a host receives are checked here as a set."""
     provider, _clock = adapter
     for schema in provider.get_tool_schemas():
         assert _untyped_properties(schema["parameters"]) == [], schema["name"]

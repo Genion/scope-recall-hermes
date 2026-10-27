@@ -1,4 +1,4 @@
-"""Small synthetic P15 migration, idempotence, deletion, and rollback drills."""
+"""Small synthetic P15 migration, idempotence, deletion, and restore drills."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import subprocess
 import sys
 from contextlib import closing
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -25,11 +26,12 @@ from scope_recall.core.restore import (
 )
 from scope_recall.core.schema import SCHEMA_VERSION
 from scope_recall.core.storage import SQLiteStorage
+from scope_recall.maintenance.restore import apply_restore
+from test_denial_values import NEGATED_STATES
 
 from maintenance.backup import backup_sqlite
 from maintenance.migrate_v2 import migrate_legacy
 from maintenance.migration_records import stable_legacy_id
-from maintenance.rollback import rollback_to_verified_snapshot
 
 
 def _legacy(path: Path) -> None:
@@ -333,8 +335,8 @@ def test_p15_exported_deletion_ledger_replays_and_core_fence_denies_normal_captu
     assert ledger["memory_epoch"] >= max(item["operation"]["memory_epoch"] for item in ledger["operations"])
     begin_restore(storage, authority, expected_ledger_sha256=ledger_digest(ledger))
     assert replay_deletion_ledger(storage, authority, ledger)["status"] == "deletion_ledger_replayed"
-    rollback = rollback_to_verified_snapshot(storage.path, legacy)
-    assert rollback["status"] == "stop_write_protection_required"
+    ledger = export_deletion_ledger(storage, authority)
+    begin_restore(storage, authority, expected_ledger_sha256=ledger_digest(ledger))
 
     class Clock:
         def utc_now(self) -> str:
@@ -369,24 +371,30 @@ def test_p15_exported_deletion_ledger_replays_and_core_fence_denies_normal_captu
     assert before == after and (target / "restore-required.json").is_file()
 
 
-def test_p15_consistent_backup_and_incompatible_rollback_protects_new_events(tmp_path: Path) -> None:
+def test_p15_restoring_a_backup_of_the_migrated_store_keeps_its_migrated_deletions(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy.sqlite3"
     target = tmp_path / "target"
     _legacy(legacy)
     migrate_legacy(legacy, target)
+    legacy_before = legacy.read_bytes()
     current = target / "memory.sqlite3"
-    backup = tmp_path / "old-snapshot.sqlite3"
-    manifest = tmp_path / "old-snapshot.manifest.json"
-    backup_receipt = backup_sqlite(current, backup, manifest=manifest)
-    result = rollback_to_verified_snapshot(current, backup)
+    backup = tmp_path / "migrated-snapshot.sqlite3"
+    backup_receipt = backup_sqlite(current, backup, manifest=tmp_path / "migrated-snapshot.manifest.json")
+    binding = InstanceBinding("p15-synthetic-agent", "p15-synthetic-installation", target, frozenset({"scope-a"}), True)
+    moment = datetime(2026, 9, 6, tzinfo=UTC)
+    result = apply_restore(binding, backup, backup_dir=tmp_path / "kept", now=moment)
 
     assert backup_receipt["quick_check"] == "ok"
-    assert result["status"] == "stop_write_protection_required"
-    marker = Path(result["stop_write_marker"])
-    assert marker.is_file()
-    assert current.is_file() and backup.is_file()
-    assert json.loads(marker.read_text(encoding="utf-8"))["old_snapshot_preserved"] is True
-    assert _counts(current)["source_events"] == 7
+    assert (result["status"], result["ledger_operations"]) == ("restored", 1)
+    assert not (target / "restore-required.json").exists() and Path(result["backup"]["path"]).is_file()
+    assert _counts(current)["source_events"] == 7 and legacy.read_bytes() == legacy_before
+    with closing(sqlite3.connect(current)) as conn:
+        assert conn.execute(
+            "SELECT read_blocked FROM source_events WHERE event_id=?", (stable_legacy_id("event", "journal_entries:2"),)
+        ).fetchone() == (1,)
+    storage = SQLiteStorage(binding)
+    with storage.read(TrustedContext(binding, "p15-audit", binding.scope_ids, "host_generated")) as tx:
+        assert tx.sources.search_sources("不能复活") == ()
 
 
 def test_p15_official_578b_private_fixture_maps_facts_history_and_multivalue(tmp_path: Path) -> None:
@@ -540,9 +548,9 @@ def test_a_store_written_by_the_previous_release_upgrades_on_first_open(tmp_path
     context = TrustedContext(binding, "TEST-session", frozenset({"TEST-scope"}), "human_direct")
     core = MemoryCore(CoreConfig(binding))
     status = core.status(context)
-    assert status.schema_version == SCHEMA_VERSION == 1110 and status.sources == 12
+    assert status.schema_version == SCHEMA_VERSION and status.sources == 12
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1110
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal", (
             "the previous release wrote a rollback-journal store"
         )
@@ -554,10 +562,10 @@ def test_a_store_written_by_the_previous_release_upgrades_on_first_open(tmp_path
     assert {"expired_vectors", "authorization_payloads", "source_authorizations"} <= tables
     (episode,) = core.episodes(replace(context, task_anchor="TEST-previous-release"))
     assert len(episode.evidence_refs) == 12
-    assert core.initialize().schema_version == 1110
+    assert core.initialize().schema_version == SCHEMA_VERSION
 
 
-def test_a_store_the_3_1_2_release_wrote_opens_at_1110_with_every_source_its_own(tmp_path):
+def test_a_store_the_3_1_2_release_wrote_opens_current_with_every_source_its_own(tmp_path):
     """The step 3.2 users meet: 3.1.2's own code writes the store, this tree opens it once."""
     path = build_previous_release_store(tmp_path / "latest", repo_root=Path.cwd(), sources=12, release=LATEST_RELEASE)
     with sqlite3.connect(path) as conn:
@@ -565,9 +573,9 @@ def test_a_store_the_3_1_2_release_wrote_opens_at_1110_with_every_source_its_own
     binding = InstanceBinding("TEST-agent", "TEST-installation", tmp_path / "latest", frozenset({"TEST-scope"}), True)
     context = TrustedContext(binding, "TEST-session", frozenset({"TEST-scope"}), "human_direct")
     status = MemoryCore(CoreConfig(binding)).status(context)
-    assert status.schema_version == SCHEMA_VERSION == 1110 and status.sources == 12
+    assert status.schema_version == SCHEMA_VERSION and status.sources == 12
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1110
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("SELECT installation_kind FROM instance_meta").fetchone()[0] == "local"
         assert conn.execute("SELECT entry_id, count(*) FROM source_events GROUP BY entry_id").fetchall() == [
             ("local", 12)
@@ -575,7 +583,7 @@ def test_a_store_the_3_1_2_release_wrote_opens_at_1110_with_every_source_its_own
         assert conn.execute("SELECT count(*) FROM entries").fetchone()[0] == 0
 
 
-# --- A migration's destination is written whole before its store (#231) ---------------------------------------------
+# --- A migration's destination is written whole before its store ----------------------------------------------------
 
 _OLD_CLI = "platform:3:cli|workspace:6:hermes|agent:7:default|user:5:local"
 _OLD_DESKTOP = "platform:7:desktop|workspace:6:hermes|agent:7:default|user:11:srdesk_TEST"
@@ -645,9 +653,9 @@ def _owner_rows() -> list[dict[str, object]]:
 
 
 def test_a_destination_written_whole_takes_every_old_scope_as_itself(tmp_path: Path) -> None:
-    """#231's migration, done the supported way: the destination's manifest names the gateway owner, its DM and every
-    old scope before its store exists, so each old scope maps to itself and the owner reads all of them on each
-    surface, while another Feishu user reads nothing."""
+    """A migration done the supported way: the destination's manifest names the gateway owner, its DM and every old
+    scope before its store exists, so each old scope maps to itself and the owner reads all of them on each surface,
+    while another Feishu user reads nothing."""
     from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
     from scope_recall.adapters.hermes.installation import approve_local_platforms, load_installation_manifest
     from scope_recall.maintenance.upgrade import prepare_upgrade
@@ -689,9 +697,9 @@ def test_a_destination_written_whole_takes_every_old_scope_as_itself(tmp_path: P
 
 
 def test_a_manifest_rewritten_after_its_store_was_made_is_named(tmp_path: Path, capsys) -> None:
-    """#231: the destination was installed first, its store made with the owner's scope alone, and then given a
-    manifest naming more scopes, which no longer opens that store.  ``migrate prepare`` answered only
-    ``invalid_or_unavailable_input``; it now says what happened and what to do, and writes no job."""
+    """A destination installed first, its store made with the owner's scope alone, and then given a manifest naming
+    more scopes no longer opens that store.  ``migrate prepare`` says what happened and what to do, not only
+    ``invalid_or_unavailable_input``, and writes no job."""
     from scope_recall.adapters.hermes import install_hermes_scope_recall
     from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
     from scope_recall.maintenance import upgrade_cli
@@ -785,7 +793,7 @@ def test_the_cli_runs_from_a_source_checkout():
     assert result.stdout.startswith("usage:")
 
 
-# --- 2.0 stores the migration job ended on (3.10.4) ------------------------------------------------------------------
+# --- 2.0 stores the migration job ended on ---------------------------------------------------------------------------
 
 _SHAPED_SCHEMA = """
 CREATE TABLE journal_entries (id INTEGER PRIMARY KEY, scope_id TEXT NOT NULL, shared_scope_id TEXT,
@@ -1214,10 +1222,10 @@ def test_a_record_sqlite_refuses_is_named_by_its_table_and_event_id(tmp_path: Pa
 def test_a_refusal_is_told_only_when_its_text_cannot_carry_a_row(
     tmp_path: Path, capsys, monkeypatch, kind, told_as_is
 ) -> None:
-    """The job answered ``invalid_or_unavailable_input`` for a CHECK that SQLite had named.  A constraint failure in
-    the forms SQLite gives one names a constraint, table or column of the schema, and the converter's refusals are
-    fixed phrases, so they are told; any other text stays masked, whatever its class, for an SQLite error can quote a
-    cell that is not UTF-8.  And the workflow names the reader contract the converter accepts (it named another)."""
+    """A CHECK failure that SQLite has named is told, not masked as ``invalid_or_unavailable_input``.  A constraint
+    failure in the forms SQLite gives one names a constraint, table or column of the schema, and the converter's
+    refusals are fixed phrases, so they are told; any other text stays masked, whatever its class, for an SQLite error
+    can quote a cell that is not UTF-8.  And the workflow names the reader contract the converter accepts."""
     from scope_recall.maintenance import upgrade_cli
     from scope_recall.maintenance.legacy_v2_compat import MEMORY_READER_CONTRACT, LegacyCompatibilityError
 
@@ -1241,3 +1249,113 @@ def test_a_refusal_is_told_only_when_its_text_cannot_carry_a_row(
     assert told["reason"] == (str(refusal) if told_as_is else "invalid_or_unavailable_input")
     workflow = Path(__file__).resolve().parents[2] / "maintenance" / "AGENT_WORKFLOW.md"
     assert f"--legacy-reader-contract {MEMORY_READER_CONTRACT}" in workflow.read_text(encoding="utf-8")
+
+
+def _legacy_facts(path: Path, facts) -> None:
+    """Facts of a shaped store in scope-a, each (id, subject, predicate, value, status, recorded at, journal id,
+    excerpt), one fact key to a slot as 2.0 kept a slot's history."""
+    with closing(sqlite3.connect(path)) as conn:
+        for name, subject, predicate, value, status, recorded, entry, excerpt in facts:
+            conn.execute(
+                "INSERT INTO fact_claims VALUES (?,NULL,'scope-a',?,?,?,?,'single','direct',?,?)",
+                (name, subject, predicate, f"key-{subject}-{predicate}", value, recorded, status),
+            )
+            conn.execute(
+                "INSERT INTO fact_claim_evidence VALUES (?,?,'journal',?,?,?,?)",
+                (f"{name}-ev", name, str(entry), f"eh-{name}", excerpt, recorded),
+            )
+        conn.commit()
+
+
+def test_a_converted_store_holds_no_denial_as_a_value(tmp_path: Path) -> None:
+    """2.0 took a denial for its slot's value as readily as any other value.  The conversion settles each as
+    restore-displaced-values does, in its own transaction: "不是 CircleCI", all TEST-project's CI service held, leaves
+    it no value, "不再是 vault-1" ends the vault-1 it denies, and the person's own 不吃辣 stays their value.  Every
+    version stays, and a second run changes nothing."""
+    legacy = _shaped_store(
+        tmp_path / "old.sqlite3",
+        journals=[
+            (1, "scope-a", "TEST-project 的 CI service 不是 CircleCI。"),
+            (2, "scope-a", "TEST-project 的 backup bucket 是 vault-1。"),
+            (3, "scope-a", "TEST-project 的 backup bucket 不再是 vault-1。"),
+            (4, "scope-a", "我不吃辣。"),
+        ],
+    )
+    later = "2026-07-02T00:00:00Z"
+    _legacy_facts(
+        legacy,
+        [
+            ("fact-ci", "TEST-project", "CI service", "不是 CircleCI", "current", _AT, 1, "不是 CircleCI"),
+            ("fact-bucket-1", "TEST-project", "backup bucket", "vault-1", "superseded", _AT, 2, "vault-1"),
+            ("fact-bucket-2", "TEST-project", "backup bucket", "不再是 vault-1", "current", later, 3, "不再是 vault-1"),
+            ("fact-diet", "用户", "饮食", "不吃辣", "current", _AT, 4, "不吃辣"),
+        ],
+    )
+    target = tmp_path / "target"
+    report = migrate_legacy(legacy, target)
+    assert report["completion_status"] == "complete", report["cutover_block"]
+    assert report["fact_authority"]["denials_settled"] == 2
+
+    def facts() -> tuple[dict[str, str], dict[str, list[tuple[str, str]]]]:
+        """Each fact's head state, and its versions' states and values, by predicate."""
+        with closing(sqlite3.connect(target / "memory.sqlite3")) as conn:
+            heads = dict(
+                conn.execute(
+                    "SELECT c.predicate, v.state FROM claims c JOIN claim_versions v"
+                    " ON v.claim_id=c.claim_id AND v.revision=c.current_revision WHERE c.kind='fact'"
+                ).fetchall()
+            )
+            versions: dict[str, list[tuple[str, str]]] = {}
+            for predicate, state, value in conn.execute(
+                "SELECT c.predicate, v.state, json_extract(v.payload_json, '$.value_text') FROM claims c"
+                " JOIN claim_versions v USING(claim_id) WHERE c.kind='fact' ORDER BY v.revision"
+            ):
+                versions.setdefault(predicate, []).append((state, value))
+        return heads, versions
+
+    heads, versions = facts()
+    assert heads == {"CI service": "retracted", "backup bucket": "retracted", "饮食": "active"}
+    assert versions == {
+        "CI service": [("active", "不是 CircleCI"), ("retracted", "不是 CircleCI")],
+        "backup bucket": [("superseded", "vault-1"), ("active", "不再是 vault-1"), ("retracted", "不再是 vault-1")],
+        "饮食": [("active", "不吃辣")],
+    }
+    assert migrate_legacy(legacy, target)["fact_authority"]["denials_settled"] == 0
+    assert facts() == (heads, versions)
+
+
+def test_conversion_preserves_every_tabulated_description_and_settles_only_denials(tmp_path):
+    """Conversion preserves descriptions as active project facts, keeps their history and retries without changes."""
+    states = (*NEGATED_STATES["zh"], *NEGATED_STATES["en"])
+    values = (*states, "不是 CircleCI", "not Jenkins")
+    legacy = _shaped_store(
+        tmp_path / "old.sqlite3",
+        journals=[(i, "scope-a", f"TEST-project state {i} 是 {value}。") for i, value in enumerate(values, 1)],
+    )
+    _legacy_facts(
+        legacy,
+        [
+            (f"state-{i}", "TEST-project", f"state {i}", value, "current", _AT, i, value)
+            for i, value in enumerate(values, 1)
+        ],
+    )
+    target = tmp_path / "target"
+    report = migrate_legacy(legacy, target)
+    assert report["completion_status"] == "complete", report["cutover_block"]
+    assert report["fact_authority"]["denials_settled"] == 2
+    query = (
+        "SELECT c.predicate,v.state,json_extract(v.payload_json,'$.value_text') FROM claims c"
+        " JOIN claim_versions v USING(claim_id) ORDER BY c.predicate,v.revision"
+    )
+    with closing(sqlite3.connect(target / "memory.sqlite3")) as conn:
+        versions = conn.execute(query).fetchall()
+    for i, value in enumerate(states, 1):
+        assert [row for row in versions if row[0] == f"state {i}"] == [(f"state {i}", "active", value)]
+    for i, value in enumerate(values[len(states) :], len(states) + 1):
+        assert [row for row in versions if row[0] == f"state {i}"] == [
+            (f"state {i}", "active", value),
+            (f"state {i}", "retracted", value),
+        ]
+    assert migrate_legacy(legacy, target)["fact_authority"]["denials_settled"] == 0
+    with closing(sqlite3.connect(target / "memory.sqlite3")) as conn:
+        assert conn.execute(query).fetchall() == versions

@@ -1,10 +1,82 @@
 """Versioned target DDL. Only explicit initialization/maintenance executes this."""
 
-SCHEMA_VERSION = 1110
+SCHEMA_VERSION = 1112
 #: Schemas a store may carry and be brought forward from, oldest first.  Any
 #: other version is unsupported and never touched.
-UPGRADE_CHAIN = (1105, 1106, 1107, 1108, 1109)
+UPGRADE_CHAIN = (1105, 1106, 1107, 1108, 1109, 1110, 1111)
 APPLICATION_ID = 0x5352434C
+
+OBJECT_TABLES = {
+    "event": ("source_events", "event_id"),
+    "claim": ("claims", "claim_id"),
+    "episode": ("episodes", "episode_id"),
+    "artifact": ("artifacts", "artifact_id"),
+    "reference": ("reference_bindings", "reference_id"),
+}
+
+#: A restore can precede a muted object's arrival. Source suppression is per
+#: revision; derived heads use revision zero for their whole-object flag.
+RESTORED_SUPPRESSION_STATEMENT = """CREATE TABLE restored_suppression_blocks (
+    object_kind TEXT NOT NULL CHECK(object_kind IN ('event','claim','episode','artifact','reference')),
+    object_ref TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>=0),
+    scope_id TEXT NOT NULL REFERENCES instance_scopes(scope_id), project_id TEXT, branch_id TEXT,
+    PRIMARY KEY(object_kind,object_ref,revision)
+) STRICT, WITHOUT ROWID"""
+
+#: Enforce late-arriving restore constraints at the sole SQLite write boundary,
+#: including source replay and all derived writers. Unmute removes the constraint
+#: first. The WHEN clause prevents recursive updates when the flag is already set.
+SUPPRESSION_TRIGGERS = tuple(
+    (
+        f"restored_suppression_{table}_{action}",
+        f"""CREATE TRIGGER restored_suppression_{table}_{action} AFTER {action} ON {table}
+        WHEN NEW.suppressed=0 AND EXISTS (
+            SELECT 1 FROM restored_suppression_blocks b WHERE b.object_kind='{kind}'
+            AND b.object_ref=NEW.{key} AND b.revision={"NEW.source_revision" if kind == "event" else "0"}
+            AND b.scope_id=NEW.scope_id AND b.project_id IS NEW.project_id AND b.branch_id IS NEW.branch_id)
+        BEGIN UPDATE {table} SET suppressed=1 WHERE {key}=NEW.{key}
+            {"AND source_revision=NEW.source_revision" if kind == "event" else ""}; END""",
+    )
+    for kind, (table, key) in OBJECT_TABLES.items()
+    for action in ("INSERT", "UPDATE")
+)
+
+#: Private intervals are operator metadata only: which session, project or whole
+#: store is private, its stricter mode and its UTC boundaries.  No message,
+#: prompt, attachment body or query is written here.  Capture is judged at an
+#: event's occurrence time against these intervals, including closed ones, so a
+#: later replay cannot store what was said while private.
+PRIVATE_INTERVALS_STATEMENT = """CREATE TABLE private_intervals (
+    interval_id INTEGER PRIMARY KEY,
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('session','project','global')),
+    session_id TEXT,
+    project_path TEXT,
+    mode TEXT NOT NULL CHECK(mode IN ('full','read-only')),
+    starts_at TEXT NOT NULL,
+    ends_at TEXT,
+    created_at TEXT NOT NULL,
+    CHECK(
+        (target_kind='session' AND session_id IS NOT NULL AND project_path IS NULL)
+        OR (target_kind='project' AND session_id IS NULL AND project_path IS NOT NULL)
+        OR (target_kind='global' AND session_id IS NULL AND project_path IS NULL)
+    ),
+    CHECK(ends_at IS NULL OR starts_at <= ends_at)
+) STRICT"""
+PRIVATE_TARGET_INDEX = (
+    "CREATE INDEX private_target ON private_intervals(target_kind,session_id,project_path,ends_at,starts_at)"
+)
+PRIVATE_ACTIVE_INDEX = "CREATE INDEX private_active ON private_intervals(ends_at,starts_at)"
+
+#: Management actions carry object identities and versions, never a copied
+#: conversation body. They are distinct from host-captured user messages.
+MANAGEMENT_STATEMENT = """CREATE TABLE management_actions (
+    action_id TEXT PRIMARY KEY NOT NULL,
+    actor TEXT NOT NULL CHECK(actor='local_user_management'),
+    action TEXT NOT NULL,
+    targets_json TEXT NOT NULL CHECK(json_valid(targets_json)),
+    recorded_at TEXT NOT NULL,
+    memory_epoch INTEGER NOT NULL CHECK(memory_epoch>=0)
+) STRICT"""
 
 WORK_ITEMS_STATEMENT = """CREATE TABLE work_items (
         work_id INTEGER PRIMARY KEY,
@@ -55,7 +127,7 @@ AUTHORIZATION_STATEMENTS = (
 )
 #: The lexical index (``core/lexical_index.py``): a term dictionary and
 #: integer postings.  The text projection it replaces took half of one
-#: instance's store; this takes a fifth of that.
+#: store; this takes a fifth of that.
 LEXICAL_STATEMENTS = (
     """CREATE TABLE lexical_terms (
         term_id INTEGER PRIMARY KEY, term TEXT NOT NULL UNIQUE
@@ -169,6 +241,10 @@ STATEMENTS = (
         installation_kind TEXT NOT NULL DEFAULT 'local' CHECK(installation_kind IN ('local','shared'))
     ) STRICT""",
         """CREATE TABLE instance_scopes (scope_id TEXT PRIMARY KEY NOT NULL) STRICT""",
+        MANAGEMENT_STATEMENT,
+        PRIVATE_INTERVALS_STATEMENT,
+        PRIVATE_TARGET_INDEX,
+        PRIVATE_ACTIVE_INDEX,
         """CREATE TABLE source_events (
         event_id TEXT NOT NULL, source_event_key TEXT NOT NULL,
         source_revision INTEGER NOT NULL CHECK(source_revision>=1),
@@ -192,6 +268,7 @@ STATEMENTS = (
         suppressed INTEGER NOT NULL DEFAULT 0 CHECK(suppressed IN (0,1)),
         source_id INTEGER,
         entry_id TEXT NOT NULL DEFAULT 'local',
+        project_root TEXT,
         PRIMARY KEY(event_id,source_revision),
         UNIQUE(source_event_key,source_revision),
         UNIQUE(source_group_key,source_revision,segment_index)
@@ -353,6 +430,8 @@ STATEMENTS = (
     )
     + RECOVERY_STATEMENTS
     + CANDIDATE_STATEMENTS
+    + (RESTORED_SUPPRESSION_STATEMENT,)
+    + tuple(statement for _name, statement in SUPPRESSION_TRIGGERS)
 )
 
 
@@ -467,10 +546,11 @@ def upgrade_1107(connection):
 def upgrade_1108(connection):
     """Keep each episode lineage row once, at the revision its source entered.
 
-    Every attach copied the previous revision's evidence links and object
-    dependencies onto the new revision, so a 200-event segment held 20,100
-    link rows for 200 sources.  Readers now take every row at or below the
-    revision they ask for, which makes the earliest copy the one to keep.
+    A store at the previous schema holds, at every revision of an episode,
+    a copy of the previous revision's evidence links and object
+    dependencies, so a 200-event segment holds 20,100 link rows for 200
+    sources.  Readers take every row at or below the revision they ask
+    for, which makes the earliest copy the one to keep.
 
     The same step adds the retention ledger, ``expired_vectors``, the content
     index a repeated tool output is looked up by, moves the migrated scope
@@ -525,6 +605,31 @@ def upgrade_1109(connection):
     connection.execute(ENTRIES_STATEMENT)
     connection.execute("UPDATE instance_meta SET schema_version=1110 WHERE singleton=1")
     connection.execute("PRAGMA user_version=1110")
+
+
+def upgrade_1110(connection):
+    """Record local management separately from conversation evidence."""
+    connection.execute(MANAGEMENT_STATEMENT)
+    connection.execute(RESTORED_SUPPRESSION_STATEMENT)
+    for _name, statement in SUPPRESSION_TRIGGERS:
+        connection.execute(statement)
+    connection.execute("UPDATE instance_meta SET schema_version=1111 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=1111")
+
+
+def upgrade_1111(connection):
+    """Add content-free private intervals and the project identity a source was said in.
+
+    ``project_root`` is the normalized working directory the host supplied with the
+    capture, metadata beside the source row rather than part of its words.  Existing
+    rows keep NULL; project matching requires directory metadata supplied by the host.
+    """
+    connection.execute(PRIVATE_INTERVALS_STATEMENT)
+    connection.execute(PRIVATE_TARGET_INDEX)
+    connection.execute(PRIVATE_ACTIVE_INDEX)
+    connection.execute("ALTER TABLE source_events ADD COLUMN project_root TEXT")
+    connection.execute("UPDATE instance_meta SET schema_version=1112 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=1112")
 
 
 def normalize_scope_authorizations(connection) -> int:

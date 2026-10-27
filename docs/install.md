@@ -36,8 +36,8 @@ older database is a separate, explicit operation — see
   manager reads a `pyproject.toml` before `plugin.yaml`'s `pip_dependencies`, and one written
   there by hand without `[lancedb]` builds an environment in which every recall runs without
   vectors. A gateway that starts on an environment older than the declaration may build it
-  again itself, with its own rights and Hermes's whole update tail (one took 13 minutes before it
-  answered), and a failure there turns memory off without a word. So after `apply-install`,
+  again itself, with its own rights and Hermes's whole update tail, and a failure there turns
+  memory off without a word. So after `apply-install`,
   rebuild it with Hermes's own sync before the restart (section 4), then run `doctor`, which
   reads the environment Hermes really runs (`hermes_runtime`). A plugin whose core is missing
   says so when Hermes loads it.
@@ -53,7 +53,7 @@ Two optional extras:
 
 | Extra | Adds | What it enables |
 |-------|------|-----------------|
-| `lancedb` | `lancedb`, `pyarrow` | The LanceDB vector companion, which is the `vector.backend` default. Without it, use `sqlite-bruteforce`, which needs no extra. |
+| `lancedb` | `lancedb`, `pyarrow` | The LanceDB vector companion, which is the `vector.backend` default. Without it, use `sqlite-bruteforce`, which needs no extra. These dependencies are not installed on Android, where recall runs without vectors. |
 | `codex` | `mcp`, `pydantic` | The Codex MCP server. Without it, the Core and Hermes paths still import and the Codex hooks still run, but the MCP server cannot start. |
 
 A third extra, `dev`, adds `build`, `pytest`, `ruff`, `pyright` and packaging
@@ -259,8 +259,33 @@ nothing when nobody logged in, which is the ordinary case for a local profile.
 A session that names no user is refused everywhere but the CLI:
 
 ```
-Memory provider 'scope-recall' initialize failed: user principal required for non-cli platform; approve it as the owner's local surface with apply-install --local-platform desktop
+Memory provider 'scope-recall' initialize failed: user principal required for non-cli platform; approve the surface with apply-install --local-platform desktop
 ```
+
+A Hermes whose gateway runs these conversations itself, and the CLI's turns, over
+its local session transport names the person instead of nobody. It passes the
+account the operating system says the Desktop app, the TUI or the CLI runs as:
+`sid:<SID>` on Windows (the named pipe client's token), `uid:<uid>` elsewhere (the
+socket peer's), and serves no other account than the one the gateway runs as. Each
+conversation comes as a direct chat of its own: `chat_type` `dm`, `chat_id`
+`local-<64 hex>` (or the id a conversation from before the transport kept),
+session key `agent:<profile>:local:dm:<chat id>`, no thread. The adapter takes the
+gateway's own account for the person at this machine and binds such a
+conversation as it binds a session that names no user there: on an approved
+surface it gets the owner's private scope under that surface's owner principal,
+with nothing to do, and the CLI's binds as the CLI does.
+The conversation is never a route, and neither is its session key. On a surface
+not yet approved such a session is not refused: it binds no scope, and the host
+log says once what approves it:
+
+```
+scope-recall: session bound to no memory scope: a desktop session for local (capability_gap:audience_unmapped, capability_gap:owner_private_denied, capability_gap:no_allowed_scope); nothing in it is captured or recalled; approve the surface with apply-install --local-platform desktop
+```
+
+Any other account or a login there is a user like any other, routed as a
+one-to-one chat with itself (`--owner-login`, below). `doctor` names a surface
+whose owner sessions bound no scope, or were refused, as `local_session_unbound`
+(section 6).
 
 Approve the surface when you install, or later on the same instance with the same
 other arguments. The flag is repeatable and takes `desktop` or `tui`:
@@ -277,7 +302,13 @@ owner's private scope on that route to `installation.json`, keeping a copy of th
 previous file under `.scope-recall-backups\`. The scopes, the installation id and
 `memory.sqlite3` are unchanged, so Desktop reads and writes the memory the CLI
 does. `plan-install` lists the approval as a change; an approved surface is not
-listed again. Restart the host surface afterwards so it binds again.
+listed again. Restart the host surface afterwards so it binds again; where the
+gateway runs the conversations, restart the gateway, since the Desktop app attaches
+to the gateway that is running. An entry of a shared store keeps its grants in
+the store's manifest, and `apply-install` refuses to approve a surface there: add
+the surface's owner principal and row with `scope-recall grants`
+([shared-store.md](shared-store.md#changing-an-entrys-grants)), which the host log
+and `doctor` name for such an entry.
 
 What it does not do: it does not cover a session that carries a login. That one
 is approved apart (`--owner-login`, below) or gets only what an audience row gives
@@ -290,35 +321,41 @@ owner. That is the same trust the CLI already has: whoever can run it against
 this home can read the store. A host that serves its dashboard to other machines
 (`hermes serve --host 0.0.0.0` with `dashboard.basic_auth`) runs the dashboard's
 Chat tab as `hermes --tui` on the host for whoever logged in, and passes that
-login to no memory provider, so such a session names no user. Approving `tui` (or
-`desktop`) on that host gives every dashboard login the owner's memory through
-the Chat tab.
+login to no memory provider, so such a session names no user, or over the local
+session transport the gateway's own account. Approving `tui` (or `desktop`) on
+that host gives every dashboard login the owner's memory through the Chat tab.
 
 #### A dashboard login: `--owner-login`
 
 With a dashboard login (`hermes serve` with `dashboard.basic_auth`, or the Desktop
 app connected to such a host from another machine) the host passes the login to
-the adapter as the session's user, `basic:<name>`, and names no chat. The adapter
-routes that session as a one-to-one chat with the login: `chat_type` `private`,
-`chat_id` the login, `thread_id` `main`. A login is not the local owner. Until it
-is approved it binds no scope, nothing said there is captured or recalled, and the
-host log says so once per session:
+the adapter as the session's user, `basic:<name>`, and names no chat. Its local
+session transport names a login `auth:v1:["<provider>","<issuer>","<name>"]`
+(`auth:v1:["basic","","nameone"]`) and the conversation as a chat of its own. The
+adapter routes either session as a one-to-one chat with the login: `chat_type`
+`private`, `chat_id` the login, `thread_id` `main`. A login is not the local
+owner. Until it is approved it binds no scope, nothing said there is captured or
+recalled, and the host log says so once per session:
 
 ```
-scope-recall: session bound to no memory scope: a desktop session for basic:alice (capability_gap:audience_unmapped, capability_gap:owner_private_denied, capability_gap:no_allowed_scope); nothing in it is captured or recalled; if this login is the owner's own, approve it with apply-install --owner-login desktop=basic:alice
+scope-recall: session bound to no memory scope: a desktop session for basic:nameone (capability_gap:audience_unmapped,
+capability_gap:owner_private_denied, capability_gap:no_allowed_scope); nothing in it is captured or recalled; if this
+login is the owner's own, approve it with apply-install --owner-login desktop=basic:nameone
 ```
 
 Approve your own login with `--owner-login <platform>=<login>`, repeatable,
-`desktop` or `tui` only, with the login exactly as the host sends it:
+`desktop` or `tui` only, with the login exactly as the host sends it, which that
+line names. Windows PowerShell 5.1 drops the double quotes inside an argument
+unless each is written `\"`: `--owner-login 'desktop=auth:v1:[\"basic\",\"\",\"nameone\"]'`.
 
 ```powershell
 scope-recall apply-install --host hermes `
   --target-plugin-dir $Plugin --instance-root $Instance `
   --project-root $Project --agent-id default --python $Python `
-  --owner-login desktop=basic:alice
+  --owner-login desktop=basic:nameone
 ```
 
-It adds the owner principal `(desktop, basic:alice)` and one grant of the owner's
+It adds the owner principal `(desktop, basic:nameone)` and one grant of the owner's
 private scope on that route, the way `--local-platform` does for a session that
 names no user, with the same backup, and approves nothing else: not that login on
 `tui`, not another login, not a session that names no user. Whoever holds that
@@ -326,9 +363,10 @@ login then reads and writes the owner's private memory there, from any machine
 that reaches the host, so approve only a login that is the owner's own; `revise`
 and `forget` stay with the CLI. An entry of a shared store keeps its grants in
 the store's manifest, which this command does not write: add the login's owner
-row there with `scope-recall grants` ([shared-store.md](shared-store.md)).
-`doctor` reports an owner row whose user is no owner principal as
-`audience_owner_unverified`.
+principal and row there with `scope-recall grants`
+([shared-store.md](shared-store.md#changing-an-entrys-grants)), which the host
+log names for such an entry. `doctor` reports an owner row whose user is no owner
+principal as `audience_owner_unverified`.
 
 A login that is not the owner's is a user like any gateway user and gets only
 what an audience row on its route gives it.
@@ -368,7 +406,7 @@ memory:
   provider: scope-recall
 ```
 
-Do not edit a sibling or production home to do it. Until that key is set,
+Set the provider in the target Hermes home's configuration. Until that key is set,
 `doctor` reports `host_registration_status: "host_config_missing"` or
 `"not_selected"` and the gap `host_registration_incomplete`.
 
@@ -488,7 +526,9 @@ the install-time `--target-plugin-dir`, `--project-root` or `--agent-id`. With
 and any mismatch it finds there; without it, it measures itself, which cannot tell
 you whether the host's environment has the new wheel.
 
-`doctor` writes nothing. It prints one JSON object with about fifty fields, sorted
+`doctor` changes no stored data and no configuration; its read of a
+`sqlite-bruteforce` vector companion can leave SQLite's `-wal` and `-shm` files
+beside it (section 10). It prints one JSON object with about fifty fields, sorted
 by key, and exits `0` only when `status` is `"ok"`.
 
 ### Reading the result
@@ -502,10 +542,11 @@ by key, and exits `0` only when `status` is `"ok"`.
 | `degraded` | 1 | At least one gap an operator must act on. It is also the fail-safe default when the database cannot be read at all. |
 
 The gaps that yield `attention` rather than `degraded` are
-`audience_owner_unverified`, `due_work_unreached`, `owner_words_from_host_request`,
-`owner_words_unchecked`, `owner_words_with_client_reminder`,
-`vector_threshold_unconfigured`, `work_failed_terminal_only`, `work_needs_review`
-and `worker_capability_unavailable`. Everything else forces `degraded`.
+`audience_owner_unverified`, `due_work_unreached`, `local_session_unbound`,
+`owner_words_from_host_request`, `owner_words_unchecked`,
+`owner_words_with_client_reminder`, `vector_threshold_unconfigured`,
+`work_failed_terminal_only`, `work_needs_review` and
+`worker_capability_unavailable`. Everything else forces `degraded`.
 
 Each store under `index_metadata.vector_stores` names its nearest-neighbour index
 in `index_outcome`. The worker builds the index once the store holds 10,000
@@ -608,6 +649,12 @@ Things that look wrong in a healthy report and are not:
   section 7). `embedding_health` always counts the embedding queue; its
   `last_day` and `held_until` appear only with an external embedding route,
   and only while the provider holds it.
+- `vector_store` with `result: "missing"` means the worker has not yet created
+  the entry's `sqlite-bruteforce` companion; its first pass does. The check opens
+  the companion as recall does, within five seconds, and reads only its tables
+  and identity: `readable` is the healthy result, and `unreadable` raises
+  `vector_store_unreadable` (below). A LanceDB store has no `vector_store` check;
+  the doctor reads its files without opening it.
 
 ### Common gaps and what they mean
 
@@ -623,24 +670,28 @@ Things that look wrong in a healthy report and are not:
 | `python_package_missing` | That interpreter could not report the package. | The wheel is not installed in that environment. |
 | `python_package_version_mismatch` / `python_package_metadata_mismatch` | The loaded version differs from this tree's, or from the installed distribution metadata. | Reinstall the wheel; do not patch files in place. "It imports" is not "it is installed". |
 | `hot_patched` | Installed files no longer match the wheel's recorded digests. | Reinstall. Editing installed files is the usual cause. |
-| `dependency_drift` | A declared requirement is missing or outside its pin. Extras you did not install are *not* drift. | Reinstall with the pins, or install the extra properly. |
+| `dependency_drift` | A declared requirement is missing or outside its pin. Extras you did not install are *not* drift, and the `codex` extra's pins count only for Codex, Claude Code, WorkBuddy and dsh, which run its MCP server; on a Hermes host they are listed with `applies: false`. | Reinstall with the pins, or install the extra properly. |
 | `hermes_runtime_package_missing` / `hermes_runtime_package_mismatch` | A Hermes that builds its own environment runs plugins from it (`hermes_runtime.environment`), and the core there is missing or another version than this one. Installing into the venv `--python` names does not reach it. | Install with `--target-plugin-dir <home>\plugins\scope-recall`, let Hermes sync, restart (section 4). |
-| `vector_dependencies_missing` | The runtime config names a LanceDB vector store, and the interpreter the doctor checked (`--python`, or its own) has no `lancedb` or `pyarrow`: the package was installed without its `lancedb` extra, and every recall finds memories by their words alone. Its recall gaps say `vector_error:RuntimeError:lance_not_installed`. | `pip install "hermes-scope-recall[lancedb]"` into that interpreter (section 2), or configure the `sqlite-bruteforce` backend. |
-| `hermes_runtime_vector_dependencies_missing` | That environment has no `lancedb` or `pyarrow` while the runtime config has a LanceDB vector store: every recall runs without vectors. | The same: the wrapper's `pyproject.toml` declares them. Look for a `pyproject.toml` there written by hand. |
+| `vector_dependencies_missing` | The runtime config names a LanceDB vector store, and the interpreter the doctor checked (`--python`, or its own) has no `lancedb` or `pyarrow`: every recall finds memories by their words alone. On Android the `lancedb` extra intentionally installs neither dependency; elsewhere the extra may be missing. Its recall gaps say `vector_error:RuntimeError:lance_not_installed`. | On Android configure the dependency-free `sqlite-bruteforce` backend, or omit `vector` to recall without vectors. Elsewhere install `pip install "hermes-scope-recall[lancedb]"` into that interpreter (section 2), or use either configuration. |
+| `hermes_runtime_vector_dependencies_missing` | That environment has no `lancedb` or `pyarrow` while the runtime config has a LanceDB vector store: every recall runs without vectors. On Android the wrapper's `lancedb` extra intentionally installs neither dependency. | On Android configure `sqlite-bruteforce`, which needs no extra, or omit `vector` to recall without vectors. Elsewhere the wrapper's `pyproject.toml` declares the extra; check whether a file written by hand omitted it. |
+| `vector_store_unreadable` | The configured `sqlite-bruteforce` companion cannot be opened for recall. The `vector_store` check's detail names the same cause as recall's `vector_error:<label>`; `VectorStoreCompatibilityError` includes a stored identity that differs from the config. | For an identity mismatch, follow “Changing the embedding model rebuilds the vector store” in [configuration.md](configuration.md#changing-the-embedding-model-rebuilds-the-vector-store). |
 | `version_mismatch` | Receipt, distribution, imported and running versions disagree. | Stop the old processes, then reinstall. |
 | `stale_process` | A live process is running code older than what is on disk. | Restart the host, or let the running worker finish. |
 | `schema_upgrade_pending` | The store is at an older schema this code knows how to bring forward. | Nothing to run: the next capture, recall or worker pass applies it in one transaction, rolled back whole if it fails; on a store above 100 MB, a caller with a minute of budget does (section 9). A step is one way: take a `backup` first if you may want to go back. |
 | `schema_version_mismatch` | The database schema is one this code cannot bring forward. | Do not run against it. Back it up and use the migration path. |
-| `schema_header_stale` | The store's tables and its own record say one schema, the SQLite header another: another process stamped the header, typically a 2.0 plugin that opened the store after its migration. Every open is refused. | Stop that process, then run `upgrade-store` with `--backup-dir`: it snapshots the store and puts the recorded schema back into the header. |
+| `schema_header_stale` | The SQLite header does not match the schema recorded by the store. Every open is refused. | Stop processes that can change the database, then run `upgrade-store` with `--backup-dir`: it snapshots the store and puts the recorded schema back into the header. |
+| `restore_pending` | A `restore` was begun and not finished: the marker `restore-required.json` closes the store, and every read and write of every host refuses it (`RESTORE_UNVERIFIED`). | Run the same `restore` command again (section 9): it finishes with the ledger kept beside the store. To keep the store as it was, give it the backup that run took as `--snapshot`, or one `backup` takes of the closed store. |
 | `vector_threshold_unconfigured` | A vector store and an approved embedding route are configured, but no threshold is set, so every vector hit is refused and recall stays lexical. `attention`. | Set a `vector_threshold` calibrated for that embedding model — see [configuration.md](configuration.md). |
-| `audience_owner_unverified` | An `owner_private` audience row names a user who is no owner principal, so it grants nothing and every session on its route captures and recalls nothing. The `audiences` check counts such rows by platform. `attention`. | If the user is the owner's own dashboard login, approve it with `apply-install --owner-login <platform>=<login>` (section 4); otherwise remove the rows. |
-| `owner_words_with_client_reminder` | Claude Code only. Messages stored as the owner's words before 3.10.5 that hold a `<system-reminder>` block Claude's desktop app put in them (#248): claims drawn from them read as things the owner said, and a recall can bring the block back. The `owner_words` check counts this entry's and names the first 20 refs, never their text. `attention`. | Forget them: in a session that has `forget` (Codex, a Hermes chat), ask for those refs to be deleted, naming each ref in your own message. What was drawn from them goes with them. New messages are stored without the block. |
+| `audience_owner_unverified` | An `owner_private` audience row names a user who is no owner principal, so it grants nothing and every session on its route captures and recalls nothing. The `audiences` check counts such rows by platform. `attention`. | If the user is the owner's own dashboard login, approve it with `apply-install --owner-login <platform>=<login>` (section 4), or on an entry of a shared store add its owner principal with `scope-recall grants`; otherwise remove the rows. |
+| `local_session_unbound` | A running Hermes process bound sessions of the person at this machine, on the CLI, Desktop or `hermes --tui`, to no scope, or refused them because the surface is not approved: nothing said there is captured or recalled. The `local_sessions` check names each surface, its gaps and since when, never who spoke. It reads what that process recorded beside the store (`unbound-sessions\`), so it appears once such a session has opened, and goes when one there binds or the process ends. A failed record write or removal is retried on the next owner session event. `attention`: approving a surface gives its memory to everyone who reaches it without logging in, which only the owner can judge. | Approve the surface with `apply-install --local-platform <platform>` (section 4), or on an entry of a shared store add its owner principal and row with `scope-recall grants` ([shared-store.md](shared-store.md#changing-an-entrys-grants)); then restart the gateway. |
+| `owner_words_with_client_reminder` | Claude Code only. Messages stored as the owner's words that hold a `<system-reminder>` block added by the desktop app: claims drawn from them read as things the owner said, and a recall can bring the block back. The `owner_words` check counts this entry's and names the first 20 refs, never their text. `attention`. | Forget them: in a session that has `forget` (Codex, a Hermes chat), ask for those refs to be deleted, naming each ref in your own message. What was drawn from them goes with them. New messages are stored without the block. |
 | `owner_words_from_host_request` | Codex only. Codex's own requests for suggestions of what to do next, stored as the owner's words, and the model's answers to them, stored as replies: the desktop app's request for one suggested next message (it opens by saying the user did not write it) and the longer request for several suggestions. Claims drawn from them read as things the owner said, and recall brings the answers back. The `owner_words` check counts this entry's and names the first 20 refs, never their text. `attention`. | Forget them: in a Codex session, ask for those refs to be deleted, naming each ref in your own message. What was drawn from them goes with them. New requests and their answers are not stored. |
 | `owner_words_unchecked` | Claude Code and Codex. The read for `owner_words_with_client_reminder` or `owner_words_from_host_request` stopped after 10 s before it reached the end of the store; the `owner_words` check says how many it found by then. `attention`. | Run `doctor` again when the store is less busy. |
-| `work_failed` | At least one item failed for a reason that is not by design: any code but `derivation_invalid`, `input_invalid` and `sensitive_request`, such as an embedding its provider answered with vectors of another width (`vector_dimension_mismatch`). | Fix the cause, then `scope-recall retry-failures --config <file> --apply`, which re-opens every such item. |
-| `work_failed_terminal_only` / `work_needs_review` | All failures are by design, or were already retried once. `attention`. | Inspect them; `--include-terminal` re-runs them only if you mean to. |
+| `work_failed` | At least one item failed for a reason that is not by design: any code but `derivation_invalid`, `input_invalid`, `model_refused` and `sensitive_request`, such as an embedding its provider answered with vectors of another width (`vector_dimension_mismatch`). | Fix the cause, then `scope-recall retry-failures --config <file> --apply`, which re-opens every such item. |
+| `work_failed_terminal_only` / `work_needs_review` | All failures are by design, or were already retried once. `attention`. A `model_refused` failure is the provider's policy stopping or refusing the answer for that source (a content filter, a refusal): it is not asked again, and the recent work errors name it. | Inspect them; `--include-terminal` re-runs them only if you mean to, once the model, the route or the provider's policy has changed. |
 | `work_backlog_stalled` | Work is pending and the worker has not succeeded for more than twice `supervisor_seconds`. | The worker is not running. See the next section. |
-| `worker_capability_unavailable` | Work is pending and the last pass reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
+| `worker_capability_unavailable` | Work is pending and the last pass of any audience reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
+| `work_type_unavailable:<work_type>` | A work type the runtime config enables was unavailable, with its work queued, in three or more passes in a row of one audience's supervisor; a busy, cut-short or failed pass, or one that only purged because the daily item cap was spent, neither counts nor ends the run. `degraded`. The `unavailable_work` check names the supervisor file's key, the number of passes, the first and last of them, and the gaps, error codes and worker error of the last. | Read those reasons: a vector store that does not open (`vector_unavailable:<label>`), a missing credential (`credential_missing`), an exhausted budget. The entry clears at the first pass that works its queue without listing the work type as unavailable: the work ran, or none of it was queued. |
 | `capture_ingress_blocked` | Inbox rows carry a real error code, or wait for their next try. Always `degraded`. | Read `capture_inbox_blocked` and the recent work errors. A row whose stored capture a replay could not check again is tried after a minute, doubling to an hour; when its 24th try again fails it is given up and counted in `capture_inbox_given_up`. `retry-failures` without `--apply` counts them by what gave them up (`inbox_by_kind`); fix that, then `retry-failures --apply` returns them to the replay. |
 | `embedding_backlog_aged` | An external embedding route is configured, and embeddings have waited more than 24 hours. Recall goes on answering, but finds what came in since then by its words alone. The check's detail names the provider's hold and its refusals over the last day when there are any (`embedding_health`). Without a route nothing embeds, by choice, and the gap is not raised. | With a hold or refusals: a quota, a spend cap or a credential at the provider; fix it there and the queue drains by itself. Without them no worker has reached the embeddings: read `worker_status`, and where each project has a worker of its own, check that it runs. |
 | `due_work_unreached` | Work, or a candidate still marked with new first-hand evidence, has waited more than 24 hours in some partition of the store, including work whose worker's lease ran out. A partition is worked only by a worker of its own audience. Work no configured route can do, and work a provider holds, is left out; a queue longer than its passes reach in a day is named too. `unreached` names each partition (scope ids carry chat and account ids, so share it with care). `attention`. | Give that audience a wake: on Windows `autostart enable`, elsewhere a timer (section 7). On a shared store the shared worker's wake works every scope its config lists. A channel no one uses any more is drained when a session of it opens; a long queue drains by itself. |
@@ -650,7 +701,7 @@ Things that look wrong in a healthy report and are not:
 | `autostart_configuration_invalid` | `runtime-autostart.json` is unusable, or points at a config that will not load or does not match the binding. | Re-run `autostart enable` with the correct `--config`. |
 | `ledger_missing:<file>` | An external route is approved but its budget ledger file does not exist. | Create the ledger — see [configuration.md](configuration.md). |
 | `model_not_approved:<role>:<model>` | The route's model is not in `budget.approved_models`. Its work waits, spending no attempt (`unsupported_model`). | Add it, with pricing. |
-| `model_refused:<model>:<code>` | Over the last hour, most calls to that model were refused by the provider. | A credential, quota or spend-cap problem at the provider. |
+| `model_refused:<model>:<code>` | Over the last hour, most calls to that model were answered with an error status (`<code>` is the most common error type or status). An answer the provider's policy stopped is not one: that call succeeded, and its work fails as `model_refused`, a failure by design (`work_failed_terminal_only`). | A credential, quota or spend-cap problem at the provider. |
 | `auxiliary_budget_pressure` | A lifetime call or token cap is at 90 % or more. | Raise the cap deliberately, or accept the stop. |
 
 A note on the shape: `checks[]` entries use the key `result`, not `status`, and
@@ -773,7 +824,7 @@ Without `--apply` nothing is written. A run re-opens every failure that is not
 terminal by design, whatever its code, up to `--limit`, reading past any number of
 failed rows it leaves alone, and each row it re-opens has the attempts of new work.
 `--include-terminal` also re-runs the terminal ones (`derivation_invalid`,
-`input_invalid`, `sensitive_request`). The worker re-opens a transient failure by
+`input_invalid`, `model_refused`, `sensitive_request`). The worker re-opens a transient failure by
 itself (`max_auto_recoveries`), but not one that would come back until someone
 changes something: an embedding its provider answered with vectors of another width
 while another model served the endpoint (`vector_dimension_mismatch`) waits for this
@@ -795,13 +846,12 @@ config reaches only that entry's scopes. Run it after going back to an earlier
 release and forward again: a capture the earlier release could not read may have
 been given up meanwhile.
 
-Since 3.7.5 it also brings back the vector work of claim heads. Before 3.7.5 the
-automatic recovery made a claim's failed embedding obsolete instead of retrying
-it, and an earlier conversion left some heads without one. The command reopens
-the first (`claim_embeds_reopened`) and queues the second
-(`claim_embeds_queued`), a page at a time up to `--limit`. It does this only for
-heads that are readable in its config's scopes. A claim found by its words alone
-is then found by meaning too.
+With `--apply`, the command requeues obsolete embedding work for readable claim
+heads only when its error is `authority_revoked` (`claim_embeds_reopened`), and
+queues work for heads with no embedding work item (`claim_embeds_queued`). Each
+batch contains at most `--limit` heads in the configuration's scopes and exact
+project/branch partition. Those claims become available to semantic search after
+the worker successfully publishes their vectors.
 
 After changing the embedding model (see [configuration.md](configuration.md),
 "Changing the embedding model rebuilds the vector store"), re-embed what was
@@ -845,6 +895,31 @@ by reference, never by text. A retired claim gets a retracted version and stops
 waiting for evaluation; its sources, its earlier versions and every confirmed
 claim stay as they are.
 
+A store can hold claims whose current version is a denial that is not the
+slot's value: one of another value than the one held ("the CI service is not
+CircleCI" while it is Jenkins, "I don't like PowerShell" while the preferred
+shell is bash), or one in a fact about anything but the person ("the deploy
+region is not us-east-2"). Take a `backup` first; it is the way back. Then:
+
+```bash
+scope-recall restore-displaced-values --config /path/to/instance-root/scope-recall/runtime-config.json --limit 32 --apply
+```
+
+It pages like `retire-rootless-claims`. Run it without `--apply` first: it
+changes nothing and lists each claim it would change, by its `ref`, `subject`,
+`predicate` and current `value`, with the revision and the value it would give
+back (`restores`, `gives_back`), both null where the claim would hold none.
+Read the list, then run it again with `--apply`. Each such denial gets a
+retracted version. The value a denial of another value
+displaced, the nearest version under it that is a value itself, becomes current
+again if it held when the denial was written and holds still; otherwise the
+claim has no current value. A second run changes nothing. The person's own
+denials, in a preference or a fact about them, that are the slot's only value
+("我不吃辣") or deny the value they replaced ("I don't drink coffee any more")
+are their values, and the command leaves them, as it leaves a value written as
+a term (NOT NULL, NOT FOUND, NOT_STARTED). Nothing is deleted: every version
+stays in the claim's history.
+
 An earlier release's capture filter left a one-line summary in place of a tool
 output it withheld ("Tool execution summary ... output_preview=omitted"); stores
 that imported that history hold many. Since 3.7.4 such a placeholder is found by
@@ -867,9 +942,6 @@ can be stopped and run again at any time; without `--until-done`, carry the
 printed `next_after_id` into `--after-id` while `more` is true. The sources stay,
 and so does the index of their error text. In a shared store, run it with the
 shared worker's config (`<root>\runtime-config.json`), which reaches every scope.
-On the shared store's copy it dropped 1,945,720 postings of 212,773 placeholders
-in 426 pages, the slowest 0.12 s, and kept the error text of the 4,348 that carry
-one.
 
 To re-frame the claims an earlier release stored in a frame this release would
 not write, among them a name given for the first time ("my cat is called ...")
@@ -913,8 +985,8 @@ scope-recall apply-uninstall --instance-root C:\path\to\instance-root --purge
 
 A purge verifies the installation identity, that the data directory is really
 owned by this installation, that no writer is active, and that no restore is
-outstanding. If any check fails it refuses with a `purge_refused:*` reason and
-deletes nothing. **Do not treat purge as a normal uninstall step.** Ordinary
+outstanding (`restore` finishes one, section 9). If any check fails it refuses
+with a `purge_refused:*` reason and deletes nothing. **Do not treat purge as a normal uninstall step.** Ordinary
 uninstall does not need it.
 
 ## 9. Coming from an older database
@@ -949,7 +1021,8 @@ A step is one way. Once a newer release has opened the store, an older one
 refuses it (`SCHEMA_UNSUPPORTED`) without touching it: a 3.1 process cannot
 open a store 3.2 has opened. Stop every host and worker of a store before
 upgrading, upgrade them together, and keep the pre-upgrade `backup`; going
-back means restoring it, and writes made since are lost.
+back means restoring it with `restore` (below): what was forgotten since stays
+forgotten, and every other write made since is lost.
 
 To bring a store forward now, with a snapshot first and the worker stopped:
 
@@ -970,15 +1043,99 @@ back into the header (`header_restamped` in its report) and, if that schema
 is an older one, brings the store forward as usual. A store that is not this
 product's, or records no schema this release knows, is still refused.
 
+### Going back to a backup
+
+A `backup` snapshot still holds whatever was forgotten after it was taken, so put
+it back with `restore`, never by copying the file over the store: a copy brings
+those words back. `restore` replays the store's deletion ledger over the snapshot,
+and every deletion, suppression and withdrawal made since stays; every other write
+made since the snapshot is lost.
+
+```bash
+python -I -X utf8 -m scope_recall.maintenance.cli restore --host hermes --instance-root <instance root> --snapshot <backup file>
+python -I -X utf8 -m scope_recall.maintenance.cli restore --host hermes --instance-root <instance root> --snapshot <backup file> --backup-dir <a new directory> --apply
+```
+
+A shared store is named by `--root <store directory>` instead; an entry's home is
+refused (`shared_store_entry`). Without `--apply` the command only checks and says
+what it would do. Stop every host, resident recall server and worker of the store
+first (`autostart pause`), then:
+
+- It changes nothing and says why while a process that recorded itself as running
+  on the store still runs (`store_open`) or another process writes it
+  (`store_busy`), while another name refers to the store's file, a hard link, which
+  is no backup since it changes with the store (`store_links`), and for a snapshot
+  that is not a whole `backup` snapshot of this very store: the store's file or its
+  log under any name (`snapshot_is_the_store`), a live store's file or another
+  program's (`snapshot_not_a_backup`), a copy cut short (`snapshot_damaged`),
+  another store's (`snapshot_identity`), one taken before an entry brought a scope of
+  its own (`snapshot_scopes`) or before an entry still attached was attached
+  (`snapshot_entries`; detach it first), or one at a schema it cannot replay into
+  (`snapshot_schema`). Where the file system cannot say whether the snapshot is one
+  of the store's files, it changes nothing either (`file_identity_unknown`). The
+  snapshot stays open from its checks to its copy, so what is copied is what was
+  checked and what the receipt's `snapshot_sha256` describes: another SQLite writer
+  is kept out, and a file moved over the snapshot is not the one read; one moved
+  over it as it is opened is refused (`snapshot_replaced`).
+- It backs the store up into `--backup-dir` as it is and closes it: it writes the
+  ledger beside it (`restore-ledger.json`) and then the marker
+  (`restore-required.json`), each through a file of its own that is synced and then
+  moved into place, so a crash leaves either file whole or not there. Every host
+  then refuses the store (`RESTORE_UNVERIFIED`). It copies the snapshot over the
+  store and replays the ledger, and opens the store again only once
+  `memory.sqlite3-wal`, which held the snapshot's pages, is truncated: a reader
+  still on an older snapshot holds that back, and the run stops with the store
+  closed (`wal_busy`). The ledger stays beside the store, content-free, until the
+  next restore writes its own or a purge (section 8) removes it with the store. The
+  receipt names the backup, the ledger's digest and the deletes it replayed
+  (`purges_queued`): start the worker again, and its next pass removes their vectors
+  and attachments once more. The vector companion and `retained\` are otherwise
+  left as they are; an attachment only the replaced store refers to stays there,
+  for that store if it is restored in turn from its backup.
+- A run cut short leaves the store closed: `restore_pending: true` in the output,
+  `restore_pending` in `doctor`. Run the same command again: it finishes with the
+  ledger it kept, and asks for `--backup-dir` only while the store is still as it
+  was. To keep the store as it was instead, give it the backup it took as
+  `--snapshot`. A marker left empty or partial is written again while nothing has
+  replaced the store; beside a kept ledger newer than the store, the store was
+  replaced after it was closed, and the run is refused (`marker_damaged`).
+
+Going back across a schema step takes two releases: only the newer one reads the
+latest store, and only the older one writes a store at the snapshot's schema. Run
+`restore` with the newer release first. For a snapshot at an older schema it backs
+the store up, closes it and keeps the ledger beside it (`status: prepared`), and
+goes no further; then install the release that reads the snapshot and run the same
+command again, which replays that ledger over the snapshot. Every release from
+3.11.0 on replays a ledger another release kept in the same format. When both
+releases write the same schema, as every release from 3.2.0 to 3.11.0 does (1110),
+the newer one does the whole restore. A snapshot at a schema below 1110, from 3.1 or
+earlier, is refused (`snapshot_schema`): no release that reads it carries
+`restore`, and going back to it would bring back what was forgotten since.
+
 ## 10. Platform and storage boundaries
 
 - **The store is a WAL-mode SQLite file.** `memory.sqlite3-wal` and
   `memory.sqlite3-shm` sit beside `memory.sqlite3` while any process has it
   open. Never copy the files by hand while the host or the worker runs;
   `scope-recall backup` takes a consistent snapshot and writes it in
-  rollback-journal mode. Readers and the writer coexist, so an operator
-  query no longer fails a worker pass.
+  rollback-journal mode, and `scope-recall restore` puts one back (section 9). Readers and the writer coexist, so an operator
+  query no longer fails a worker pass. After a `forget`, the worker's purge
+  truncates `memory.sqlite3-wal`, which still held the deleted words; what is
+  written to it afterwards holds none of them. A read transaction left open on
+  an older snapshot holds the truncation back until a later pass.
+  [deletion-contract.md](deletion-contract.md) says what a purge removes and
+  what it does not.
 
+- **The `sqlite-bruteforce` vector companion** is a rebuildable WAL-mode
+  `vector.sqlite3` file. Recall reads every committed embedding through the WAL
+  while the worker writes, and each read's lock wait is capped by the recall's
+  remaining time. A read needs `vector.sqlite3-wal` and the
+  `vector.sqlite3-shm` WAL index beside the file, or permission to create them
+  there, as the worker has; SQLite creates them for a read when they are
+  absent. A reader that closes last leaves them behind; a writer removes them
+  when it is the last connection and closes cleanly. On POSIX SQLite gives
+  them the database file's owner-only mode; on Windows they inherit the
+  directory's ACL.
 - **LanceDB** needs the `lancedb` extra. Keep the data directory short, for
   example `C:\ScopeRecall\my-agent`: LanceDB appends index, table and temporary
   file names below it, and the worker reports `native_vector_path_too_long`
@@ -997,13 +1154,16 @@ share one store, Hermes agents and from 3.3.0 Codex and Claude Code, each attach
 it as an entry, with every memory marked with the agent it came in through:
 [shared-store.md](shared-store.md). Claude Code installs only this way. An attached home keeps
 only a pointer, `scope-recall\attachment.json`; `plan-install`, `apply-install` and
-`doctor` recognize it.
+`doctor` recognize it. Clients alone can share a store: the first one attached to a new store
+brings the owner's scope, and the clients attached after it share it
+([shared-store.md](shared-store.md#a-store-of-clients-alone)).
 
 ## 12. WorkBuddy
 
 WorkBuddy runs the hooks and the MCP server of the `codex` adapter as an entry of a shared
-store, the owner at this machine. Attach its home first ([shared-store.md](shared-store.md)),
-from an environment with the `codex` extra, then install. WorkBuddy's agent reads its hooks from
+store, the owner at this machine. Attach its home first, beside the store's other entries or as
+the first entry of a new store ([shared-store.md](shared-store.md)), from an environment with the
+`codex` extra, then install. WorkBuddy's agent reads its hooks from
 `settings.json` in WorkBuddy's own home. Its MCP servers are those listed in `mcp.json` there:
 WorkBuddy starts each one, once you have approved it in its MCP settings, and serves its tools to
 the agent. (`.mcp.json` beside it is WorkBuddy's record of its own connector proxy; its agent
@@ -1062,19 +1222,16 @@ session ends (a day at most). The MCP server serves the tools that read the stor
 `propose_memory`, `revise` or `forget`: WorkBuddy names no conversation with a call
 ([shared-store.md](shared-store.md)).
 
-The prompt's recall comes from a resident recall server (from 3.6.0), which keeps the entry's
-vector search and embedding connection warm. WorkBuddy 5.6.2 runs its MCP servers inside a
+The prompt's recall comes from a resident recall server, which keeps the entry's
+vector search and embedding connection warm. WorkBuddy runs its MCP servers inside a
 conversation's agent process: it starts one when a conversation opens or a prompt comes to a
-conversation without one, and stops it at its own time. A server started there met the prompt
-that started it still opening its vector store, and a cold server answered with its vector search
-only 12.7 s after its start, past the hook's 6 s. The resident server is a process of its own,
-started apart from the MCP server. It still lives only as long as the conversation's agent process
-that started it: WorkBuddy's agent puts itself and every process it starts in a Windows job that
-ends them all when the agent's process ends, and the server cannot leave that job (agent 2.147.0,
-measured 2026-10-04). While one conversation's process runs, another conversation's first prompt
-finds the server warm (1.48 s, with its vector search, measured the same day); the first
-conversation after WorkBuddy starts, and a prompt right after the conversation holding the server
-ended, are recalled without it (see Known limits):
+conversation without one, and stops it at its own time. Cold vector and embedding startup can
+exceed the prompt hook's budget. The resident server is a process of its own, started apart
+from the MCP server. On Windows, the resident server may still belong to the launching
+conversation's job if that job prevents breakaway, in which case closing the job also ends
+the resident server. Another conversation can reuse a running warm server. A prompt that
+finds no usable resident server uses the hook's fallback recall and can start the server
+for later prompts (see Known limits):
 
 - The prompt hook starts it after its answer when none runs, at most once a minute. The MCP
   server WorkBuddy runs with a conversation starts it too, and looks again every 30 s while that
@@ -1173,8 +1330,8 @@ rest). It does not offer `propose_memory`, `revise` or `forget`: dsh's MCP clien
 conversation with a call, and the store takes such a change only on the word of the person's latest
 message in the same conversation ([shared-store.md](shared-store.md)).
 
-Attach dsh's entry first ([shared-store.md](shared-store.md)), from an environment with the
-`codex` extra, then install:
+Attach dsh's entry first, beside the store's other entries or as the first entry of a new store
+([shared-store.md](shared-store.md)), from an environment with the `codex` extra, then install:
 
 ```powershell
 $Entry  = "D:\ScopeRecall\dsh"
@@ -1249,11 +1406,14 @@ What the plugin does:
   pass, and the next waits longer, up to 30 minutes. A dsh that quits waits up to 3 s for a store that is
   running; what it left is taken up by the next dsh that runs, once that process is gone (or the
   file has been idle for 6 hours). A message sent twice is stored once.
-- A completed turn's reply goes with its `Stop` when it was said at most a minute before: the store
-  recognises it among the turn's messages by its words and a moment 120 s away at most, and the
-  reply's moment is the hook's. A reply said earlier (before a long tool call that ended the turn,
-  say), and the last words of a turn that did not complete, are stored from the turn's messages alone,
-  as the model's words.
+- A completed turn's reply goes with its `Stop` when it was said at most a minute before, with the id
+  of the message that holds it. The store dates the reply by that message; when the `Stop` names no
+  message holding the reply's words, or the message carries no time the store can read, by the
+  moment the `Stop` ran. A reply already stored under its turn keeps the moment it was stored with
+  when a later `Stop` sends it again (the rest of a turn, or a pass over what a failed store left),
+  and its message is held as that reply, so each is stored once. A reply said earlier (before a long
+  tool call that ended the turn, say), and the last words of a turn that did not complete, are
+  stored from the turn's messages alone, as the model's words.
 - Bounds: a message's text is kept up to 20,000 characters (and 36 KB), with a marker for the rest;
   a message waiting longer than 14 days, or past 5,000 waiting in a session, is dropped and said in
   dsh's log.
@@ -1304,6 +1464,8 @@ Known limits:
 | Codex installation record | `<instance-root>\codex-installation.json` |
 | Codex Core data directory | `<instance-root>\data\` |
 | Runtime config | `<core-data-directory>\runtime-config.json` |
+| A restore's files | `<core-data-directory>\restore-required.json` while it is not finished; `restore-ledger.json`, the ledger it replays, until the next restore |
+| The owner's local sessions bound to no scope | `<core-data-directory>\unbound-sessions\<pid>.json`, one per host process that bound one, read by `doctor` while that process runs |
 | WorkBuddy home | `WORKBUDDY_CONFIG_DIR`, else `%USERPROFILE%\.workbuddy` |
 | WorkBuddy hooks and MCP server | `hooks` in `<WorkBuddy home>\settings.json`, `mcpServers.scope-recall` in `<WorkBuddy home>\mcp.json` |
 | dsh home | `DSH_HOME`, else `%USERPROFILE%\.dsh` |

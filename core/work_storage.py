@@ -73,12 +73,8 @@ CAPACITY_REFUSALS = frozenset({"http_429", "rate_limited", "http_502", "http_503
 #: no migration is needed and an operator reading the row sees the history.
 _CAPACITY_TOKEN = re.compile(r"(?:^|\|)capacity:([0-9]+)(?=\||$)")
 
-#: First wait after a provider refuses for capacity, and the longest one.
-#: Sized against a measured outage: the median interval between one item's
-#: retries was 115 minutes, so the floor sits above that cycle rather than
-#: below it (a 60 s floor would have made the instance ask *more* often).
-#: There is no limit on how many times an item may check: it is never given
-#: up on, only asked less often.
+#: First wait after a provider refuses for capacity, and the longest one.  Repeated refusals increase the wait
+#: within these bounds.  There is no retry-count limit: an item is delayed rather than abandoned.
 CAPACITY_BACKOFF_FLOOR_SECONDS = 1800.0
 CAPACITY_BACKOFF_CEILING_SECONDS = 4 * 3600.0
 
@@ -882,6 +878,9 @@ class WorkItems:
         already re-opened, it reads on to the rows it may re-open
         (``_failed_rows``), and each row it re-opens starts its attempts afresh
         (``_reopen_failed``).
+
+        Preview and apply share the candidate retry fence. Declined evaluations are counted with the first
+        ``MAX_RECOVERY_PAGE`` work ids and reasons; neither mode retires them or consumes a retry slot for them.
         """
         validate_page(limit)
         if type(include_terminal) is not bool or type(dry_run) is not bool:
@@ -896,6 +895,9 @@ class WorkItems:
             "applied": not dry_run,
             "already_retried": 0,
             "already_retried_work_ids": [],
+            "declined": 0,
+            "declined_work_items": [],
+            "retried_work_ids": [],
         }
         for row in self._failed_rows(conn):
             if report["retried"] >= limit:
@@ -910,11 +912,14 @@ class WorkItems:
                 if len(report["already_retried_work_ids"]) < MAX_OPERATOR_PAGE:
                     report["already_retried_work_ids"].append(int(row["work_id"]))
                 continue
+            if self._decline_candidate_retry(row, report):
+                continue
             if not dry_run and not self._reopen_failed(row["work_id"], row["work_type"], code, now=now):
                 continue
             kind = str(code or "").rsplit("|", 1)[-1]
             report["by_kind"][kind] = report["by_kind"].get(kind, 0) + 1
             report["retried"] += 1
+            report["retried_work_ids"].append(int(row["work_id"]))
         # The automatic recovery read every embed's subject as a source, so a claim embed a provider failed was made
         # obsolete instead of reopened (``_embed_retry_reason``).  A readable head it left without a vector is worked
         # on again, with the attempts of new work, and one an earlier conversion never queued is queued.
@@ -968,6 +973,18 @@ class WorkItems:
                 "UPDATE capture_inbox SET last_error_code=NULL WHERE token=?", [(row[0],) for row in refused]
             )
         return report
+
+    def _decline_candidate_retry(self, row, report: dict) -> bool:
+        """Report a candidate's read-only retry refusal with bounded detail; other work stays eligible."""
+        if row["work_type"] != "evaluate_candidate":
+            return False
+        rejection = self._tx.candidates.evaluation_retry_rejection(row["work_id"])
+        if rejection is None:
+            return False
+        report["declined"] += 1
+        if len(report["declined_work_items"]) < MAX_RECOVERY_PAGE:
+            report["declined_work_items"].append({"work_id": int(row["work_id"]), "reason": rejection})
+        return True
 
     def _failed_rows(self, conn) -> Iterator:
         """Every failed row of this context, ``RETRY_SCAN_PAGE`` at a time, in the order ``work_ready`` keeps them (by
@@ -1098,6 +1115,22 @@ class WorkItems:
             )
             .fetchone()[0]
         )
+
+    def rebuild_lost_vectors(self, *, now: str) -> int:
+        """Requeue prior embeddings after restoring a store without its vectors.
+
+        The restore owns an unopened destination. Previously completed or leased
+        embeddings become pending with fresh leases; expired outputs stay expired
+        and failed work keeps its retry history. Already pending work also counts
+        toward the restore receipt.
+        """
+        self._tx._check(write=True).execute(
+            f"""UPDATE work_items AS w SET state='pending',attempt=0,available_at=?,
+                lease_token=lease_token+1,lease_owner=NULL,lease_until=NULL,last_error_code=NULL
+                WHERE w.work_type='embed' AND w.state IN ('done','leased') AND {_NOT_EXPIRED}""",
+            (now,),
+        )
+        return self.embed_queue()["pending"]
 
     def start_respace(self, space_id: str, *, now: str, restart: bool = False) -> dict:
         """Start a run into ``space_id`` over every embedding done so far, from the newest down (``respace_refusal``

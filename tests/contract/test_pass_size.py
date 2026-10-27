@@ -1,13 +1,12 @@
 """A pass carries as much work as its per-pass costs deserve, in as few requests as allowed.
 
 Every pass pays for its own process start and its own queue report whatever it carries, so a
-pass of 32 paid those twice as often as a pass of 64 and six times as often as one of 200.  The
-bound was 32 because each source was its own request and each vector its own commit; once a
-group shares both, the bound is only deciding how often the fixed costs are paid.
+pass of 32 pays those twice as often as a pass of 64 and six times as often as one of 200.  A
+group shares its requests and its commit, so the bound only decides how often the fixed costs
+are paid.
 
-The provider takes a hundred texts per request and refuses more -- measured, not assumed: 32
-answered in 2.6s, 100 in 3.8s, 250 refused with HTTP 400 -- so a longer group is sent as
-consecutive full requests instead of being refused for its shape.
+The provider takes a hundred texts per request and refuses more (250 are refused with HTTP 400),
+so a longer group is sent as consecutive full requests instead of being refused for its shape.
 """
 
 from __future__ import annotations
@@ -159,20 +158,14 @@ class GroupEmbed:
 
 
 def test_a_group_asks_its_requests_at_the_same_time():
-    """The last serial cost in a pass.
-
-    A pass of a thousand documents is ten requests of a hundred; asked one at a time they were
-    38 of its 55 seconds, while the provider allows three thousand requests a minute.  The
-    answers must still come back in the order they were asked, and no more than
-    ``EMBED_REQUEST_CONCURRENCY`` may be in flight, because each one is a helper process.
-    """
+    """Concurrent document batches preserve order and stay within the helper limit."""
     import threading
-    import time
 
     class Concurrent(Recording):
         def __init__(self) -> None:
             super().__init__()
             self._lock = threading.Lock()
+            self._ready = threading.Event()
             self.live = 0
             self.most = 0
 
@@ -180,8 +173,10 @@ def test_a_group_asks_its_requests_at_the_same_time():
             with self._lock:
                 self.live += 1
                 self.most = max(self.most, self.live)
+                if self.live == EMBED_REQUEST_CONCURRENCY:
+                    self._ready.set()
             try:
-                time.sleep(0.05)  # a request is mostly waiting
+                assert self._ready.wait(remaining_seconds), "the first wave must overlap within its request budget"
                 return super()._embed_many(texts, remaining_seconds=remaining_seconds)
             finally:
                 with self._lock:
@@ -194,8 +189,7 @@ def test_a_group_asks_its_requests_at_the_same_time():
     count = 6 * MAX_EMBED_BATCH
     vectors = adapter.embed_texts([f"TEST {index}" for index in range(count)], remaining_seconds=60)
     assert len(vectors) == count
-    # Requests in flight at once are what the concurrency is.  The wall clock is not: on a loaded Windows runner six
-    # requests that overlapped took 0.78 s, more than the six asked one at a time would (3.4.0rc13's CI).
+    # Holding the first wave proves overlap without assuming how quickly worker threads start.
     assert adapter.most > 1, "the requests were still made one at a time"
     assert adapter.most <= EMBED_REQUEST_CONCURRENCY, f"{adapter.most} requests were in flight at once"
     # Order is what lets a vector be matched to the source that asked for it.
@@ -211,8 +205,8 @@ def test_one_request_is_not_sent_through_a_pool():
 
 def test_long_texts_are_split_to_stay_within_the_ledger_s_request_size():
     """The ledger refuses a body over its max_request_bytes before it is sent, and the worker then defers the
-    whole group an hour.  A hundred long sources made about 600 KB against 128 KB, every pass, for eight hours
-    on the pilot's store; the rebuild stalled on them without one request leaving."""
+    whole group an hour.  A hundred long sources make about 600 KB against 128 KB, every pass, so the rebuild
+    would stall on them without one request leaving."""
     limit = 131072
     adapter = _adapter(max_request_bytes=limit)
     texts = [f"TEST {index} " + "长文" * 1500 for index in range(MAX_EMBED_BATCH)]

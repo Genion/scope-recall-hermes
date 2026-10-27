@@ -8,6 +8,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any, Literal, NamedTuple, cast
 
 from scope_recall.contracts import Origin, SourceEvent, TrustedContext
@@ -20,10 +21,12 @@ SourceIdentity = tuple[str, int]
 
 @dataclass
 class SourceObservationLedger:
-    """Per-session source identity dedupe confirmed only after Core persistence."""
+    """Per-session dedupe and first observed instants, without retaining message content."""
 
     _confirmed: dict[SourceIdentity, None] = field(default_factory=dict)
     _pending: set[SourceIdentity] = field(default_factory=set)
+    _moments: dict[SourceIdentity, tuple[str, str | None]] = field(default_factory=dict)
+    _time_lock: Any = field(default_factory=Lock, repr=False)
 
     def observe(
         self,
@@ -45,6 +48,7 @@ class SourceObservationLedger:
             return None, gaps, None
         if len(self._pending) >= 64:
             return None, (*gaps, "capture_gap:observation_pending_capacity"), None
+        recorded_at, occurred_at = self.witness(identity, recorded_at, occurred_at)
         self._pending.add(identity)
         event: SourceEvent = {
             "protocol_version": "1.1",
@@ -63,6 +67,18 @@ class SourceObservationLedger:
             event["artifact_refs"] = list(artifact_refs)
         return event, gaps, identity
 
+    def witness(self, identity: SourceIdentity, recorded_at: str, occurred_at: str | None) -> tuple[str, str | None]:
+        """Keep only the first seen instants across callbacks, including replies queued for sync.
+
+        Post-model callbacks use their own lock; the timestamp cache is independent of capture's
+        pending/confirmed sets and never holds words or waits for store I/O.
+        """
+        with self._time_lock:
+            first = self._moments.setdefault(identity, (recorded_at, occurred_at))
+            while len(self._moments) > 4096:
+                self._moments.pop(next(iter(self._moments)))
+            return first
+
     def confirm(self, identity: SourceIdentity) -> None:
         self._pending.discard(identity)
         self._confirmed.pop(identity, None)
@@ -79,6 +95,8 @@ class SourceObservationLedger:
     def reset(self) -> None:
         self._confirmed.clear()
         self._pending.clear()
+        with self._time_lock:
+            self._moments.clear()
 
 
 def host_source_key(
@@ -94,7 +112,7 @@ def host_source_key(
     safe_id = event_id.strip() or "unknown"
     # Entries of a shared store share its installation id and can see the same
     # host session and turn ids -- the owner talking to two bots -- so there the
-    # entry is part of the key.  A local store's keys are unchanged.
+    # entry is part of the key.  A local store's keys leave it out.
     owner = f"{installation_id}:{entry_id}" if entry_id is not None else installation_id
     return f"hermes:{owner}:{session_id}:{safe_kind}:{safe_id}@{revision}"
 
@@ -158,6 +176,17 @@ def pre_llm_source_event(
     )
 
 
+def sync_assistant_key(context: TrustedContext, session_id: str, turn_id: str) -> str:
+    """The same reply identity for the host's post-model observation and its delayed sync."""
+    return host_source_key(
+        installation_id=context.binding.installation_id,
+        entry_id=context.entry_id,
+        session_id=session_id,
+        event_kind="sync_assistant",
+        event_id=turn_id or "turn",
+    )
+
+
 def sync_turn_source_events(
     ledger: SourceObservationLedger,
     context: TrustedContext,
@@ -192,13 +221,7 @@ def sync_turn_source_events(
         gaps.extend(user_gaps)
     if outcome == "success" and assistant_content.strip():
         assistant_event, assistant_gaps, assistant_identity = ledger.observe(
-            source_event_key=host_source_key(
-                installation_id=context.binding.installation_id,
-                entry_id=context.entry_id,
-                session_id=session_id,
-                event_kind="sync_assistant",
-                event_id=turn_id or "turn",
-            ),
+            source_event_key=sync_assistant_key(context, session_id, turn_id),
             source_revision=1,
             role="assistant",
             content=assistant_content,
@@ -274,7 +297,7 @@ _COMPRESSED_SUMMARY = "_compressed_summary"
 #: The lines that bound a folded summary (``agent.context_compressor``: ``_MERGED_PRIOR_CONTEXT_HEADER``,
 #: ``_MERGED_SUMMARY_DELIMITER``, ``_SUMMARY_END_MARKER``) and the header of a to-do list a compression appends to the
 #: last user message (``tools.todo_tool.TODO_INJECTION_HEADER``), as Hermes 0.21.5 writes them.  Should Hermes change
-#: them, a folded message is no longer recognised: the turn is then the person's, as before.
+#: them, a folded message is no longer recognised: the turn is then the person's.
 _PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT \u2014 for reference only; not a new message]"
 _SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT \u2014 COMPACTION SUMMARY BELOW]"
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY \u2014 respond to the message below, not the summary above ---"
@@ -315,14 +338,15 @@ def host_notice(history: object, user_message: object) -> bool:
     Hermes marks the user messages it writes itself with a display kind: a finished background process, a
     delegation's result, a wake-up, a plugin's message (``gateway.response_filters.display_kind_for_event``, the
     CLI's ``TimelineNotification``).  A steer is the one kind that holds the person's words
-    (``ContextCompressor._is_actionable_user_turn``).  Stored as the person's, a notice read as something they said.
+    (``ContextCompressor._is_actionable_user_turn``).  Stored as the person's, a notice would read as something they
+    said.
 
     The latest user message with words of its own decides: the turn is Hermes's when those words are the turn's
     text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message has no
-    words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: when Hermes put a note
-    of its own before the person's message (a model switch, a timestamp), an unanswered notice with the same words
-    took theirs, and so did an older folded one.  A request Hermes restores after a notice
-    decides in its place, and the notice stays the person's: the safe side.
+    words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: otherwise, when Hermes
+    puts a note of its own before the person's message (a model switch, a timestamp), an unanswered notice with the same
+    words would take theirs, and so would an older folded one.  A request Hermes restores after a notice decides in its
+    place, and the notice stays the person's: the safe side.
 
     Past the last reply the message must be one Hermes folded and marked.  A compression at the turn's start can
     fold its summary into the turn's own message (``ContextCompressor._merge_summary_into_tail_row``) and put the
@@ -540,6 +564,17 @@ def interim_messages(history: object, *, answer: str) -> tuple[tuple[str, str | 
     return tuple(said)
 
 
+def interim_source_key(context: TrustedContext, session_id: str, turn_id: str, ordinal: int) -> str:
+    """The stable identity of an intermediate reply, shared with content-free observation."""
+    return host_source_key(
+        installation_id=context.binding.installation_id,
+        entry_id=context.entry_id,
+        session_id=session_id,
+        event_kind="interim",
+        event_id=f"{turn_id or 'turn'}:{ordinal}",
+    )
+
+
 def interim_source_event(
     ledger: SourceObservationLedger,
     context: TrustedContext,
@@ -553,13 +588,7 @@ def interim_source_event(
 ) -> tuple[SourceEvent | None, tuple[str, ...], SourceIdentity | None]:
     """One thing the assistant showed on the way through a turn, named by its turn and place in it."""
     return ledger.observe(
-        source_event_key=host_source_key(
-            installation_id=context.binding.installation_id,
-            entry_id=context.entry_id,
-            session_id=session_id,
-            event_kind="interim",
-            event_id=f"{turn_id or 'turn'}:{ordinal}",
-        ),
+        source_event_key=interim_source_key(context, session_id, turn_id, ordinal),
         source_revision=1,
         role="assistant",
         content=content,

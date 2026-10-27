@@ -12,11 +12,12 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from ..contracts import ContractError
-from .embedding_budget import bounded_embedding_text
+from .embedding_budget import bounded_embedding_text, kept_length
 from .endpoint_policy import endpoint_url_shape_ok
 from .events import CJK_RUN, lexical_terms, query_terms, version_suffixes
 from .owner_view import OWNER_NAME_LENGTH, OWNER_NAMES_LIMIT
 from .retrieval import CandidateRef, SearchContext
+from .secret_patterns import secret_like_text_starts_before
 
 EMBEDDING_SPACE = {
     "model": "gemini-embedding-2",
@@ -56,13 +57,12 @@ def canonical_embedding_space(value: dict) -> dict:
 
     if type(value) is not dict or set(value) != set(EMBEDDING_SPACE):
         raise ContractError("INPUT_INVALID", "embedding_space")
-    # Shape and bounds, not identity. This used to require every field to equal
-    # the module default, which made the embedding model unconfigurable: a
-    # deployment could not choose its own provider even though the vector store
-    # keys everything on the space digest and would have rebuilt cleanly.
-    # Identity is still enforced, one layer out and where it belongs — a vector
-    # whose space digest differs from the one its `RecallPolicy` is bound to
-    # (`embedding_space_id`, the configured route's space in a runtime
+    # Shape and bounds, not identity: requiring every field to equal the module
+    # default would make the embedding model unconfigurable, though the vector
+    # store keys everything on the space digest and rebuilds cleanly for
+    # another provider.  Identity is enforced one layer out, where it belongs —
+    # a vector whose space digest differs from the one its `RecallPolicy` is
+    # bound to (`embedding_space_id`, the configured route's space in a runtime
     # instance) is refused admission in `RecallPolicy.vector_admission`.
     if type(value.get("model")) is not str or not 1 <= len(value["model"]) <= 200:
         raise ContractError("INPUT_INVALID", "embedding_space")
@@ -149,8 +149,7 @@ def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect
     dimensionality or the request shape and the digest changes, the store moves
     to a new directory, and vectors from the old space are refused admission
     instead of being silently compared across incompatible geometries. That
-    property is what makes swapping embedding models safe; it was already here,
-    and only the hardcoded descriptor stopped anyone from using it.
+    property is what makes swapping embedding models safe.
     """
     if dialect not in EMBEDDING_DIALECTS:
         raise ContractError("INPUT_INVALID", "embedding_dialect")
@@ -174,6 +173,13 @@ def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect
     )
 
 
+def _bound_input(raw_text: object) -> str:
+    """``raw_text`` as the input bound cuts it and every embedded body carries it: in NFKC form."""
+    if type(raw_text) is not str:
+        raise ContractError("INPUT_INVALID", "embedding_text")
+    return unicodedata.normalize("NFKC", raw_text)
+
+
 def encode_embedding_text(raw_text: str, *, kind: str) -> str:
     """Encode raw source/query text for Gem2 without changing raw identity.
 
@@ -183,13 +189,27 @@ def encode_embedding_text(raw_text: str, *, kind: str) -> str:
     ``core/embedding_budget.py``.
     """
 
-    if type(raw_text) is not str or kind not in {"document", "query"}:
+    if kind not in {"document", "query"}:
         raise ContractError("INPUT_INVALID", "embedding_text")
-    normalized = unicodedata.normalize("NFKC", raw_text)
-    bounded, _truncated = bounded_embedding_text(normalized)
+    bounded, _truncated = bounded_embedding_text(_bound_input(raw_text))
     if kind == "query":
         return f"task: question answering | query: {bounded}"
     return f"title: none | text: {bounded}"
+
+
+def embedding_sends_secret_like_text(raw_text: str) -> bool:
+    """Whether the part of ``raw_text`` that ``encode_embedding_text`` sends holds secret-like text.
+
+    A run counts when it starts in the part the input bound keeps, and is judged with the rest of the line the cut
+    falls in (``secret_like_text_starts_before``); the template around the text and the marker after a cut are this
+    module's own words.  Judged in the encoded body, a cut right after a key name puts the marker where its value
+    would be (``credential_env: …[truncated]``), and a cut inside a value exempt only whole leaves its start
+    (``credential_env: nu`` of ``null``); either reads as a credential, and a text is cut in the same place every
+    time, so its source could never be embedded.  Judged with the rest of its line, a key the cut runs through is
+    caught although too few of its characters are sent for its pattern.
+    """
+    text = _bound_input(raw_text)
+    return secret_like_text_starts_before(text, kept_length(text))
 
 
 def claim_embedding_text(payload: dict) -> str:
@@ -231,6 +251,11 @@ class RecallPolicy:
     """Admission thresholds are injected by the frozen space configuration."""
 
     vector_threshold: float | None
+    #: Automatic injection needs independent lexical coverage or vector evidence;
+    #: fusion ranks admitted evidence but cannot turn a weak hit into a strong one.
+    auto_lexical_min_coverage: float = 0.20
+    auto_lexical_min_terms: int = 2
+    auto_vector_threshold: float = 0.30
     lexical_min_terms: int = 1
     rrf_k: int = 60
     #: Digest of the space the query is embedded in; only vectors from that
@@ -245,6 +270,12 @@ class RecallPolicy:
         threshold = _finite_score(self.vector_threshold)
         if self.vector_threshold is not None and (threshold is None or not -1.0 <= threshold <= 1.0):
             raise ContractError("INPUT_INVALID", "vector_threshold")
+        for name, low in (("auto_lexical_min_coverage", 0.0), ("auto_vector_threshold", -1.0)):
+            value = _finite_score(getattr(self, name))
+            if value is None or not low <= value <= 1.0:
+                raise ContractError("INPUT_INVALID", name)
+        if type(self.auto_lexical_min_terms) is not int or self.auto_lexical_min_terms < 2:
+            raise ContractError("INPUT_INVALID", "auto_lexical_min_terms")
         if type(self.lexical_min_terms) is not int or self.lexical_min_terms < 1:
             raise ContractError("INPUT_INVALID", "lexical_min_terms")
         if type(self.rrf_k) is not int or self.rrf_k < 1:
@@ -263,6 +294,32 @@ class RecallPolicy:
             )
         ):
             raise ContractError("INPUT_INVALID", "owner_names")
+
+    def automatic_admission(self, candidate: CandidateRef, query: str) -> bool:
+        """Whether a channel's evidence is strong enough for automatic injection.
+
+        Named references and a named day's scoped conversation are already
+        narrowed by the request. Relations inherit admission from their seed.
+        One-term questions may match one term; longer ones need several.
+        """
+        if candidate.source in {"exact_ref", "scoped", "relation"}:
+            return True
+        if candidate.source == "vector":
+            score = _finite_score(candidate.vector_score)
+            return score is not None and score + VECTOR_SCORE_TOLERANCE >= self.auto_vector_threshold
+        terms = set(meaningful_query_terms(query))
+        matched = terms.intersection(candidate.matched_query_terms or ())
+        if not terms or len(matched) < min(len(terms), self.auto_lexical_min_terms):
+            return False
+        if len(matched) / len(terms) >= self.auto_lexical_min_coverage:
+            return True
+        # A substantive question can precede a long attachment. Its anchors
+        # must meet the same clause-specificity rule as lexical admission;
+        # unrelated attachment terms do not dilute that question's evidence.
+        return any(
+            hits >= min(count, self.auto_lexical_min_terms) and hits / count >= self.auto_lexical_min_coverage
+            for hits, count in _matched_substantive_clauses(query, matched)
+        )
 
     def vector_admission(self, candidate: CandidateRef) -> tuple[bool, str | None]:
         if candidate.source != "vector":
@@ -350,9 +407,16 @@ def query_is_relevant(query: str, content: str) -> bool:
     overlap = len(q.intersection(lexical_terms(content)))
     if hard_identifiers(query).intersection(hard_identifiers(content)):
         return True
-    if len(q) == 1:
+    return shares_enough(overlap, len(q))
+
+
+def shares_enough(overlap: int, terms: int) -> bool:
+    """Whether ``overlap`` of a query's ``terms`` meaningful terms is enough for a source something else already
+    narrowed down, as the session for its recent messages or the time a question names: one of one, else two and
+    three in ten."""
+    if terms == 1:
         return overlap == 1
-    return overlap >= max(2, math.ceil(len(q) * 0.30))
+    return overlap >= max(2, math.ceil(terms * 0.30))
 
 
 def _specificity_required(term_count: int) -> int:
@@ -370,6 +434,16 @@ def _substantive_chinese_clauses(query: str) -> tuple[tuple[str, ...], ...]:
     )
     substantive = tuple(terms for terms in clauses if len(terms) >= 5)
     return substantive if len(substantive) >= 2 else ()
+
+
+def _matched_substantive_clauses(query: str, matches: Iterable[str]) -> tuple[tuple[int, int], ...]:
+    """Matched and total term counts for clauses meeting the lexical specificity minimum."""
+    held = frozenset(matches)
+    return tuple(
+        (hits, len(terms))
+        for terms in _substantive_chinese_clauses(query)
+        if (hits := len(held.intersection(terms))) >= max(5, _specificity_required(len(terms)))
+    )
 
 
 def query_is_specific(
@@ -390,26 +464,21 @@ def query_is_specific(
     required = _specificity_required(len(terms))
     if matched_terms >= required and matched_terms / len(terms) >= 0.30:
         return True
-    matches = frozenset(matched_query_terms or ())
-    for clause_terms in _substantive_chinese_clauses(query):
-        clause_hits = len(matches.intersection(clause_terms))
-        if clause_hits >= max(5, _specificity_required(len(clause_terms))) and clause_hits / len(clause_terms) >= 0.30:
-            return True
-    return False
+    return any(hits / count >= 0.30 for hits, count in _matched_substantive_clauses(query, matched_query_terms or ()))
 
 
 #: Characters that only ask: 什么, 怎么, 哪个, 谁, 多少 and the sentence-final
 #: particles.  The index holds overlapping bigrams, so "这个实例当前是什么模型"
-#: searched 是什, 什么 and 么模 too -- terms every earlier question shares and
-#: no answer does -- so "你现在是什么模型呀" came back as the best match.
+#: would search 是什, 什么 and 么模 too -- terms every earlier question shares
+#: and no answer does -- and "你现在是什么模型呀" would come back as the best match.
 #: A bigram holding one of these asks rather than names, so it proves nothing.
 #: The few nouns built on them (酒吧, 哪吒) are the price of that rule.
-_ASKING_CHARACTERS = frozenset("什么吗呢呀吧嘛哪啥谁")
+_RETRIEVAL_ASKING_CHARACTERS = frozenset("什么吗呢呀吧嘛哪啥谁")
 #: Asking words whose characters also appear in naming words (怎 in 怎样 only,
 #: but 多 in 多少 and 多个, 是 in 是否 and 于是).
-_ASKING_WORDS = frozenset({"怎样", "如何", "为何", "多少", "是否", "何时", "几时"})
+_RETRIEVAL_ASKING_WORDS = frozenset({"怎样", "如何", "为何", "多少", "是否", "何时", "几时"})
 #: English asking and helper words: in a question they carry no subject matter.
-_ASKING_ENGLISH = frozenset(
+_RETRIEVAL_ASKING_ENGLISH = frozenset(
     {
         "what",
         "which",
@@ -447,9 +516,90 @@ _ASKING_ENGLISH = frozenset(
 
 
 def _asks_only(term: str) -> bool:
-    if term in _ASKING_WORDS or term in _ASKING_ENGLISH:
+    if term in _RETRIEVAL_ASKING_WORDS or term in _RETRIEVAL_ASKING_ENGLISH:
         return True
-    return _CJK_TEXT.search(term) is not None and any(char in _ASKING_CHARACTERS for char in term)
+    return _CJK_TEXT.search(term) is not None and any(char in _RETRIEVAL_ASKING_CHARACTERS for char in term)
+
+
+#: English words that only frame a request to be told about what a question names ("Describe Orchard", "Any updates
+#: on Orchard?"), which an answer need not say: it names what it answers.  Read by ``asked_terms`` alone: recall
+#: searches them as it searches any word (``meaningful_query_terms``), since a message that says one may be what was
+#: asked for ("show me the summary" finds "Summary: the deployment ended at noon.").  status names something itself
+#: (a status page, a status code) and is none of them.
+_FRAMING_ENGLISH = frozenset(
+    {
+        "please",
+        "tell",
+        "show",
+        "give",
+        "you",
+        "know",
+        "remember",
+        "remind",
+        "say",
+        "said",
+        "describe",
+        "explain",
+        "summarize",
+        "summarise",
+        "any",
+        "anything",
+        "something",
+        "everything",
+        "update",
+        "updates",
+        "latest",
+        "news",
+        "progress",
+        "situation",
+        "overview",
+        "summary",
+        "info",
+        "information",
+        "details",
+    }
+)
+#: What ``asked_terms`` reads a question without, whole, so that the bigrams joining a Chinese one to its neighbours go
+#: with it (是多 in 端口是多少, 绍一 and 一下 in 介绍一下): the Chinese words that ask
+#: (``_RETRIEVAL_ASKING_WORDS``); the Chinese
+#: words that only frame a request (介绍一下, 说说, 告诉, 关于, 知道, 怎么样, 进展, 消息 ...), where 情况 frames
+#: "X 的情况" but not 情况下, a condition an answer says too; and the person a request to be told is addressed to:
+#: tell me, 给我讲讲, and me or us closing a request ("Explain Orchard to me").  Elsewhere me and 我 name whom a
+#: request is about (contact me, 给我订), and an answer says them.  Recall reads the question with all of them.
+_FRAMING_PHRASES = re.compile(
+    "|".join(
+        (
+            *sorted(_RETRIEVAL_ASKING_WORDS),
+            "怎么样",
+            "(?:给我|跟我|帮我)?(?:介绍|说说|讲讲|谈谈|聊聊|看看)",
+            "告诉我?",
+            "一下",
+            "关于",
+            "知道",
+            "还记得",
+            "记得",
+            "情况(?!下)",
+            "进展",
+            "消息",
+            "最新",
+            "动态",
+            r"\b(?:tell|show|give|remind) (?:me|us)\b",
+            r"\b(?:let (?:me|us) know|fill (?:me|us) in|catch (?:me|us) up|walk (?:me|us) through)\b",
+            r"\b(?:to|for) (?:me|us)\b(?=\W*$)",
+        )
+    ),
+    re.I,
+)
+
+
+def asked_terms(question: str) -> tuple[str, ...]:
+    """The terms a question asks an answer to say (``recall_needs.answering``): its meaningful terms
+    (``meaningful_query_terms``) read without what asks or only frames a request (``_FRAMING_PHRASES``,
+    ``_FRAMING_ENGLISH``).  "Tell me about Orchard" asks nothing past its name, as "What is Orchard?" does; "What do you
+    know about Orchard's port?" asks for its port."""
+    return tuple(
+        term for term in meaningful_query_terms(_FRAMING_PHRASES.sub(" ", question)) if term not in _FRAMING_ENGLISH
+    )
 
 
 #: Longest text still read as a bare question rather than a message that also
@@ -477,8 +627,8 @@ def _without_closing(text: str, marks: frozenset[str] = _CLOSING_MARKS) -> str:
 def asks_without_answering(text: str) -> bool:
     """Whether a message only asks.
 
-    Asking again, one instance returned five earlier questions like the query and
-    not the reply that answered one: a question shares every content word with
+    Asked again, a question can return five earlier questions like it and not
+    the reply that answered one: a question shares every content word with
     a later one and is short, so it outranks its own answer.  A short message
     with a question mark, or ending on an asking particle, is such a question.
     "去看下那台机器怎么了" is a request, and "不管什么情况都要先备份" a rule.
@@ -504,7 +654,8 @@ def same_message(text: str, other: str) -> bool:
 
     The automatic recall sets an older copy of the current message aside (``RetrievalPipeline._hydrate_admit``):
     the message already says it.  Compared character for character, "我家窗外有什么" and "我家窗外有什么？" (both ask)
-    were two messages, and the copy without the question mark took a packet slot as if it answered the one with it.
+    would be two messages, and the copy without the question mark would take a packet slot as if it answered the one
+    with it.
     "我的航班改到周五早上八点了。" asked back as "……八点了？" is not a copy: the person's statement stays found, at
     any length.  Letter case still tells two messages apart ("Release-2" is not "release-2").  A
     message of closing marks alone is compared as it is.
@@ -608,8 +759,8 @@ def _spelled_out_forms(text: str) -> frozenset[str]:
     """The same names, also as they read with a space or dash between letters and their digits.
 
     A reply writes "DLSS 5" and "glm-5.3-flash" where the question wrote DLSS5
-    and glm5.3-flash; compared as written, the reply was refused as naming a
-    different thing.  Only the text being offered is read both ways: read that
+    and glm5.3-flash; compared as written, the reply would be refused as naming
+    a different thing.  Only the text being offered is read both ways: read that
     way, a query asking for "the top 5 options" would start demanding that an
     answer contain "top5", and a query about H100 would ask for "H100as".
     """

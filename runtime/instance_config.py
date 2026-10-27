@@ -84,14 +84,9 @@ _SECONDS_BOUNDS = {
 
 
 _COUNT_BOUNDS = {
-    # A pass's own bound, matching the core's (``core/worker.py``: 1..1000).  Held
-    # at 32 while every embedding was its own request and every vector its own
-    # commit; now that a group shares both, what a bigger pass amortises is the
-    # cost of starting a pass at all -- measured at 8 of the 18 seconds a pass of
-    # two hundred took.  Model-bound work keeps its own per-pass bounds
-    # (``candidate_batch_limit``, and the deadline for consolidation), so this
-    # number decides how much cheap work shares one start, not how much money one
-    # pass may spend.
+    # A pass's own bound, matching the core's (``core/worker.py``: 1..1000).  Larger groups share embedding requests
+    # and vector commits to amortize worker startup.  Model-bound work retains its own limits
+    # (``candidate_batch_limit`` and the consolidation deadline), independently of this pass-size bound.
     "max_items": (1, 1000),
     "daily_work_limit": (0, 1_000_000),
     "max_auto_recoveries": (0, 4),
@@ -125,7 +120,7 @@ class RuntimeInstanceConfig:
     owner_id: str = "scope-recall-worker"
     request_seconds: float = 45.0
     #: The worker's own ceiling for a consolidation or candidate-evaluation request, when its model needs longer
-    #: than ``request_seconds``: one that reasons before it answers took 18 to 90 seconds (#240).  It bounds only
+    #: than ``request_seconds``: one that reasons before it answers took 18 to 90 seconds.  It bounds only
     #: those background requests; recall, capture and embedding keep ``request_seconds``.  None: the same bound.
     model_request_seconds: float | None = None
     drain_seconds: float = 120.0
@@ -136,16 +131,15 @@ class RuntimeInstanceConfig:
     auxiliary: AuxiliaryRuntimeConfig | None = None
     vector: VectorRuntimeConfig | None = None
     vector_threshold: float | None = None
+    auto_lexical_min_coverage: float = RecallPolicy.auto_lexical_min_coverage
+    auto_lexical_min_terms: int = RecallPolicy.auto_lexical_min_terms
+    auto_vector_threshold: float = RecallPolicy.auto_vector_threshold
     #: Names the store's owner is called by, beside the name the host attests for the person asking: a question that
     #: names them is recalled as they would ask it themselves (``core/owner_view.py``).  None by default.
     owner_names: tuple[str, ...] = ()
-    #: Queue items a day may attempt; 0 means no cap.  This is not the spend
-    #: guard: money, calls and tokens are governed by the auxiliary ledger
-    #: (``runtime/model_budget.py``) before every request.  A cap below the
-    #: arrival rate is not conservative, it is a permanent leak.  Measured on a
-    #: 3.1 instance: 1.4 work items per captured source (an embed and, for
-    #: most, a consolidation) plus 1.2 evaluations per candidate, so even the
-    #: old 256 default could not drain a busy day's output.
+    #: Queue items a day may attempt; 0 means no cap.  Money, calls and tokens are governed by the auxiliary ledger
+    #: (``runtime/model_budget.py``) before every request.  A daily work limit below the incoming work rate prevents
+    #: the queue from draining.
     daily_work_limit: int = 0
     auto_retry_cooldown_seconds: float = 3600.0
     max_auto_recoveries: int = 2
@@ -240,6 +234,9 @@ class RuntimeInstanceConfig:
         """
         return RecallPolicy(
             vector_threshold=self.vector_threshold,
+            auto_lexical_min_coverage=self.auto_lexical_min_coverage,
+            auto_lexical_min_terms=self.auto_lexical_min_terms,
+            auto_vector_threshold=self.auto_vector_threshold,
             embedding_space_id=self.embedding_space_id(),
             owner_names=self.owner_names,
         )

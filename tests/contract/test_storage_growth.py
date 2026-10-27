@@ -33,9 +33,9 @@ def _dependencies(core, episode_ref):
 
 
 def test_an_episode_lineage_row_is_written_once_at_the_revision_its_source_entered(app):
-    """Every attach copied the previous revision's links onto the new one, so a
-    200-event segment held 20,100 rows for 200 sources.  Each source now has one
-    row, a revision's evidence is every row at or below it, and a resume that
+    """An attach that copied the previous revision's links onto the new one would
+    make a 200-event segment hold 20,100 rows for 200 sources.  Each source has
+    one row, a revision's evidence is every row at or below it, and a resume that
     cites members adds nothing."""
     core, ctx = app
     ctx = replace(ctx, task_anchor="TEST-lineage")
@@ -120,18 +120,18 @@ def test_upgrade_1108_keeps_the_earliest_copy_of_every_episode_lineage_row(app):
         conn.commit()
     downgrade_store(core.storage.path, 1108)
     # A known older schema is brought forward by the first ordinary open.
-    assert core.status(ctx).schema_version == SCHEMA_VERSION == 1110
+    assert core.status(ctx).schema_version == SCHEMA_VERSION
     assert _lineage(core, episode.ref) == [(index + 1, s.ref) for index, s in enumerate(sources)]
     assert _dependencies(core, episode.ref) == [(2,)]
     with sqlite3.connect(core.storage.path) as conn:
         assert conn.execute("SELECT count(*) FROM evidence_links WHERE object_kind='claim'").fetchone()[0] == 2
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1110
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert {"source_content", "source_ids"} <= {row[1] for row in conn.execute("PRAGMA index_list(source_events)")}
         # the lexical index was rebuilt from the text projection the old store carried
         assert conn.execute("SELECT count(*) FROM lexical_postings").fetchone()[0] == postings
         assert conn.execute("SELECT count(DISTINCT source_id) FROM source_events").fetchone()[0] == 4
     assert set(core.episodes(ctx)[0].evidence_refs) == {ref(s) for s in sources}
-    assert core.initialize().schema_version == 1110
+    assert core.initialize().schema_version == SCHEMA_VERSION
 
 
 def test_an_episode_read_judges_its_members_in_one_query(app):
@@ -179,9 +179,9 @@ def test_a_resume_is_judged_by_what_it_cites(app):
 
 
 def test_a_long_episode_with_a_resume_is_delivered_on_its_cited_evidence(app):
-    """The packet refuses an object with more than 32 evidence refs, and an
-    episode's evidence used to be every member: a long episode's resume never
-    reached a packet.  It is delivered on what the resume cites."""
+    """The packet refuses an object with more than 32 evidence refs, so an
+    episode's evidence cannot be every member: a long episode's resume would never
+    reach a packet.  It is delivered on what the resume cites."""
     from scope_recall.core.recall_packet import fits_packet_schema
     from scope_recall.core.retrieval import SearchContext
     from scope_recall.core.retrieval_storage import RetrievalStorage

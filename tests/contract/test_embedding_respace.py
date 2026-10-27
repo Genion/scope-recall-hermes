@@ -1,9 +1,8 @@
 """A re-embed run after the embedding space changed (``respace-embeddings``).
 
-``work_items`` is unique on its type and subject, so an embedding done in one space stayed done when the model
-changed, and the new space never received it (#200, found and reproduced by @Vivamisu; the model switch below follows
-that reproduction).  An operator starts a run; each drain of a worker in that space reopens a page of the store's
-done embeddings, newest first and only while the embed queue has room.
+``work_items`` is unique on its type and subject, so an embedding done in one space stays done when the model
+changes, and the new space never receives it without a run.  An operator starts a run; each drain of a worker in that
+space reopens a page of the store's done embeddings, newest first and only while the embed queue has room.
 """
 
 from __future__ import annotations
@@ -147,6 +146,44 @@ def test_a_model_switch_re_embeds_what_was_embedded_once_an_operator_starts_a_ru
         new.close()
 
 
+def test_sqlite_runtime_recall_reads_the_store_held_by_a_worker(app):
+    import time
+
+    from scope_recall.core.retrieval import SearchContext, SearchLimits
+    from scope_recall.runtime.instance import _LazyVectorPort
+
+    core, ctx = app
+    claim, source = edge(core, ctx, "TEST-A", "TEST-B")
+    writer = _space_instance(core, ctx, "TEST-model")
+    reader = _space_instance(core, ctx, "TEST-model")
+    try:
+        writer.drain()
+        assert writer._vector_store.count_rows() == 2
+        context = SearchContext(
+            query="TEST-A",
+            mode="auto",
+            as_of=None,
+            focus_refs=(),
+            limits=SearchLimits(),
+            deadline=time.monotonic() + 10.0,
+            now=core.clock.utc_now(),
+            trusted_context=ctx,
+        )
+        pipeline = core.recall_pipeline
+        pipeline.vector_port = _LazyVectorPort(reader)
+        pipeline.policy = replace(
+            pipeline.policy, embedding_space_id=reader.config.embedding_space_id(), vector_threshold=0.0
+        )
+        hits = pipeline.vector_port.search(context, limit=10, remaining_seconds=10.0)
+        assert {hit.ref for hit in hits} == {claim.ref, source.ref}
+        result = pipeline.search(context)
+        assert not any(gap.startswith("vector_") for gap in result.gaps), result.gaps
+        assert reader._vector_store.count_rows() == 2
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_a_reopened_row_waits_like_new_work_with_its_lease_fenced_and_attempts_afresh(app):
     core, ctx = app
     edge(core, ctx, "TEST-A", "TEST-B")
@@ -174,7 +211,7 @@ def test_a_preview_counts_what_a_run_would_reopen_and_changes_nothing(app):
 
 def test_the_preview_counts_what_still_waits_which_a_run_started_now_would_pay_for_twice(app):
     """An embedding waiting at the start lies below the run: it is embedded into the new space in its turn, and the
-    run reopens it again when it gets there (review of 3.8.0)."""
+    run reopens it again when it gets there."""
     core, ctx = app
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
@@ -186,7 +223,7 @@ def test_the_preview_counts_what_still_waits_which_a_run_started_now_would_pay_f
 
 
 def test_one_run_at_a_time_and_one_per_space_unless_started_again_on_purpose(app):
-    """A start after a finished run into the same space began a second paid run without a word (review of 3.8.0)."""
+    """A start after a finished run into the same space does not begin a second paid run without a word."""
     core, ctx = app
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
@@ -308,7 +345,7 @@ def test_the_drain_s_upkeep_keeps_the_queue_to_its_ceiling_and_yields_to_evaluat
 
 def test_what_waits_in_a_partition_this_worker_cannot_see_holds_the_run(app):
     """A run reopens rows of every partition, so it is held by the store's queue: counted as the worker's own,
-    300 rows of another project went pending 64 a pass (review of 3.8.0)."""
+    300 rows of another project would go pending 64 a pass."""
     core, ctx = app
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
@@ -439,8 +476,8 @@ def test_doctor_names_a_run_no_worker_will_go_on_with():
 
 
 def test_doctor_names_an_embedding_backlog_that_aged_beside_a_refusing_provider(tmp_path):
-    """Recall went on answering by words alone while embeddings waited for a week behind HTTP 429s, and nothing
-    said so (reported with #200)."""
+    """Recall goes on answering by words alone while embeddings wait for a week behind HTTP 429s, and the doctor
+    must say so."""
     import time
     from datetime import datetime, timedelta, timezone
 
@@ -503,7 +540,7 @@ def test_doctor_names_an_embedding_backlog_that_aged_beside_a_refusing_provider(
 
 def test_doctor_says_nothing_of_a_backlog_where_nothing_embeds_and_names_a_worker_where_nothing_refused():
     """Without a vector store or an external embedding route the queue only grows, by choice: an install without one
-    went from "attention" to "degraded" for good (review of 3.8.0)."""
+    must not go from "attention" to "degraded" for good."""
     from datetime import datetime, timedelta, timezone
 
     from scope_recall.maintenance.doctor_report import DoctorReport
@@ -544,7 +581,7 @@ def test_doctor_says_nothing_of_a_backlog_where_nothing_embeds_and_names_a_worke
 )
 def test_doctor_blames_the_worker_only_when_nothing_asked_the_provider(tmp_path, statuses, said):
     """A proxy outage ends calls in network errors, which are no refusals: "refused nothing, so no worker has reached
-    them" was wrong there (review of 3.8.0)."""
+    them" is wrong there."""
     import time
     from datetime import datetime, timedelta, timezone
 

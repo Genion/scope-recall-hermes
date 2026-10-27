@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from ..contracts import ContractError
 from ..core.endpoint_policy import endpoint_scheme_allowed
+from ..core.private import require_outbound
 from ..core.secret_patterns import contains_secret_like_text
 from .model_budget import AuxiliaryBudgetLedger
 
@@ -242,6 +243,7 @@ class HttpsTransport:
     ) -> tuple[int, bytes]:
         """Bound the entire exchange, including waiting for a query session."""
         if self._session is None:
+            require_outbound()
             return self._post(
                 url, body=body, headers=headers, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes
             )
@@ -249,6 +251,7 @@ class HttpsTransport:
         if not self._post_lock.acquire(timeout=max(0, seconds_left(deadline))):
             raise AuxiliaryModelError("timeout")
         try:
+            require_outbound()
             return self._post(
                 url,
                 body=body,
@@ -289,6 +292,7 @@ class HttpsTransport:
             if seconds_left(deadline) <= 0:
                 raise AuxiliaryModelError("timeout")
             if self._session is not None:
+                require_outbound()
                 stdout, stderr = self._session.exchange(
                     command,
                     request_bytes,
@@ -307,6 +311,7 @@ class HttpsTransport:
                 remaining = seconds_left(deadline)
                 if remaining <= 0:
                     raise AuxiliaryModelError("timeout")
+                require_outbound()
                 stdout, stderr = process.communicate(input=request_bytes, timeout=remaining)
             if seconds_left(deadline) <= 0:
                 raise AuxiliaryModelError("timeout")
@@ -325,6 +330,73 @@ class HttpsTransport:
             raise AuxiliaryModelError("network_error", detail=type(exc).__name__) from exc
         finally:
             _cleanup_http_worker(process)
+
+
+class HttpsTransportPool:
+    """A bounded set of owned persistent transports, borrowed until each reply is read.
+
+    Idle transports are reused most recently first so a quiet route keeps one
+    connection warm. Waiting for a free transport consumes the caller's deadline.
+    Closing wakes waiters and cancels all owned helpers, including active ones.
+    """
+
+    def __init__(self, *, size: int, allow_insecure_endpoint: bool = False) -> None:
+        if type(size) is not int or size <= 0:
+            raise ValueError("transport_pool_size")
+        self._transports = tuple(
+            HttpsTransport(persistent=True, allow_insecure_endpoint=allow_insecure_endpoint) for _ in range(size)
+        )
+        self._available = list(self._transports)
+        self._condition = threading.Condition()
+        self._closed = False
+
+    def post(
+        self, url: str, *, body: bytes, headers: Mapping[str, str], timeout_seconds: float, max_response_bytes: int
+    ) -> tuple[int, bytes]:
+        """Borrow one connection within the request's budget and return it on every exit path."""
+        deadline = time.monotonic() + validate_timeout_seconds(timeout_seconds)
+        with self._condition:
+            ready = self._condition.wait_for(
+                lambda: self._closed or bool(self._available), timeout=max(0, seconds_left(deadline))
+            )
+            if self._closed:
+                raise AuxiliaryModelError("transport_unavailable")
+            if not ready or seconds_left(deadline) <= 0:
+                raise AuxiliaryModelError("timeout")
+            transport = self._available.pop()
+        try:
+            require_outbound()
+            return transport.post(
+                url,
+                body=body,
+                headers=headers,
+                timeout_seconds=seconds_left(deadline),
+                max_response_bytes=max_response_bytes,
+            )
+        finally:
+            with self._condition:
+                if not self._closed:
+                    self._available.append(transport)
+                    # A notified caller can expire before reacquiring the lock;
+                    # every live waiter must get a chance to borrow the slot.
+                    self._condition.notify_all()
+
+    def close(self) -> None:
+        """Permanently close the pool without waiting for borrowers to finish."""
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+        first_error = None
+        for transport in self._transports:
+            try:
+                transport.close()
+            except BaseException as exc:  # noqa: BLE001 - raised once every helper has had its close attempt
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def json_bytes(value: object) -> bytes:
@@ -453,6 +525,7 @@ def metered_post(
         http_remaining = seconds_left(deadline)
         if http_remaining <= 0:
             raise AuxiliaryModelError("timeout")
+        require_outbound()
         status_code, raw = transport.post(
             endpoint, body=body, headers=headers, timeout_seconds=http_remaining, max_response_bytes=max_response_bytes
         )

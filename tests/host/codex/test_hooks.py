@@ -38,6 +38,18 @@ def _payload(handler_root: Path, event: str, session: str = "TEST-session-1", tu
     return payload
 
 
+def test_a_mid_session_status_with_a_trailing_newline_skips_recall(handler, monkeypatch):
+    hook, project_root, _config = handler
+    monkeypatch.setattr(hook, "ensure_runtime", lambda *a, **k: None)
+    hook.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="Prepare a synthetic poster."))
+    monkeypatch.setattr(
+        hook.core.recall_pipeline.storage_reader, "lexical", lambda *a, **k: pytest.fail("status requested a search")
+    )
+    result = hook.handle_payload(_payload(project_root, "UserPromptSubmit", turn="TEST-turn-2", prompt="删除了吗\n"))
+    assert not result
+    assert hook.diagnostics.last_reason == "auto_recall_skipped:session_status"
+
+
 def test_production_mode_user_prompt_capture_and_recall(handler, installed):
     hook, project_root, config = handler
     _, core, clock, _ = installed
@@ -241,7 +253,15 @@ def test_path_traversal_cwd_does_not_bind_foreign_root(handler, installed, tmp_p
     assert hook.handle_payload(_payload(Path(cwd), "UserPromptSubmit", prompt="hello")) == {}
 
 
-def test_stop_never_loops_and_records_only_present_assistant_text(handler, installed):
+@pytest.mark.parametrize("pace", ["normal", "slow"])
+def test_stop_never_loops_and_records_only_present_assistant_text(handler, installed, slow_capture_store, pace):
+    """A Stop stores the assistant text that is present, and an empty one adds no row.
+
+    ``slow`` delays the next real write after this body starts. That delay is store time, so the
+    same source row is committed.
+    """
+    if pace == "slow":
+        slow_capture_store()
     hook, project_root, config = handler
     assert hook.handle_payload(_payload(project_root, "Stop", last_assistant_message="final answer")) == {}
     assert hook.handle_payload(_payload(project_root, "Stop", turn="turn-blank", last_assistant_message="")) == {}
@@ -306,8 +326,8 @@ def test_interrupt_and_session_end_are_host_generated_without_model_calls(handle
 
 
 def test_a_recall_that_found_the_store_unreadable_says_so(handler, installed):
-    """A recall whose store could not be read returned an empty packet that read as nothing found: an entry's server
-    answering so was taken over the hook's own recall (review of rc11)."""
+    """A recall whose store cannot be read says so, not an empty packet that reads as nothing found: an entry's server
+    answering so is not taken over the hook's own recall."""
     _hook, project_root, config = handler
     _, core, clock, _ = installed
 
@@ -335,9 +355,9 @@ def test_a_recall_that_found_the_store_unreadable_says_so(handler, installed):
 
 
 def test_a_recall_whose_read_did_not_finish_ranks_as_without_its_vector_search(handler, installed):
-    """A recall whose time ran out at its release, with its vector search run, came back empty and still ranked as one
-    with vectors: a hook's own such answer beat the entry's server's finished one, and a server's was final (reviews of
-    rc11)."""
+    """A recall whose time runs out at its release, with its vector search run, comes back empty and ranks as one
+    without its vector search: a hook's own such answer does not beat the entry's server's finished one, and a
+    server's is not final."""
     _hook, project_root, config = handler
     _, core, clock, _ = installed
 
@@ -357,8 +377,8 @@ def test_a_recall_whose_read_did_not_finish_ranks_as_without_its_vector_search(h
 
 
 def test_a_recall_whose_time_ran_out_after_its_packet_ranks_as_without_its_vector_search(handler, installed):
-    """A recall whose packet was whole, vector search included, but whose time ran out before it was rendered came
-    back empty and still ranked as one with its vector search (review of rc11)."""
+    """A recall whose packet is whole, vector search included, but whose time runs out before it is rendered comes
+    back empty and ranks as one without its vector search."""
     _hook, project_root, config = handler
     _, core, clock, _ = installed
 
@@ -512,6 +532,31 @@ def test_source_keys_use_session_turn_and_public_event_ids():
         event_id="exec-123",
     )
     assert key == "codex:install-1:session-1:tool:exec-123@1"
+
+
+def test_a_session_start_s_read_of_the_store_waits_no_longer_than_a_capture(installed, project_root, monkeypatch):
+    """A hook's core lets a write wait 2 s for the store's lock, as long as the owner's prompt may, and a read given
+    no time of its own would wait as long.  A session's start reads the store's standing for a capture's 1 s at most."""
+    from scope_recall.adapters.clients.hook_events import CAPTURE_TIMEOUT_S
+    from scope_recall.core import MemoryCore
+
+    config, _core, _clock, _root = installed
+    asked = []
+    status = MemoryCore.status
+
+    def timed(self, context, **kwargs):
+        asked.append(kwargs.get("remaining_seconds"))
+        return status(self, context, **kwargs)
+
+    monkeypatch.setattr(MemoryCore, "status", timed)
+    monkeypatch.setattr(CodexHookHandler, "launch_worker", lambda *args, **kwargs: None)
+    hook = CodexHookHandler.from_config_path(str(config.config_path))
+    try:
+        hook.handle_payload(_payload(project_root, "SessionStart", turn=""))
+    finally:
+        hook.close()
+    assert hook.diagnostics.last_reason is None, hook.diagnostics.last_reason
+    assert asked and all(seconds is not None and 0 < seconds <= CAPTURE_TIMEOUT_S for seconds in asked), asked
 
 
 def test_hook_entry_cli_uses_absolute_config_and_bounded_stdin(installed, project_root):

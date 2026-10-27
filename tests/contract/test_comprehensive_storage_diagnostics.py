@@ -8,6 +8,7 @@ import sys
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from scope_recall._version import __version__
@@ -15,6 +16,7 @@ from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.admission import AdmissionPolicy
 from scope_recall.core.recall_policy import SPACE_ID
+from scope_recall.core.schema import SCHEMA_VERSION
 from scope_recall.maintenance import doctor, doctor_store
 from test_autonomous_admission import app_at, capture
 from v11_support import downgrade_store
@@ -191,6 +193,167 @@ def _vector_block(ctx):
     }
 
 
+@pytest.mark.parametrize("state", ["readable", "unreadable", "missing", "directory"])
+def test_doctor_checks_the_configured_sqlite_companion(tmp_path, monkeypatch, state):
+    from scope_recall.core.vector_failure import vector_failure_label
+    from scope_recall.vector import VectorStoreCompatibilityError
+    from scope_recall.vector.store import build_vector_store
+
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    block = {**_vector_block(ctx), "backend": "sqlite-bruteforce"}
+    _write_runtime_config(ctx, vector=block)
+    config = doctor._runtime_config(ctx.binding.data_directory).vector
+    writer = build_vector_store(
+        config.backend,
+        storage_dir=config.storage_dir,
+        table_name=config.table_name,
+        dimensions=config.dimensions + (state == "unreadable"),
+    )
+    expected_label = None
+    try:
+        if state == "directory":
+            writer.db_path.parent.mkdir(parents=True)
+            writer.db_path.mkdir()
+            expected_label = vector_failure_label(
+                VectorStoreCompatibilityError("sqlite-bruteforce physical storage is not a regular file")
+            )
+        elif state != "missing":
+            writer.open()
+        if state == "unreadable":
+            reader = build_vector_store(
+                config.backend,
+                storage_dir=config.storage_dir,
+                table_name=config.table_name,
+                dimensions=config.dimensions,
+            )
+            with pytest.raises(VectorStoreCompatibilityError) as failure:
+                reader.open_existing()
+            expected_label = vector_failure_label(failure.value)
+        report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+        (check,) = [item for item in report.checks if item["name"] == "vector_store"]
+        unreadable = state in {"unreadable", "directory"}
+        assert check["result"] == ("unreadable" if unreadable else state)
+        assert str(ctx.binding.data_directory) not in check.get("detail", "")
+        assert ("vector_store_unreadable" in report.capability_gaps) is unreadable
+        if unreadable:
+            assert report.status == "degraded" and check["detail"] == expected_label
+        elif state == "missing":
+            assert "worker" in check["detail"] and "first pass" in check["detail"]
+            assert not writer.db_path.exists()
+    finally:
+        writer.close()
+
+
+def test_doctor_skips_a_sqlite_companion_bound_to_another_installation(tmp_path, monkeypatch):
+    from scope_recall.vector.store import build_vector_store
+
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    other_directory = tmp_path / "TEST-other-installation"
+    binding = {
+        "agent_id": ctx.binding.agent_id,
+        "installation_id": "TEST-other-installation",
+        "data_directory": str(other_directory),
+        "scope_ids": sorted(ctx.binding.scope_ids),
+        "test_mode": True,
+    }
+    block = {
+        **_vector_block(ctx),
+        "backend": "sqlite-bruteforce",
+        "storage_dir": str(other_directory / "vectors" / SPACE_ID),
+    }
+    _write_runtime_config(ctx, binding=binding, vector=block)
+    config = doctor._runtime_config(ctx.binding.data_directory)
+    assert config is not None and config.binding != ctx.binding
+    store = build_vector_store(
+        config.vector.backend,
+        storage_dir=config.vector.storage_dir,
+        table_name=config.vector.table_name,
+        dimensions=config.vector.dimensions,
+    )
+    try:
+        store.open()
+    finally:
+        store.close()
+    before = {path.name: path.read_bytes() for path in store.db_path.parent.iterdir()}
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    after = {path.name: path.read_bytes() for path in store.db_path.parent.iterdir()}
+    assert not any(item["name"] == "vector_store" for item in report.checks)
+    assert "vector_store_unreadable" not in report.capability_gaps
+    assert after == before
+
+
+def test_doctor_checks_a_sqlite_companion_with_an_equivalent_binding_path(tmp_path, monkeypatch):
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    _write_runtime_config(ctx, vector={**_vector_block(ctx), "backend": "sqlite-bruteforce"})
+    path = ctx.binding.data_directory / "runtime-config.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["binding"]["data_directory"] = str(ctx.binding.data_directory / ".." / ctx.binding.data_directory.name)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = doctor._runtime_config(ctx.binding.data_directory)
+    assert config is not None and config.binding != ctx.binding
+    assert config.binding.data_directory.resolve() == ctx.binding.data_directory.resolve()
+
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    (check,) = [item for item in report.checks if item["name"] == "vector_store"]
+    assert check["result"] == "missing"
+    assert "vector_store_unreadable" not in report.capability_gaps
+
+
+def test_doctor_labels_vector_path_permission_errors_as_unreadable(tmp_path, monkeypatch):
+    from scope_recall.vector.store import build_vector_store
+
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    _write_runtime_config(ctx, vector={**_vector_block(ctx), "backend": "sqlite-bruteforce"})
+    config = doctor._runtime_config(ctx.binding.data_directory).vector
+    store = build_vector_store(
+        config.backend,
+        storage_dir=config.storage_dir,
+        table_name=config.table_name,
+        dimensions=config.dimensions,
+    )
+    raw_stat, raw_lstat = os.stat, os.lstat
+    path_exists, path_is_symlink = Path.exists, Path.is_symlink
+
+    def deny_stat(path, *args, **kwargs):
+        if Path(path) == store.db_path:
+            raise PermissionError("TEST inaccessible vector store")
+        return raw_stat(path, *args, **kwargs)
+
+    def deny_lstat(path, *args, **kwargs):
+        if Path(path) == store.db_path:
+            raise PermissionError("TEST inaccessible vector store")
+        return raw_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", deny_stat)
+    monkeypatch.setattr(os, "lstat", deny_lstat)
+    # Python 3.14's path predicates suppress permission errors; emulate that on older interpreters.
+    monkeypatch.setattr(Path, "exists", lambda path: False if path == store.db_path else path_exists(path))
+    monkeypatch.setattr(Path, "is_symlink", lambda path: False if path == store.db_path else path_is_symlink(path))
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    (check,) = [item for item in report.checks if item["name"] == "vector_store"]
+    assert check["result"] == "unreadable" and check["detail"] == "PermissionError"
+    assert "vector_store_unreadable" in report.capability_gaps
+
+
+@pytest.mark.parametrize("configured", ["lancedb", "no-vector", "no-config"])
+def test_doctor_skips_companion_open_without_a_sqlite_backend(tmp_path, monkeypatch, configured):
+    import builtins
+
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    if configured != "no-config":
+        _write_runtime_config(ctx, vector=_vector_block(ctx) if configured == "lancedb" else None)
+    original_import = builtins.__import__
+
+    def without_lance(name, *args, **kwargs):
+        assert name.split(".")[0] not in {"lancedb", "pyarrow"}
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_lance)
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    assert not any(item["name"] == "vector_store" for item in report.checks)
+    assert "vector_store_unreadable" not in report.capability_gaps
+
+
 def _pm_environment(home, tmp_path, packages):
     """``home`` made a Hermes whose package manager runs plugins in its own environment, holding ``packages``."""
     environment = tmp_path / "TEST-pm" / "environments" / "TEST-env" / "venv"
@@ -211,7 +374,7 @@ def _runtime_gaps(report):
 @pytest.mark.parametrize(
     ("packages", "gaps"),
     [
-        # As found on 2026-10-13: a core two releases old and no vector dependencies.
+        # A core two releases old and no vector dependencies.
         (
             {"hermes_scope_recall": "3.10.0"},
             {"hermes_runtime_package_mismatch", "hermes_runtime_vector_dependencies_missing"},
@@ -254,8 +417,8 @@ def test_a_hermes_that_runs_plugins_in_its_venv_has_no_environment_to_read(tmp_p
     ],
 )
 def test_doctor_names_a_lancedb_store_the_interpreter_cannot_open(tmp_path, monkeypatch, installed, missing):
-    """As 3.10.3 shipped it: installed without the ``lancedb`` extra, with a LanceDB store configured, every recall
-    ran by words alone while the doctor named only the threshold."""
+    """Installed without the ``lancedb`` extra, with a LanceDB store configured, every recall runs by words alone,
+    and the doctor names that, not only the threshold."""
     _app, ctx = _doctor_app(tmp_path, monkeypatch)
     home = ctx.binding.data_directory
     _write_runtime_config(ctx)
@@ -373,8 +536,8 @@ def test_doctor_names_vector_recall_configured_without_a_threshold(tmp_path, mon
 
 
 def test_doctor_names_answers_cut_off_at_the_output_limit(tmp_path, monkeypatch):
-    """beta's consolidation model reasoned into its max_tokens and most answers
-    were cut off; only recent_work_errors showed it, sixteen rows at a time."""
+    """A consolidation model that reasons into its max_tokens has most answers cut
+    off, and only recent_work_errors would show it, sixteen rows at a time."""
     from datetime import datetime, timedelta, timezone
 
     app, ctx = _doctor_app(tmp_path, monkeypatch)
@@ -486,9 +649,9 @@ def test_doctor_reports_the_footprint_the_growth_and_a_budget(tmp_path, monkeypa
 
 
 def test_doctor_reads_a_shared_worker_config_past_64_kb(tmp_path, monkeypatch):
-    """A shared worker's runtime config lists every scope of the store twice; the pilot's passed 85 KB.
-    The doctor read it as a 64 KB control file: every entry reported ``vector_threshold: invalid`` and
-    the storage budget was never checked.  It is bounded where the shared commands write it."""
+    """A shared worker's runtime config lists every scope of the store twice, so it can pass 85 KB.
+    Read as a 64 KB control file, every entry would report ``vector_threshold: invalid`` and
+    the storage budget would never be checked.  It is bounded where the shared commands write it."""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     scopes = sorted({*ctx.binding.scope_ids, *(f"conversation:TEST-{index:03d}-{'x' * 64}" for index in range(450))})
     binding = {
@@ -526,9 +689,9 @@ def test_doctor_reports_a_pending_schema_upgrade_without_applying_it(tmp_path, m
     ordinary open brings it forward.  The doctor is read-only, so it names the
     pending step instead of failing on a store it will not touch.  Both what the
     store holds and its bytes are compared: the schema facts say no step was
-    applied, the bytes that nothing was written.  (The bytes failed at random on
-    CI while the step's own connection was left to the garbage collector, which
-    moved its pages from the WAL into the file when it pleased, 3.4.0rc10.)"""
+    applied, the bytes that nothing was written.  (The step closes its own
+    connection; left to the garbage collector, it would move its pages from the
+    WAL into the file when it pleased, and the bytes would change at random.)"""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     capture(app, ctx, "TEST-upgrade/1", "TEST pending upgrade")
     downgrade_store(app.storage.path, 1108)
@@ -538,9 +701,9 @@ def test_doctor_reports_a_pending_schema_upgrade_without_applying_it(tmp_path, m
     assert "schema_upgrade_pending" in result.capability_gaps and result.schema_version == 1108
     assert next(item for item in result.checks if item["name"] == "schema")["result"] == "upgrade_pending"
     assert _schema_facts(app.storage.path) == before and app.storage.path.read_bytes() == image
-    assert app.status(ctx).schema_version == 1110
+    assert app.status(ctx).schema_version == SCHEMA_VERSION
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
-    assert "schema_upgrade_pending" not in result.capability_gaps and result.schema_version == 1110
+    assert "schema_upgrade_pending" not in result.capability_gaps and result.schema_version == SCHEMA_VERSION
 
 
 def test_a_secret_refusal_is_a_terminal_failure_not_a_degraded_instance(tmp_path, monkeypatch):
@@ -557,8 +720,8 @@ def test_a_secret_refusal_is_a_terminal_failure_not_a_degraded_instance(tmp_path
 
 
 def test_doctor_names_a_runtime_config_that_was_there_and_is_gone(tmp_path, monkeypatch):
-    """#118: with runtime-config.json deleted the hosts ran in basic mode -- no worker, no
-    model routes -- while the doctor reported ok with no gap.  A fresh install has no config
+    """With runtime-config.json deleted the hosts run in basic mode -- no worker, no
+    model routes -- so the doctor must not report ok with no gap.  A fresh install has no config
     either, so the evidence is work only a config's routes could have run."""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
@@ -578,8 +741,8 @@ def test_doctor_names_a_runtime_config_that_was_there_and_is_gone(tmp_path, monk
 
 
 def test_the_downgrade_leaves_nothing_for_the_garbage_collector(tmp_path, monkeypatch):
-    """The schema test's byte comparison passed without the downgrade closing its connection unless the collector
-    ran at the wrong moment (review of rc10); with collection held back, a connection left to it shows."""
+    """The schema test's byte comparison passes without the downgrade closing its connection unless the collector
+    runs at the wrong moment; with collection held back, a connection left to it shows."""
     import gc
 
     app, ctx = _doctor_app(tmp_path, monkeypatch)

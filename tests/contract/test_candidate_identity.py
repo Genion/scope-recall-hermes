@@ -7,6 +7,7 @@ the candidate's own and is restored; a name it lengthens, negates or points at s
 
 from __future__ import annotations
 
+import pytest
 from scope_recall.core.candidate_lifecycle import candidate_name_matches
 
 from tests.contract.test_candidate_lifecycle import (  # noqa: F401  (fixture)
@@ -83,6 +84,46 @@ def test_a_different_kind_is_still_refused(app):
     assert current is None
 
 
+@pytest.mark.parametrize(
+    ("expected", "proposed"),
+    [("自己维护", "自己维护了"), ("确认", "确认了"), ("决定", "决定了"), ("跟随", "跟随着"), ("使用", "使用的")],
+)
+def test_trailing_chinese_particles_keep_the_candidates_identity(app, expected, proposed):
+    core, ctx = app
+    assert candidate_name_matches(expected, proposed, predicate=True)
+    current, evaluation, work = _verdict(core, ctx, candidate_predicate=expected, predicate=proposed)
+    assert work["state"] == "done" and evaluation["state"] == "resolved"
+    assert current.payload["predicate"] == expected
+
+
+@pytest.mark.parametrize(
+    ("expected", "proposed"),
+    [
+        ("清理", "清理掉"),
+        ("跟随", "跟随一下"),
+        ("使用", "使用过"),
+        ("清理", "清理好"),
+        ("清理", "清理完"),
+        ("喜欢", "不喜欢"),
+        ("使用", "没使用"),
+        ("使用", "只使用"),
+        ("使用", "暂时使用"),
+        ("确认", "了确认"),
+        ("confirm", "confirm了"),
+        ("确认", "确认了之后"),
+    ],
+)
+def test_chinese_complements_and_qualifiers_remain_different_names(expected, proposed):
+    assert not candidate_name_matches(expected, proposed, predicate=True)
+
+
+def test_a_subject_with_a_trailing_particle_is_another_name():
+    """After a subject, 的 makes a possessive: ``张三的`` names something of 张三's, not 张三."""
+    for expected, proposed in (("张三", "张三的"), ("项目", "项目的"), ("团队", "团队了")):
+        assert not candidate_name_matches(expected, proposed)
+        assert candidate_name_matches(expected, proposed, predicate=True)
+
+
 def test_what_counts_as_the_same_name():
     same = (
         ('无 vision_analyze 工具时要\\"看图\\"（截图识别）', '无 vision_analyze 工具时要"看图"（截图识别）'),
@@ -137,9 +178,11 @@ def test_what_counts_as_the_same_name():
     for expected, proposed in different:
         assert not candidate_name_matches(expected, proposed), (expected, proposed)
     # A predicate that repeats its subject is the same predicate without it; a negation never falls away with it.
-    said = ("issue comments need Joy's OK", "need Joy's OK")
+    said = ("issue comments need NameOne's OK", "need NameOne's OK")
     assert candidate_name_matches(*said, subject="issue comments")
     assert not candidate_name_matches(*said)
-    assert not candidate_name_matches("issue comments need Joy's OK", "do not need Joy's OK", subject="issue comments")
-    assert not candidate_name_matches("Joy吃辣", "不吃辣", subject="Joy")
+    assert not candidate_name_matches(
+        "issue comments need NameOne's OK", "do not need NameOne's OK", subject="issue comments"
+    )
+    assert not candidate_name_matches("NameOne吃辣", "不吃辣", subject="NameOne")
     assert not candidate_name_matches("prodigy plan", "igy plan", subject="prod")

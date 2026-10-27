@@ -375,7 +375,7 @@ def test_hermes_fresh_install_and_doctor(tmp_path):
 def test_a_hermes_wrapper_may_sit_where_hermes_looks_a_provider_up(tmp_path):
     """Hermes reads a memory provider's plugin.yaml, and the core the wrapper declares, from
     ``<home>/plugins/<name>/`` or from the installed core's own directory; once the environment it
-    runs has lost the core, only the first is left (#135).  That one directory may sit inside the
+    runs has lost the core, only the first is left.  That one directory may sit inside the
     home; any other plugin directory still may not."""
     instance_root, _outside, project_root = _install_paths(tmp_path, host="hermes")
     inside = instance_root / "plugins" / "scope-recall"
@@ -424,8 +424,8 @@ def _hermes_plan(instance_root, target, project_root):
 
 
 def _hand_made_wrapper(inside):
-    """What the official Hermes update of 2026-10-11 left in a home: the wrapper copied in, the core pinned
-    without its vector extra, from a local wheel, plus the bytecode Hermes wrote beside it."""
+    """What an official Hermes update leaves in a home: the wrapper copied in, the core pinned without its vector
+    extra, from a local wheel, plus the bytecode Hermes wrote beside it."""
     inside.mkdir(parents=True, exist_ok=True)
     (inside / "plugin.yaml").write_text(
         "name: scope-recall\nversion: 3.10.0\npip_dependencies:\n- hermes-scope-recall==3.10.0\n", encoding="utf-8"
@@ -488,9 +488,8 @@ def test_the_home_plugin_directory_declares_the_core_with_its_vector_extra(tmp_p
 
 
 def test_an_install_moves_its_wrapper_into_the_home_plugin_directory_over_a_hand_made_one(tmp_path, released):
-    """As found on 2026-10-13: the receipt named a wrapper outside the home, Hermes read a hand-made one
-    inside it.  The install moves there, replaces that wrapper's own files (backed up first) and leaves the old
-    directory and the bytecode alone."""
+    """The receipt names a wrapper outside the home while Hermes reads a hand-made one inside it.  The install moves
+    there, replaces that wrapper's own files (backed up first) and leaves the old directory and the bytecode alone."""
     import tomllib
 
     instance_root, outside, project_root = _install_paths(tmp_path, host="hermes")
@@ -745,6 +744,26 @@ def test_explicit_purge_removes_owned_data_and_keeps_host_files(tmp_path):
     assert not (instance_root / "data" / "memory.sqlite3").exists()
     assert not (instance_root / "codex-installation.json").exists()
     assert host_file.is_file()
+
+
+def test_purge_removes_the_ledger_a_restore_keeps_beside_the_store(tmp_path):
+    instance_root, plugin_dir, project_root = _install_paths(tmp_path, host="codex")
+    apply_install(
+        plan_install(
+            host="codex",
+            target_plugin_dir=plugin_dir,
+            instance_root=instance_root,
+            project_root=project_root,
+            agent_id="TEST-P14-agent",
+            python_executable=Path(sys.executable),
+        )
+    )
+    ledger = instance_root / "data" / "restore-ledger.json"
+    ledger.write_text("{}\n", encoding="utf-8")
+    purge_plan = plan_uninstall(instance_root=instance_root, target_plugin_dir=plugin_dir, purge=True)
+    assert purge_plan.conflicts == [] and str(ledger.resolve()) in purge_plan.purge_paths
+    result = apply_uninstall(purge_plan, purge=True)
+    assert result.purged is True and not ledger.exists()
 
 
 def test_purge_rejects_unknown_retained_file(tmp_path):
@@ -1363,7 +1382,8 @@ def _hermes_cli(tmp_path: Path, command: str, *extra: str) -> list[str]:
 
 
 def test_local_platform_is_approved_on_a_fresh_install_and_binds_a_session_that_names_no_user(tmp_path, capsys):
-    """Issue #94: Hermes Desktop sends no user_id without a dashboard login, and 3.x refused it outright."""
+    """Hermes Desktop sends no user_id without a dashboard login; ``--local-platform`` approves that platform for such
+    a session."""
     from scope_recall.adapters.hermes import HermesIdentityError, bind_hermes_identity
     from scope_recall.maintenance import cli as maintenance_cli
 
@@ -1487,7 +1507,7 @@ def test_local_platform_names_only_a_local_surface_and_only_on_hermes(tmp_path):
 
 
 def test_an_owner_login_is_approved_in_place_once_and_binds_that_login_only(tmp_path, capsys):
-    """#175: Hermes passes a dashboard login (``basic:<name>``) as the session's user and names no chat.  The
+    """Hermes passes a dashboard login (``basic:<name>``) as the session's user and names no chat.  The
     installer approves one login on one local surface as the owner's own: the owner principal and one grant
     of the owner's private scope on the route the adapter gives that login.  Nothing else is approved."""
     from scope_recall.adapters.hermes import HermesIdentityError, bind_hermes_identity
@@ -1564,8 +1584,8 @@ def test_an_owner_login_names_one_login_on_one_local_surface_and_only_on_hermes(
 
 
 def test_doctor_names_an_owner_grant_that_no_owner_principal_can_use(tmp_path, capsys):
-    """#175's manifest: owner rows written for a Desktop login and no owner principal for it, so every session
-    on that route bound nothing while doctor stayed green.  Doctor counts such rows by platform, never by user."""
+    """Owner rows written for a Desktop login with no owner principal for it bind nothing on that route, so doctor
+    names the gap rather than staying green.  Doctor counts such rows by platform, never by user."""
     from scope_recall.maintenance import cli as maintenance_cli
 
     instance_root = (tmp_path / "instance").resolve()
@@ -1707,7 +1727,10 @@ def test_package_health_record_bytes_and_declared_dependencies(tmp_path, monkeyp
     ]
     specs = list(project["dependencies"])
     for extra in ("lancedb", "codex"):
-        specs.extend(f"{spec}; extra == '{extra}'" for spec in project["optional-dependencies"][extra])
+        for spec in project["optional-dependencies"][extra]:
+            requirement, separator, marker = spec.partition(";")
+            conditions = f"({marker}) and " if separator else ""
+            specs.append(f"{requirement}; {conditions}extra == '{extra}'")
     (dist_dir / "METADATA").write_text(
         "Metadata-Version: 2.1\nName: hermes-scope-recall\nVersion: 3.1.0rc28\n"
         + "".join(f"Requires-Dist: {s}\n" for s in specs),
@@ -1755,6 +1778,42 @@ def test_package_health_record_bytes_and_declared_dependencies(tmp_path, monkeyp
             ensure_ascii=False,
         )
     )
+
+
+def test_codex_extra_pins_count_only_on_hosts_that_run_its_mcp_server(tmp_path):
+    """Another package in a Hermes environment may pin ``mcp`` past the codex extra's cap; that host never loads the
+    MCP server the extra serves, so the cap is no drift there.  A base requirement still counts on every host."""
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.package_health import apply_package_health, dependency_health
+
+    requirements = ['mcp<=2.1.0,>=2.0.0; extra == "codex"', 'pyarrow<25,>=24; extra == "lancedb"', "packaging>=24"]
+    installed = {"mcp": "2.3.0", "pyarrow": "24.0.0", "packaging": "25.0"}
+    drift = dependency_health(requirements, version_lookup=installed.__getitem__)
+    assert drift["status"] == "mismatch"
+
+    def doctor(host, probe):
+        report = DoctorReport(host=host, status="degraded")
+        apply_package_health(report, tmp_path, {"dependency_drift": probe})
+        return report
+
+    hermes = doctor("hermes", drift)
+    assert "dependency_drift" not in hermes.capability_gaps
+    assert hermes.package_health["dependency_drift"]["status"] == "ok"
+    assert {row["name"]: row["extra"] for row in drift["requirements"]} == {
+        "mcp": "codex",
+        "pyarrow": "lancedb",
+        "packaging": None,
+    }
+    assert [row["name"] for row in hermes.package_health["dependency_drift"]["requirements"] if not row["applies"]] == [
+        "mcp"
+    ]
+    for host in ("codex", "claude-code", "workbuddy", "dsh"):
+        assert "dependency_drift" in doctor(host, drift).capability_gaps, host
+    installed.update(mcp="2.0.0", packaging="23.0")
+    base = dependency_health(requirements, version_lookup=installed.__getitem__)
+    assert "dependency_drift" in doctor("hermes", base).capability_gaps
+    # A probe without per-row extras keeps its own verdict.
+    assert "dependency_drift" in doctor("hermes", {"status": "mismatch"}).capability_gaps
 
 
 def test_package_health_doctor_three_way_versions(tmp_path, monkeypatch):
@@ -1824,9 +1883,9 @@ def test_package_health_doctor_three_way_versions(tmp_path, monkeypatch):
 
 def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
     """On POSIX a venv's ``bin/python`` is a symlink to the base interpreter.
-    Recording its target meant hooks, the MCP launcher and the autostart task
-    started an interpreter with no venv on its path, which cannot import this
-    package (#87).  The chain is still validated through the target."""
+    Recording its target would have hooks, the MCP launcher and the autostart task
+    start an interpreter with no venv on its path, which cannot import this
+    package, so the link is recorded as given.  The chain is still validated through the target."""
     from plugin_source import linked_interpreter
 
     link = linked_interpreter(tmp_path)
@@ -1853,10 +1912,10 @@ def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
 
 
 def test_the_cli_passes_a_symlinked_interpreter_on_as_given(tmp_path, capsys):
-    """#141: the CLI resolved ``--python`` before the installer and the doctor saw it, so a POSIX venv's
-    ``bin/python`` reached both as the base interpreter.  The doctor then probed an interpreter that cannot
-    import this package and reported it missing, and the installer recorded that interpreter for the hooks, the
-    MCP launcher, the autostart task and the worker: #87 again, fixed below the CLI only."""
+    """The CLI passes ``--python`` to the installer and the doctor as given.  Resolved first, a POSIX venv's
+    ``bin/python`` would reach both as the base interpreter: the doctor would probe an interpreter that cannot
+    import this package and report it missing, and the installer would record that interpreter for the hooks, the
+    MCP launcher, the autostart task and the worker."""
     from plugin_source import linked_interpreter
     from scope_recall.maintenance import cli as maintenance_cli
 
@@ -1891,7 +1950,7 @@ def test_the_cli_passes_a_symlinked_interpreter_on_as_given(tmp_path, capsys):
 
 def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing():
     """Hermes builds the environment it runs plugins in from what their manifests declare, and rebuilds it
-    on updates: a wrapper that declares nothing loses its core then (#135).  A requirement Hermes cannot
+    on updates: a wrapper that declares nothing loses its core then.  A requirement Hermes cannot
     resolve fails its whole build, so only a release on PyPI is declared."""
     import yaml
     from packaging.requirements import Requirement

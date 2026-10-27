@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -17,6 +18,7 @@ from ..core.recall_policy import (
     EMBEDDING_DIALECTS,
     EMBEDDING_SPACE,
     build_embedding_space,
+    embedding_sends_secret_like_text,
     encode_embedding_text,
 )
 from ..core.source_records import StoredSource
@@ -25,6 +27,7 @@ from .models import (
     RESERVE_ENVELOPE_MARGIN,
     AuxiliaryModelError,
     HttpsTransport,
+    HttpsTransportPool,
     HttpTransport,
     json_bytes,
     load_credential,
@@ -37,6 +40,9 @@ from .models import (
 
 MAX_EMBED_RESPONSE_BYTES = 16 * 1024 * 1024
 
+#: Separate concurrent recalls without creating an unbounded number of HTTP helpers.
+QUERY_EMBED_CONNECTIONS = 3
+
 
 #: Embedding requests one group may have in flight.  A document request spawns its
 #: own bounded HTTP helper and shares no state, so this is threads waiting on
@@ -48,11 +54,8 @@ MAX_EMBED_RESPONSE_BYTES = 16 * 1024 * 1024
 EMBED_REQUEST_CONCURRENCY = 4
 
 
-#: Documents one embedding request may carry, measured against the live provider
-#: rather than assumed: 32 texts answered in 2.6s, 64 in 3.2s, 100 in 3.8s, and
-#: 250 was refused with HTTP 400.  A hundred 3072-wide vectors is about 4 MB of
-#: response, well inside the cap above, and it is the difference between seven
-#: requests for a pass of two hundred sources and two.
+#: Maximum documents per embedding request.  Batching reduces request overhead; the transport separately enforces
+#: ``MAX_EMBED_RESPONSE_BYTES``, since response size also depends on vector dimensions and JSON serialization.
 MAX_EMBED_BATCH = 100
 
 
@@ -178,20 +181,6 @@ def _embedding_vectors(
     return tuple(validate_embedding_vector(row.get("embedding"), dimensions=dimensions) for row in data)
 
 
-def parse_embedding_response(
-    payload: object, *, dialect: str, dimensions: int
-) -> tuple[tuple[float, ...], dict[str, int] | None]:
-    """Read one vector, and any usage the provider reported, from a response.
-
-    The two dialects differ only here and in the request body; reservation,
-    transport, deadlines and error mapping are shared.
-    """
-    if not isinstance(payload, dict):
-        raise AuxiliaryModelError("unsupported_response_shape")
-    usage = _embedding_usage(payload, dialect=dialect)
-    return _embedding_vector(payload, dialect=dialect, dimensions=dimensions), usage
-
-
 def validate_embedding_vector(values: object, *, dimensions: int | None = None) -> tuple[float, ...]:
     if not isinstance(values, list):
         raise AuxiliaryModelError("unsupported_response_shape")
@@ -277,6 +266,15 @@ class EmbeddingRouteConfig:
         return self.dialect or "gemini"
 
 
+def _encoded_document(text: str) -> str:
+    """``text`` encoded as a document, refused before anything is sent when the part of it the request carries holds
+    secret-like text (``embedding_sends_secret_like_text``)."""
+    encoded = encode_embedding_text(text, kind="document")
+    if embedding_sends_secret_like_text(text):
+        raise AuxiliaryModelError("sensitive_request")
+    return encoded
+
+
 class GeminiEmbeddingAdapter:
     def __init__(
         self,
@@ -295,7 +293,7 @@ class GeminiEmbeddingAdapter:
         self._query_transport = (
             transport
             if transport is not None
-            else HttpsTransport(persistent=True, allow_insecure_endpoint=route.allow_insecure_endpoint)
+            else HttpsTransportPool(size=QUERY_EMBED_CONNECTIONS, allow_insecure_endpoint=route.allow_insecure_endpoint)
         )
         self._owns_transport = transport is None
         space = route.space()
@@ -307,18 +305,14 @@ class GeminiEmbeddingAdapter:
         self._dialect = route.wire_dialect()
 
     def embed_query(self, text: str, *, remaining_seconds: float) -> Sequence[float]:
-        # The whole query first: the request guard sees only what the input bound keeps, so a key that straddled
-        # the cut went out in part.  A query is the owner's message as typed, screened by nothing before this.
+        # The whole query, before the input bound cuts it, so a key the cut runs through is not sent in part.  A query
+        # is the owner's message as typed, screened by nothing before this.
         reject_secrets(text)
         encoded = encode_embedding_text(text, kind="query")
         return self._embed(encoded, remaining_seconds=remaining_seconds, transport=self._query_transport)
 
     def embed_queries(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
-        """Several queries in one request on the query connection, answered in the order they were sent.
-
-        A question recall reads two ways (``core/owner_view.py``) is embedded once: asked one after the other, the
-        second waited for the first on the one persistent connection, and a recall tool's 2 s left it no time.
-        """
+        """Batch one recall's query phrasings on one borrowed connection, preserving their order."""
         for text in texts:
             # The whole query, before the input bound cuts it; the screen reads it normalised, as it is sent.
             reject_secrets(text)
@@ -340,8 +334,7 @@ class GeminiEmbeddingAdapter:
             self._transport.close()
 
     def embed_source(self, source: StoredSource, *, remaining_seconds: float) -> Sequence[float]:
-        encoded = encode_embedding_text(source.event["content"], kind="document")
-        return self._embed(encoded, remaining_seconds=remaining_seconds)
+        return self._embed(_encoded_document(source.event["content"]), remaining_seconds=remaining_seconds)
 
     def embed_sources(
         self, sources: Sequence[StoredSource], *, remaining_seconds: float
@@ -352,23 +345,22 @@ class GeminiEmbeddingAdapter:
         request, and a store with a hundred thousand sources is a hundred
         thousand requests to rebuild one at a time.
         """
-        encoded = [encode_embedding_text(source.event["content"], kind="document") for source in sources]
-        return self.embed_texts(encoded, remaining_seconds=remaining_seconds)
+        return self.embed_texts([source.event["content"] for source in sources], remaining_seconds=remaining_seconds)
 
-    def embed_texts(self, encoded: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
-        """Embed already-encoded document texts, in as few requests as the provider allows.
+    def embed_texts(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
+        """Embed document texts, each encoded and screened as ``embed_text`` does, using ``MAX_EMBED_BATCH`` as a
+        provider-compatibility cap, splitting larger document groups so callers do not manage batch boundaries.
 
-        The provider takes ``MAX_EMBED_BATCH`` texts per request and refuses more, so a longer
-        group is sent as consecutive full requests rather than refused: what a caller asks for
-        is how many documents it has, not how the endpoint is shaped.  Measured against the
-        live provider: 32 texts in 2.6s, 100 in 3.8s, 250 refused with HTTP 400.  A request also
-        stays within the ledger's ``max_request_bytes`` (``request_chunks``).
+        Requests contain at most ``MAX_EMBED_BATCH`` texts.  Batches are also split against ``max_request_bytes``;
+        a single text whose request body exceeds that cap remains a one-text batch and is rejected by the ledger
+        before transmission.  A text the guard refuses refuses the group before any request is sent.
         """
-        texts = list(encoded)
+        texts = list(texts)
         if not texts:
             return ()
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
-        chunks = request_chunks(texts, body=self._request_body, limit=self._ledger.policy.max_request_bytes)
+        encoded = [_encoded_document(text) for text in texts]
+        chunks = request_chunks(encoded, body=self._request_body, limit=self._ledger.policy.max_request_bytes)
         if len(chunks) == 1:
             return tuple(self._embed_many(chunks[0], remaining_seconds=seconds_left(deadline)))
 
@@ -381,7 +373,7 @@ class GeminiEmbeddingAdapter:
         with ThreadPoolExecutor(
             max_workers=min(EMBED_REQUEST_CONCURRENCY, len(chunks)), thread_name_prefix="scope-recall-embed"
         ) as pool:
-            answers = [pool.submit(request, chunk) for chunk in chunks]
+            answers = [pool.submit(copy_context().run, request, chunk) for chunk in chunks]
             for answer in answers:  # in the order they were asked
                 vectors.extend(answer.result())
         return tuple(vectors)
@@ -393,8 +385,7 @@ class GeminiEmbeddingAdapter:
         here as the rendered assertion. Same encoding as a source, so both land
         in one comparable space.
         """
-        encoded = encode_embedding_text(text, kind="document")
-        return self._embed(encoded, remaining_seconds=remaining_seconds)
+        return self._embed(_encoded_document(text), remaining_seconds=remaining_seconds)
 
     def _request_body(self, texts: Sequence[str]) -> bytes:
         """The request body for ``texts`` in this route's dialect."""
@@ -405,10 +396,9 @@ class GeminiEmbeddingAdapter:
         )
 
     def _embed_many(self, texts: list[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
-        """The one-request path, for any number of texts; identical bounds to ``_embed``."""
+        """The one-request path, for any number of encoded texts their callers screened; identical bounds to
+        ``_embed``."""
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
-        for text in texts:
-            reject_secrets(text)
         return self._send(
             self._request_body(texts),
             deadline,
@@ -419,8 +409,10 @@ class GeminiEmbeddingAdapter:
     def _embed(
         self, encoded_text: str, *, remaining_seconds: float, transport: HttpTransport | None = None
     ) -> Sequence[float]:
+        """One request for an encoded text.  Its caller screened the text it was encoded from (the whole query, or
+        ``embedding_sends_secret_like_text``): the body adds the template and the cut's marker, which hold nothing
+        secret."""
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
-        reject_secrets(encoded_text)
         return self._send(
             self._request_body(encoded_text),
             deadline,

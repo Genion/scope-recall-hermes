@@ -1,4 +1,4 @@
-"""P12 regression: automatic recall must not let an old query echo crowd out facts."""
+"""Automatic recall must not let an old query echo crowd out facts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 
 from tests.contract.test_claims import Clock, capture
-from tests.v11_support import context, recall_request
+from tests.v11_support import context, recall_request, slowdown
 
 
 @pytest.fixture
@@ -116,7 +116,7 @@ def test_auto_followup_keeps_original_query_filter(app):
 )
 def test_an_older_copy_is_the_same_words_whatever_closes_them(older, query, same):
     """Only the closing marks and surrounding spaces may differ, and the two must both end asking or both not: a
-    statement asked back as a question is not a copy of it, however long (review of 3.7.1).  The words, their letter
+    statement asked back as a question is not a copy of it, however long.  The words, their letter
     case included, may not differ."""
     from scope_recall.core.recall_policy import same_message
 
@@ -124,20 +124,20 @@ def test_an_older_copy_is_the_same_words_whatever_closes_them(older, query, same
 
 
 def test_closing_marks_are_read_from_the_end_once():
-    """A long run of spaces or marks inside a message costs one pass: a pattern anchored at the end tried it again from
-    every position of the run, seconds for one candidate (review of 3.7.1)."""
-    import time
-
+    """A long run of spaces or marks inside a message costs one pass, not a pattern anchored at the end that tries it
+    again from every position of the run, which takes seconds for one candidate: four times the run takes about four
+    times as long (``slowdown``)."""
     from scope_recall.core.recall_policy import same_message
 
+    def compared(text):
+        return same_message(text, text + "。"), same_message(text, "P12")
+
     text = "P12" + " ." * 40_000 + "x"
-    started = time.monotonic()
-    assert same_message(text, text + "。") is True
-    assert same_message(text, "P12") is False
-    assert time.monotonic() - started < 1.0
+    assert compared(text) == (True, False)
+    assert slowdown(compared, "P12" + " ." * 10_000 + "x", text) < 8
 
 
-# -- what the asking model still holds (#249) ---------------------------------------------------------------------
+# -- what the asking model still holds ----------------------------------------------------------------------------
 # A host that keeps the whole session in its model's context (Claude Code until it compacts) says since when; an
 # automatic recall then leaves out what stands only on this session's turns since that moment, and other memories
 # take the slots.
@@ -277,55 +277,53 @@ def test_what_the_model_holds_still_leads_to_what_is_related_to_it(app):
     assert sorted(candidate.ref for candidate, _obj in hydrated) == ["claim-old", "claim-other"]
 
 
-def test_hits_too_large_for_any_packet_leave_the_owner_s_background_room(tmp_path):
-    """An automatic recall whose every hit is larger than any packet kept six of them, the compiler refused each, and
-    the packet came back empty; the owner's background was cut with them.  One stays as the hint that it can be
-    expanded.  Leaving out what the model holds made this likelier (#249)."""
+def test_hits_too_large_for_any_packet_cannot_leave_only_background(tmp_path):
+    """Background depends on query evidence surviving the compiler's whole-packet budget."""
     from tests.contract.test_autonomous_context import packet, preference
 
     ctx = replace(context(tmp_path / "TEST-p249-oversized"), project_id="TEST-project", branch_id="TEST-main")
     core = MemoryCore(CoreConfig(ctx.binding), clock=Clock())
     core.initialize()
     core.test_sequence = itertools.count(1)
-    item, _source = preference(core, ctx)
+    preference(core, ctx)
     for index in range(7):
         capture(core, ctx, f"火星咖啡采购报价 第{index}份：" + "价" * 9000, key=f"TEST-p249/huge/{index}")
-    result = packet(core, ctx, request_id="TEST-p249-oversized")
-    assert [entry["ref"] for entry in result["items"]] == [item.ref], result["gaps"]
+    result = packet(core, ctx, query="火星咖啡采购报价是什么", request_id="TEST-p249-oversized")
+    assert result["items"] == [], result["gaps"]
+    assert result["answerability"] == "unknown"
     assert any(need.startswith("expandable") for need in result["unmet_needs"]), "the hint that it can be expanded"
 
 
 def test_the_owner_s_background_the_model_holds_is_left_out_too(tmp_path):
     """A standing preference the owner stated in this session since its last compaction is in the model's context
-    already; background is not admitted like a hit, and it was delivered again (the replay's last ten copies)."""
-    from tests.contract.test_autonomous_context import packet, preference
+    already; background is not admitted like a hit, so it is left out too, not delivered again.  Background rides
+    only with passing query evidence, so the unrelated question has an answer of its own, said in another session
+    that this session's model does not hold."""
+    from scope_recall.core.background_context import BACKGROUND_PREFIX
+
+    from tests.contract.test_autonomous_context import preference
 
     ctx = replace(context(tmp_path / "TEST-p249-background"), project_id="TEST-project", branch_id="TEST-main")
     core = MemoryCore(CoreConfig(ctx.binding), clock=Clock())
     core.initialize()
     core.test_sequence = itertools.count(1)
-    item, source = preference(core, ctx)  # said at 2026-09-01T12:00:00Z, in this session
+    item, _source = preference(core, ctx)  # said at 2026-09-01T12:00:00Z, in this session
+    quoting = replace(ctx, session_id="TEST-quote-session")
+    capture(core, quoting, "火星咖啡采购报价是每箱 TEST-120 元。", key="TEST-p249/quote")
 
-    def refs(**changes):
-        return [entry["ref"] for entry in packet(core, ctx, **changes)["items"]]
+    def background(asking, request_id, since=None):
+        held = {} if since is None else {"in_context_since": since}
+        result = core.recall_packet(
+            asking, recall_request(query="火星咖啡采购报价是什么", request_id=request_id), **held
+        )
+        items = result["items"]
+        assert any(not entry["applicability"].startswith(BACKGROUND_PREFIX) for entry in items), result["gaps"]
+        return [entry["ref"] for entry in items if entry["applicability"].startswith(BACKGROUND_PREFIX)]
 
-    assert item.ref in refs(request_id="TEST-bg-0")
-    held = core.recall_packet(
-        ctx,
-        recall_request(query="火星咖啡采购报价是什么", request_id="TEST-bg-1"),
-        in_context_since="2026-09-01T11:00:00Z",
-    )
-    assert item.ref not in [entry["ref"] for entry in held["items"]]
-    later = core.recall_packet(
-        ctx,
-        recall_request(query="火星咖啡采购报价是什么", request_id="TEST-bg-2"),
-        in_context_since="2026-09-01T13:00:00Z",
-    )
-    assert item.ref in [entry["ref"] for entry in later["items"]], "said before the compaction"
+    assert item.ref in background(ctx, "TEST-bg-0")
+    assert item.ref not in background(ctx, "TEST-bg-1", since="2026-09-01T11:00:00Z")
+    assert item.ref in background(ctx, "TEST-bg-2", since="2026-09-01T13:00:00Z"), "said before the compaction"
     other = replace(ctx, session_id="TEST-other-session")
-    elsewhere = core.recall_packet(
-        other,
-        recall_request(query="火星咖啡采购报价是什么", request_id="TEST-bg-3"),
-        in_context_since="2026-09-01T11:00:00Z",
+    assert item.ref in background(other, "TEST-bg-3", since="2026-09-01T11:00:00Z"), (
+        "another session's model does not hold it"
     )
-    assert item.ref in [entry["ref"] for entry in elsewhere["items"]], "another session's model does not hold it"

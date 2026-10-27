@@ -17,6 +17,7 @@ import time
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from scope_recall.adapters.clients import CodexHookHandler
@@ -37,6 +38,9 @@ from scope_recall.adapters.hermes.shared_entries import (
 )
 from scope_recall.contracts import ContractError, InstanceBinding
 from scope_recall.core.capture import CaptureReceipt
+from scope_recall.core.capture_inbox import replay_inbox
+
+from tests.store_clock import assert_hook_budget
 
 NOW = "2026-09-24T20:00:00Z"
 AGENT = "TEST-agent"
@@ -46,10 +50,11 @@ OWNER = "TEST-owner"
 
 @pytest.fixture
 def store(tmp_path):
+    """Create a synthetic store shared by the attached host entries."""
     root = tmp_path / "TEST-shared"
     write_shared_payload(root, new_shared_payload(root, agent_id=AGENT))
     homes = {}
-    for name, display in (("tianshu", "天枢"), ("tianquan", "天权")):
+    for name, display in (("agent3", "天三"), ("agent2", "天二")):
         home = tmp_path / f"TEST-{name}-home"
         home.mkdir()
         attach_shared_entry(
@@ -94,6 +99,47 @@ def _prompt(text, *, session="TEST-cc-session", prompt_id="TEST-prompt-1", cwd="
 def _hook(client):
     # The system clock, as the Hermes entries use: a fixed earlier "now" would hide their sources as future ones.
     return CodexHookHandler.from_home(str(client), "claude-code")
+
+
+def test_a_shared_entry_status_with_a_newline_uses_its_stored_session(store, tmp_path, monkeypatch):
+    root, _homes, _client, capture_scope = store
+    client = tmp_path / "TEST-status-client"
+    attach_shared_record(
+        root,
+        client_entry_record(
+            host="codex",
+            home=client,
+            entry_id="test-status-entry",
+            display_name="Test status entry",
+            attached_at=NOW,
+            allowed_scope_ids=[capture_scope],
+            writable_scope_ids=[capture_scope],
+            capture_scope_id=capture_scope,
+        ),
+        now=NOW,
+    )
+    hook = CodexHookHandler.from_home(str(client), "codex")
+    monkeypatch.setattr(hook, "ensure_runtime", lambda *a, **k: None)
+    try:
+        payload = dict(
+            hook_event_name="UserPromptSubmit",
+            session_id="TEST-status-session",
+            turn_id="TEST-first",
+            cwd="C:/TEST/project",
+            prompt="Prepare a synthetic poster.",
+        )
+        hook.handle_payload(payload)
+        monkeypatch.setattr(
+            hook.core.recall_pipeline.storage_reader,
+            "lexical",
+            lambda *a, **k: pytest.fail("status requested a search"),
+        )
+        assert not hook.handle_payload(dict(payload, turn_id="TEST-second", prompt="删除了吗\n"))
+        assert hook.diagnostics.last_reason == "auto_recall_skipped:session_status"
+    finally:
+        hook.close()
+    rows = _rows(root, "SELECT entry_id,session_id FROM source_events WHERE entry_id='test-status-entry'")
+    assert rows == [("test-status-entry", "test-status-entry:TEST-status-session")] * 2
 
 
 def _rows(root, sql):
@@ -148,7 +194,7 @@ def test_a_prompt_is_the_owner_s_under_the_client_s_entry_and_a_hermes_entry_rec
     # Attaching the client made its local user the owner, the way the Hermes CLI's is.
     assert principal_ref("human", store_id, "claude-code", "local") in rows[0][6]
 
-    asked = _hermes(homes["tianshu"])
+    asked = _hermes(homes["agent3"])
     try:
         injected = asked.prefetch("青鸟计划的代号 QX-17 是什么")
     finally:
@@ -162,7 +208,7 @@ def test_a_prompt_is_the_owner_s_under_the_client_s_entry_and_a_hermes_entry_rec
 
 def test_what_a_hermes_entry_was_told_reaches_the_client_s_prompt_marked_as_theirs(store):
     root, homes, client, _capture = store
-    told = _hermes(homes["tianquan"])
+    told = _hermes(homes["agent2"])
     try:
         told.on_turn_start(1, "TEST 白鹭项目的负责人是 KZ-42。", turn_id="TEST-turn-1", session_id="TEST-session-1")
         told.observe_pre_llm(
@@ -181,7 +227,7 @@ def test_what_a_hermes_entry_was_told_reaches_the_client_s_prompt_marked_as_thei
     guidance, _newline, body = context.partition("\n")
     assert "You are Claude Code (claude-code)" in guidance
     marked = [item for item in json.loads(body)["items"] if "KZ-42" in item["content"]]
-    assert marked and all(item["entries"] == [{"id": "tianquan", "name": "天权"}] for item in marked)
+    assert marked and all(item["entries"] == [{"id": "agent2", "name": "天二"}] for item in marked)
 
 
 def test_the_client_s_tool_traffic_is_not_recorded_and_a_turn_needs_its_prompt_id(store):
@@ -211,8 +257,7 @@ def test_the_client_s_tool_traffic_is_not_recorded_and_a_turn_needs_its_prompt_i
 
 
 def test_a_session_start_on_an_entry_reads_nothing_of_the_store(store, monkeypatch):
-    """A local installation checks its store's status at a session start; on the pilot's shared store that
-    count took 7-8 s, past Codex's 2 s hook timeout.  An entry was checked when its config loaded."""
+    """Session start on a shared entry performs no store-status query; loading its configuration checks the entry."""
     _root, _homes, client, _capture = store
     hook = _hook(client)
     monkeypatch.setattr(hook.core, "status", lambda *args, **kwargs: pytest.fail("status read at a session start"))
@@ -248,9 +293,8 @@ def _codex_client(root, tmp_path):
 
 
 def test_a_client_s_prompt_runs_the_entry_s_budget(store, tmp_path):
-    """Recall on the pilot's shared store took 2.7-5.7 s.  Claude Code waits 15 s for a prompt's hook and Codex
-    now as long, so both run the entry's configured budget; with 2 s most of Codex's automatic recalls came back
-    empty.  No installer writes ``hook_processing_seconds``: a config without it runs the worker's 6 s."""
+    """Both clients honor the entry's configured hook budget. A missing setting uses the worker's default;
+    an out-of-bounds value falls back to the hook's own budget."""
     root, _homes, client, _capture = store
     codex = _codex_client(root, tmp_path)
     for home, host in ((client, "claude-code"), (codex, "codex")):
@@ -280,19 +324,21 @@ def test_a_client_s_prompt_runs_the_entry_s_budget(store, tmp_path):
         hook.close()
 
 
-def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_path):
+def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_path, metered_store):
     """The budget bounds a prompt's capture and recall; it is not a wait.  A small store answers in well under
-    the 6 s a hook may take, and the client's prompt goes on as soon as it does."""
+    the 6 s a hook may take, and the client's prompt goes on as soon as it does.  Each store transaction counts 0.05 s
+    on the hook's clock, however long the runner's store takes, and everything else as long as it takes."""
     root, _homes, _client, _capture = store
     codex = _codex_client(root, tmp_path)
     # What attach writes: the routes, and no hook budget of its own.
     (codex / "scope-recall" / "runtime-config.json").write_text(
         json.dumps({"auto_recall_seconds": 5.0}), encoding="utf-8"
     )
+    clock = metered_store(0.05)
     hook = CodexHookHandler.from_home(str(codex), "codex")
     try:
         assert hook._hook_budget() == 6.0
-        started = datetime.now(timezone.utc)
+        started = clock()
         hook.handle_payload(
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -302,7 +348,7 @@ def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_pa
                 "cwd": "C:/anywhere",
             }
         )
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        elapsed = clock() - started
     finally:
         hook.close()
     assert hook.diagnostics.last_reason is None, hook.diagnostics.last_reason
@@ -335,7 +381,7 @@ def test_a_pointer_binds_only_its_own_host_and_home(store, tmp_path):
     with pytest.raises(CodexConfigError):
         load_shared_client(client, "codex")
     with pytest.raises(CodexConfigError):
-        load_shared_client(homes["tianshu"], "claude-code")
+        load_shared_client(homes["agent3"], "claude-code")
     copied = tmp_path / "TEST-copied-home"
     (copied / "scope-recall").mkdir(parents=True)
     (copied / "scope-recall" / "attachment.json").write_bytes(
@@ -370,9 +416,9 @@ READ_TOOLS = ["recall", "inspect", "profile", "trace", "entity", "status"]
 
 @pytest.mark.parametrize("host", ["claude-code", "workbuddy", "dsh", "codex"])
 def test_only_a_client_that_names_its_conversation_is_offered_the_tools_that_change_the_store(store, tmp_path, host):
-    """#245: the store takes a change only on the word of the person's latest message in the same conversation, and
-    Claude Code, WorkBuddy and dsh name no conversation with a tool call: offered there, propose_memory, revise and
-    forget were refused on every call (ACCESS_DENIED codex_thread_id).  Codex names its thread and keeps all nine."""
+    """Store changes require the person's latest message in the tool call's conversation.  Claude Code, WorkBuddy
+    and dsh name no conversation with a tool call, so they omit mutation tools; Codex names its thread and keeps all
+    nine tools."""
     root, _homes, client, _capture = store
     if host != "claude-code":
         owner = next(
@@ -532,8 +578,7 @@ def test_a_stop_records_what_the_session_record_shows_was_said_and_nothing_else(
 
 
 def test_a_long_prompt_is_stored_once_when_the_record_shows_it_again(store, tmp_path):
-    """A prompt over 65,536 characters is stored in segments under keys of their own, so the Stop's read of the
-    session record did not find it by its prompt id and stored it a second time (review of 3.4.0rc10)."""
+    """Segmented prompts are recognized by their prompt identity and stored once."""
     root, _homes, client, _capture = store
     text = "TEST 很长的提问。" + "长" * 70000
     record = _record(tmp_path / "TEST-projects" / "TEST-cc-session.jsonl", _person("u1", _moments()(0), text))
@@ -630,8 +675,7 @@ def test_record_check_carries_stop_budget_and_defers_large_schema_upgrade(store,
 
 
 def test_a_locked_database_during_the_record_check_ends_the_read_not_the_hook(store, tmp_path, monkeypatch):
-    """SQLite's own "database is locked" escaped the Stop hook's check of the session record, which ended the hook
-    (rc13).  The read ends there instead, and the next Stop starts again from the same line."""
+    """A locked database ends the transcript read without ending the hook; the next Stop retries the same line."""
     root, _homes, client, _capture = store
     record = _record(
         tmp_path / "TEST-projects" / "TEST-cc-session.jsonl", _person("u1", _moments()(0), "TEST locked record")
@@ -654,9 +698,7 @@ def test_a_locked_database_during_the_record_check_ends_the_read_not_the_hook(st
 
 
 def test_a_deleted_message_in_the_session_record_does_not_stop_its_read(store, tmp_path, monkeypatch):
-    """A record line whose message was deleted is refused for good (``ACCESS_DENIED:source_unavailable``), but the read
-    took the refusal as a store it might write later, and every later Stop stopped at that line (review of rc13).  It
-    counts as settled, and the read goes on."""
+    """A permanently refused deleted message is settled, allowing the transcript read to continue."""
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -682,9 +724,8 @@ def test_a_deleted_message_in_the_session_record_does_not_stop_its_read(store, t
 
 
 def test_a_stop_s_capture_time_is_all_of_its_captures(store, tmp_path, monkeypatch):
-    """The remote server logs a hook's capture time; for a Stop it was only the last record line's, each capture
-    writing over the one before (review of rc13).  All of a hook's captures count."""
-    import time
+    """Capture diagnostics sum precise durations even when the budget clock ticks coarsely."""
+    from scope_recall.adapters.clients import handler
 
     _root, _homes, client, _capture = store
     at = _moments()
@@ -695,18 +736,27 @@ def test_a_stop_s_capture_time_is_all_of_its_captures(store, tmp_path, monkeypat
     )
     hook = _hook(client)
     original = hook.core.record_event
+    elapsed = [100.0]
+    durations = iter((0.06, 0.09))
+    # Budget clocks can have coarse ticks; diagnostic durations need their own precise clock.
+    monkeypatch.setattr(
+        handler,
+        "time",
+        SimpleNamespace(monotonic=lambda: int(elapsed[0] * 64) / 64, perf_counter=lambda: elapsed[0]),
+    )
 
-    def slow(context, event, **kwargs):
-        time.sleep(0.06)
-        return original(context, event, **kwargs)
+    def capture(context, event, **kwargs):
+        receipt = original(context, event, **kwargs)
+        elapsed[0] += next(durations)
+        return receipt
 
-    monkeypatch.setattr(hook.core, "record_event", slow)
+    monkeypatch.setattr(hook.core, "record_event", capture)
     try:
         hook.handle_payload(_stop(record))
     finally:
         hook.close()
     total, last = hook.diagnostics.capture_total_ms, hook.diagnostics.capture_elapsed_ms
-    assert total >= 120 and total > last, (total, last)
+    assert (total, last) == (150, 90)
 
 
 def test_two_record_messages_repeating_hook_text_are_not_both_suppressed(store, tmp_path):
@@ -788,11 +838,6 @@ def test_a_prompt_still_in_the_inbox_is_not_stored_again_from_the_record(store, 
 
 
 def test_what_could_not_be_written_is_recorded_at_the_next_stop_once(store, tmp_path, monkeypatch):
-    from scope_recall.adapters.clients import handler as handler_module
-
-    # Room for every message of the record to be written in one hook however slow the runner: what is written and
-    # when, not the budget, is under test.  On the 2 s default a slow runner left the last ones for a later stop.
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 30.0)
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -904,8 +949,7 @@ def test_codex_does_not_read_a_session_record(store, tmp_path):
 
 
 def test_a_task_notification_is_not_the_owner_s_prompt(store):
-    """Claude Code hands the model a notice as a prompt when a background task finishes; on the pilot the
-    first such notice was stored as the owner's message."""
+    """A background-task notice passed as a prompt is excluded from the owner's captured words and recall."""
     root, _homes, client, _capture = store
     notice = "<task-notification>\n<task-id>TEST</task-id>\n<status>completed</status>\n</task-notification>"
     hook = _hook(client)
@@ -919,7 +963,7 @@ def test_a_task_notification_is_not_the_owner_s_prompt(store):
 
 
 #: What Claude's desktop app puts in the person's first message when a session starts without a project folder,
-#: shortened (#248).  Synthetic.
+#: shortened and synthetic.
 APP_REMINDER = (
     "<system-reminder>\nTEST The user started this session without choosing a project folder, so your working "
     "directory is a scratch workspace the app created for it.\n</system-reminder>"
@@ -927,9 +971,9 @@ APP_REMINDER = (
 
 
 def test_a_reminder_the_desktop_app_puts_in_a_prompt_is_not_the_owner_s_words(store, monkeypatch):
-    """#248: Claude's desktop app puts a <system-reminder> ahead of what the person typed; it was stored as their words,
-    claims were drawn from it, and it was recalled for.  A prompt that is only reminders stores and recalls nothing,
-    here and on the entry's server; the person's own words about such a block stay."""
+    """Reminder blocks inserted by the app are excluded from the person's captured words and recall query.  A prompt
+    containing only reminders stores and recalls nothing, locally or on the entry's server; the person's own words
+    about a block stay."""
     root, _homes, client, _capture = store
     asked = []
     monkeypatch.setattr(
@@ -957,8 +1001,8 @@ def test_a_reminder_the_desktop_app_puts_in_a_prompt_is_not_the_owner_s_words(st
 
 
 def test_a_reminder_the_desktop_app_puts_in_the_record_is_not_the_owner_s_words(store, tmp_path):
-    """#248, the session record: the reminder is a text block of its own, or ahead of the typed text in one string, in
-    a message the record marks as the person's.  A message that is only reminders is not theirs."""
+    """A reminder in a person-role record is excluded whether it is a separate text block or precedes the typed text
+    in one string.  A message containing only reminders is not captured as the person's words."""
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -1003,9 +1047,8 @@ def _compaction(stamp):
 
 
 def test_a_prompt_s_recall_leaves_out_what_claude_code_s_model_still_holds(store, tmp_path):
-    """#249: a message of this session the model still has (said since its last compaction, or in a session that has
-    had none) came back in a later prompt's recall, a second copy in the context.  One said before the compaction
-    reaches the model only as the compaction's summary, and is still recalled."""
+    """Recall excludes this session's messages that the model still holds, including every message when no compaction
+    has occurred.  Messages before compaction remain recallable because the model holds only their summary."""
     root, _homes, client, _capture = store
     record = tmp_path / "TEST-projects" / "TEST-cc-session.jsonl"
     record.parent.mkdir(parents=True)
@@ -1057,7 +1100,7 @@ def test_the_doctor_names_owner_words_stored_with_a_reminder(store, monkeypatch)
     check_owner_words(report, "claude-code", root, "claude-code")
     assert report.capability_gaps == ["owner_words_with_client_reminder"]
     assert report.checks == [{"name": "owner_words", "result": "client_reminders", "detail": f"1: {event}@{revision}"}]
-    for entry in ("tianshu", None):
+    for entry in ("agent3", None):
         other = DoctorReport(host="claude-code", status="ok")
         check_owner_words(other, "claude-code", root, entry)
         assert other.capability_gaps == [] and other.checks == [], "another entry's, or another store's"
@@ -1211,9 +1254,8 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
 
 
 def test_the_rest_of_codex_s_suggestions_thread_is_not_stored_either(store, tmp_path):
-    """The request and its answer were kept out, but the thread's tool calls and end came through: on the pilot one
-    thread left four tool outputs of 2-11 kB and an end marker.  Each hook is a process of its own, so the thread is
-    marked when its request is recognized, and its end removes the mark."""
+    """Every hook of a suggested-message thread is excluded, including tool calls and the end marker. Each hook
+    runs in its own process, so recognizing the request persists a thread mark and session end removes it."""
     root, _homes, _client, _capture = store
     codex = _codex_client(root, tmp_path)
 
@@ -1287,31 +1329,24 @@ def test_the_doctor_names_codex_s_requests_stored_as_the_owner_s_words(store, tm
     refs = ",".join(f"{event}@{revision}" for event, revision in written_by_codex)
     assert report.checks == [{"name": "owner_words", "result": "host_requests", "detail": f"4: {refs}"}]
     other = DoctorReport(host="codex", status="ok")
-    check_owner_words(other, "codex", root, "tianshu")
+    check_owner_words(other, "codex", root, "agent3")
     assert other.capability_gaps == [] and other.checks == [], "another entry's"
 
 
 def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store):
-    """A recall request carries at most 8,192 characters of query.  A longer prompt went whole, the request was
-    refused, and the turn had no recall at all: three of the work computer's Codex prompts in one morning."""
+    """A long prompt recalls its bounded prefix when the source clears the lexical floor."""
     _root, homes, client, _capture = store
-    told = _hermes(homes["tianquan"])
+    attachment = "".join(chr(0x4E00 + index) for index in range(180))
+    remembered = "TEST 白鹭项目的负责人是 KZ-42。"
+    told = _hermes(homes["agent2"])
     try:
-        told.on_turn_start(1, "TEST 白鹭项目的负责人是 KZ-42。", turn_id="TEST-turn-1", session_id="TEST-session-1")
-        told.observe_pre_llm(
-            session_id="TEST-session-1", turn_id="TEST-turn-1", user_message="TEST 白鹭项目的负责人是 KZ-42。"
-        )
-        told.sync_turn("TEST 白鹭项目的负责人是 KZ-42。", "好的。", session_id="TEST-session-1")
+        told.on_turn_start(1, remembered, turn_id="TEST-turn-1", session_id="TEST-session-1")
+        told.observe_pre_llm(session_id="TEST-session-1", turn_id="TEST-turn-1", user_message=remembered)
+        told.sync_turn(remembered, "好的。", session_id="TEST-session-1")
     finally:
         told.shutdown()
     # Distinct characters, so the prompt has far more than 128 distinct terms as a real one would.
-    prompt = (
-        "白鹭项目的负责人 KZ-42 是谁？下面是附件：\n"
-        + "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜金生丽水玉出昆冈剑号巨阙珠称夜光果珍李柰菜重芥姜海咸河淡鳞潜羽翔龙师火帝鸟官人皇始制文字乃服衣裳推位让国有虞陶唐吊民伐罪周发殷汤坐朝问道垂拱平章爱育黎首臣伏戎羌遐迩一体率宾归王鸣凤在竹白驹食场化被草木赖及万方"
-        * 3
-        + "\n"
-        + "TEST 附件里的一行字。\n" * 800
-    )
+    prompt = "白鹭项目的负责人 KZ-42 是谁？下面是附件：\n" + attachment * 3 + "\n" + "TEST 附件里的一行字。\n" * 800
     assert len(prompt) > 8192
     hook = _hook(client)
     try:
@@ -1326,9 +1361,8 @@ def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store):
 
 
 def test_a_failed_recall_says_what_stopped_it(store, ample_budget, monkeypatch, capsys):
-    """The work computer's server logged recall_exception three times with nothing else: the cause had to be found
-    by reading the store.  The hook needs time enough to reach the recall: on the 2 s default a slow CI runner spent
-    it attaching the runtime, and the hook said deadline_exceeded instead (windows-latest, 2026-10-05)."""
+    """A failed recall reports its contract error in diagnostics and the hook's error output. The fixture reserves
+    enough hook time to reach recall, so an earlier deadline does not replace the failure being checked."""
     from scope_recall.adapters.clients.hook_answer import emit_result
     from scope_recall.core import MemoryCore
 
@@ -1378,6 +1412,63 @@ def test_a_prompt_the_store_could_not_take_is_still_recalled_by_meaning(store, m
         refused.close()
 
 
+#: Another process of the store's: it holds the store's writer lease until a line comes on its stdin.
+_LEASE_HOLDER = """
+import sys
+
+from scope_recall.core.writer_lease import TruthWriterLease
+
+lease = TruthWriterLease(sys.argv[1], role="provider")
+assert lease.acquire()["status"] == "acquired"
+print("holding", flush=True)
+sys.stdin.readline()
+lease.release()
+"""
+
+
+def test_the_owner_s_prompt_waits_out_a_writer_lease_another_process_holds_past_a_second(store):
+    """An owner's prompt waits up to 2 s for the writer lease and reaches durable storage. When the inbox write uses
+    most of that time, its source commit waits for replay instead of taking another write of the same duration."""
+    import threading
+
+    root, _homes, client, _capture = store
+    # A runtime config that names no budget: the entry's 6 s, as a real entry's hooks run.
+    (client / "scope-recall" / "runtime-config.json").write_text(json.dumps({"resident_recall_minutes": 0}), "utf-8")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LEASE_HOLDER, str(root)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+
+    def release():
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+
+    try:
+        assert holder.stdout.readline().strip() == "holding"
+        hook = _hook(client)
+        # Let go 1.3 s after the hook starts: past the 1 s, within the prompt's 2 s, however late its capture begins.
+        timer = threading.Timer(1.3, release)
+        timer.start()
+        try:
+            hook.handle_payload(_prompt("TEST 等写锁让开的一句。", prompt_id="TEST-prompt-lease"))
+        finally:
+            timer.join()
+            hook.close()
+    finally:
+        holder.communicate(timeout=30)
+    assert hook.diagnostics.capture_error_type is None
+    assert hook.call.captured
+    audience = hook.audience_of(_prompt("TEST replay"))
+    context = hook.context(audience, "TEST-cc-session", "human_direct")
+    replay_inbox(
+        hook.core.storage,
+        hook.core.clock,
+        context,
+        authorize=lambda scope: context.allowed_scope_ids,
+        remaining_seconds=10,
+    )
+    assert _user_rows(root) == [("TEST 等写锁让开的一句。",)]
+
+
 def test_a_prompt_whose_capture_failed_before_the_secret_screen_still_keeps_a_credential_from_the_vectors(
     store, monkeypatch
 ):
@@ -1402,7 +1493,7 @@ def test_a_prompt_whose_capture_failed_before_the_secret_screen_still_keeps_a_cr
 
 def test_a_prompt_blank_for_its_first_8192_characters_is_recalled_by_what_follows(store):
     _root, homes, client, _capture = store
-    told = _hermes(homes["tianquan"])
+    told = _hermes(homes["agent2"])
     try:
         told.on_turn_start(1, "TEST 白鹭项目的负责人是 KZ-42。", turn_id="TEST-turn-1", session_id="TEST-session-1")
         told.observe_pre_llm(
@@ -1545,9 +1636,7 @@ def small_reserve(monkeypatch):
 
 @pytest.fixture
 def ample_budget(monkeypatch):
-    """For a test that needs the server's answer: a hook on the 2 s default asked no server when storing the prompt
-    took most of it, as on a slow CI runner (the prompt's write took 5.6 s on windows-latest, 2026-10-04, and the hook
-    recalled by itself).  The server answers at once; the time is only there to be enough."""
+    """Reserve hook time for semantic server-answer tests to reach recall after runtime attachment and capture."""
     from scope_recall.adapters.clients import handler as handler_module
 
     monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 30.0)
@@ -1556,9 +1645,8 @@ def ample_budget(monkeypatch):
 def test_the_server_answers_a_prompt_s_recall_and_the_hook_stores_the_prompt(
     resident, small_reserve, ample_budget, monkeypatch, capsys
 ):
-    """A cold prompt's recall was often done before its LanceDB helper was ready: on the pilot 6 of 8 cold Claude
-    Code prompts recalled by words alone.  The client's MCP server lives as long as the client and recalls warm; the
-    prompt is stored by its own hook, as before."""
+    """The resident server answers the prompt's recall while the hook stores the prompt. Closing the server removes
+    its endpoint, so another hook cannot mistake a closed server for an available one."""
     root, client, endpoint = resident
     calls = _counted(endpoint, monkeypatch)
     raw = json.dumps(_prompt("TEST 常驻进程给这句召回。", prompt_id="TEST-prompt-resident")).encode()
@@ -1571,16 +1659,14 @@ def test_the_server_answers_a_prompt_s_recall_and_the_hook_stores_the_prompt(
     assert not endpoint.path.exists()
 
 
-def test_a_late_answer_leaves_the_prompt_stored_once(resident, small_reserve, monkeypatch, capsys):
+def test_a_late_answer_leaves_the_prompt_stored_once(
+    resident, small_reserve, storing_takes_no_hook_time, monkeypatch, capsys
+):
     """The first version had the server store the prompt too: one that answered after its hook stopped waiting left
     the prompt stored twice.  The server now only recalls, and the hook recalls itself; while its late recall runs, the
     server tells the next prompt at once that it is busy."""
     import threading
 
-    from scope_recall.adapters.clients import handler as handler_module
-
-    # A real entry's 6 s: on the 2 s default, a slow runner's write of the prompt left no time to ask the server.
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 6.0)
     root, client, endpoint = resident
     release, finished = threading.Event(), []
     calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
@@ -1765,8 +1851,7 @@ def test_a_long_prompt_s_recall_is_answered(resident, small_reserve, monkeypatch
     """The first version re-escaped the payload into a JSON body: 22,000 Chinese characters made it too large (413)."""
     from scope_recall.adapters.clients import handler as handler_module
 
-    # The budget an entry's config gives (the test store's default is 2 s): on a slow CI runner storing this prompt
-    # took 2.25 s of the 2, and the hook never asked its server (rc13's CI).  The size is what is tested here.
+    # Use sufficient hook time to test payload size independently of storage speed.
     monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 10.0)
     root, client, endpoint = resident
     calls = _counted(endpoint, monkeypatch)
@@ -1814,8 +1899,8 @@ def test_credentials_rotated_or_removed_in_the_env_file_are_taken_up(store, monk
 
 
 def test_a_server_names_itself_in_the_user_s_own_profile(resident):
-    """The entry's home may sit on a drive every account can read (on the pilot, F:\\ gives Authenticated Users
-    write), and whoever holds a server's token can read the owner's memory through it."""
+    """The server's endpoint lives in the user's private profile, apart from an entry home other accounts may read.
+    Its token authorizes memory reads, so the endpoint and its directory require private permissions."""
     import os
     import stat
     from pathlib import Path
@@ -1843,9 +1928,7 @@ def test_a_prompt_with_half_of_a_broken_emoji_is_stored(store, capsys):
 def test_a_server_answer_that_ran_out_of_time_is_not_the_last_word(
     resident, small_reserve, ample_budget, monkeypatch, capsys
 ):
-    """A server's recall that ended in deadline_exceeded or recall_exception was taken as final, though the hook had
-    time for its own.  Then it was dropped and the hook said ``answered``: a server whose recalls kept failing looked
-    healthy (review of rc11)."""
+    """Incomplete server recalls trigger the hook's fallback and retain a diagnostic failure outcome."""
     _root, client, endpoint = resident
     marker = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "TEST-server-marker"}}
     for reason, detail, said in (
@@ -1872,8 +1955,7 @@ def test_a_server_answer_that_ran_out_of_time_is_not_the_last_word(
 
 
 def test_a_prompt_whose_server_runs_still_starts_its_helper(resident, small_reserve, monkeypatch):
-    """A prompt whose server ran started no helper of its own, and every recall the hook then did itself (the server
-    busy, late or failing) ran by words alone (review of rc11)."""
+    """Prompt hooks prepare their own vector helper even when a recall server is available."""
     from scope_recall.adapters.clients import hook_entry
 
     _root, client, _endpoint = resident
@@ -1926,10 +2008,11 @@ def test_the_mcp_server_starts_whatever_its_endpoint_does(store, monkeypatch):
     assert local_endpoint.serve(client, "claude-code") is None
 
 
-def test_a_slow_server_s_answer_is_taken_while_the_hook_recalls_alongside(resident, monkeypatch, capsys):
-    """Given only what the hook kept back, a server's recall that needed most of the time had none, and neither had
-    the hook's (review of rc11).  The server has all of it now: the hook recalls alongside once little is left, and
-    takes the server's answer when it comes."""
+def test_a_slow_server_s_answer_is_taken_while_the_hook_recalls_alongside(
+    resident, storing_takes_no_hook_time, monkeypatch, capsys
+):
+    """The server receives the available recall budget while the hook starts its fallback near the deadline
+    and accepts the server's answer when it arrives in time."""
     import time
 
     from scope_recall.adapters.clients import handler as handler_module
@@ -1958,9 +2041,7 @@ def test_a_slow_server_s_answer_is_taken_while_the_hook_recalls_alongside(reside
 
 
 def test_a_server_whose_recall_is_past_its_time_sends_hooks_on(resident, monkeypatch):
-    """A recall's time counted 2 s past what its hook gave it, and in between a hung server answered, named itself
-    again, and the next prompt waited on it (review of rc11).  It is stuck from that time, and until the recall ends
-    it tells every hook at once that it is busy."""
+    """A server with an overdue recall reports busy until that recall ends."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -1991,8 +2072,7 @@ def test_a_server_whose_recall_is_past_its_time_sends_hooks_on(resident, monkeyp
 
 
 def test_a_hung_first_name_leaves_time_for_the_next(resident, monkeypatch):
-    """A name whose server did not prove itself took the whole second of finding, and the next was never asked
-    (review of rc11)."""
+    """An unresponsive endpoint leaves enough discovery time to try the next server."""
     import os
     import socket
     import time
@@ -2024,13 +2104,12 @@ def test_a_hung_first_name_leaves_time_for_the_next(resident, monkeypatch):
         os.utime(named, (newer, newer))  # the newest name, asked first
         recaller = local_endpoint.Recaller(client, "claude-code")
         assert recaller(_prompt("TEST 第一个不应答。"), (), (), 3.0) is not None
-    # Kept, a name whose process no longer answered cost every later prompt its wait (review of rc11).
+    # Remove the unresponsive endpoint registration after discovery fails.
     assert recaller.outcome == "answered" and not named.exists()
 
 
 def test_a_first_read_of_the_env_file_that_failed_is_tried_again(store, monkeypatch, tmp_path):
-    """A server that could not read its env file at its start recorded it as read, and recalled by words alone until
-    its client restarted (review of rc11)."""
+    """An initial environment-file read failure is retried on a later prompt."""
     import os
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2059,8 +2138,7 @@ def test_a_first_read_of_the_env_file_that_failed_is_tried_again(store, monkeypa
 
 
 def test_a_key_the_runtime_config_comes_to_name_is_taken_up(store, monkeypatch, tmp_path):
-    """Only the env file was watched: a runtime config that came to name another key was not read again, and a key
-    the server's own start could not read stayed out though its endpoint had read it (review of rc11)."""
+    """Runtime-config changes refresh the credential names used by the server."""
     import os
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2092,8 +2170,7 @@ def test_a_key_the_runtime_config_comes_to_name_is_taken_up(store, monkeypatch, 
 
 
 def test_a_payload_nested_past_the_interpreter_s_limit_is_cleaned():
-    """The cleaning walked a payload by calling itself: a tool's output nested 499 levels deep ended the hook with a
-    RecursionError on Python 3.11 (review of rc11)."""
+    """Payload cleaning handles nesting beyond Python's recursion limit."""
     from scope_recall.adapters.clients.boundary import without_lone_surrogates
 
     top = node = {}
@@ -2116,10 +2193,9 @@ def _marker(text):
 def test_a_server_answer_without_its_vector_search_gives_way_to_the_hook_s_own(
     resident, small_reserve, ample_budget, monkeypatch, capsys
 ):
-    """A server whose vector search failed on its own (its key lost, say) answered every prompt by words alone, and
-    the hook took that though it had the key, the helper and the time (review of rc11).  The hook's own recall is
-    used when it has its vector search, and the server's words when it has not either.  A provider's refusal the hook
-    would meet as well: that answer is used as it is, and the hook does not recall a second time."""
+    """Server-local vector failures permit the hook's vector fallback when it is available.
+    The hook uses the server's lexical result if its own recall also lacks vectors.
+    Shared provider failures do not duplicate the request."""
     from scope_recall.adapters.clients import handler as handler_module
 
     _root, client, endpoint = resident
@@ -2166,9 +2242,8 @@ def test_a_server_answer_without_its_vector_search_gives_way_to_the_hook_s_own(
 
 
 def test_a_hook_whose_own_recall_went_without_vectors_waits_for_its_server(resident, ample_budget, monkeypatch, capsys):
-    """Recalling alongside, the hook stopped waiting the moment its own recall was done, dropped an answer that came in
-    the time it had given the server, and called the server late (review of rc11).  A hook whose own recall had no
-    vector search waits until its own time is up; one whose own had it does not."""
+    """A hook fallback without vectors waits for the server until the hook deadline;
+    a fallback with vectors can return immediately."""
     import time
 
     from scope_recall.adapters.clients import handler as handler_module
@@ -2204,8 +2279,7 @@ def test_a_hook_whose_own_recall_went_without_vectors_waits_for_its_server(resid
 
 
 def test_a_server_whose_recall_raises_says_so_and_keeps_its_name(resident, monkeypatch, capsys):
-    """A recall that raised dropped the connection: the hook took the server for another program and removed its
-    name, which came back and failed the same way, with only the error's class in the log (review of rc11)."""
+    """A recall exception reports failure and a traceback without removing the server's endpoint registration."""
     from scope_recall.adapters.clients import local_endpoint
 
     _root, client, endpoint = resident
@@ -2223,8 +2297,7 @@ def test_a_server_whose_recall_raises_says_so_and_keeps_its_name(resident, monke
 
 
 def test_a_runtime_config_that_will_not_load_keeps_the_keys(store, monkeypatch, tmp_path):
-    """Read again whenever the runtime config changed, a config that did not load (a TypeError) raised out of the
-    server's recall (review of rc11); what is loaded stays, and it is read again at the next prompt."""
+    """A failed configuration refresh preserves loaded credentials and retries on the next prompt."""
     import os
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2258,8 +2331,7 @@ def test_a_runtime_config_that_will_not_load_keeps_the_keys(store, monkeypatch, 
 
 
 def test_a_payload_nested_past_the_parser_s_limit_is_answered_empty(store, monkeypatch, capsys, past_the_parser):
-    """Nested past what the JSON parser takes, a tool's output ended the hook with a RecursionError and no answer
-    (review of rc11)."""
+    """JSON beyond the parser's nesting limit receives an empty hook answer."""
     _root, _homes, client, _capture = store
     raw = past_the_parser(b'{"hook_event_name": "PostToolUse", "tool_response": ', b"}")
     assert _hook_entry(monkeypatch, raw, client) == 0
@@ -2269,8 +2341,7 @@ def test_a_payload_nested_past_the_parser_s_limit_is_answered_empty(store, monke
 def test_a_server_answer_from_an_unreadable_store_gives_way_to_the_hook_s_own(
     resident, small_reserve, ample_budget, monkeypatch, capsys
 ):
-    """A server whose store could not be read answered with an empty packet, which read as nothing found and was
-    taken over the hook's own recall (review of rc11)."""
+    """An unreadable store produces an incomplete server answer eligible for hook fallback."""
     from scope_recall.adapters.clients import handler as handler_module
 
     _root, client, endpoint = resident
@@ -2300,7 +2371,7 @@ def test_a_server_answer_from_an_unreadable_store_gives_way_to_the_hook_s_own(
 
 
 def test_a_hook_knows_whether_its_own_runtime_has_a_vector_search(store):
-    """Nothing tested what a hook took its own vector route from (review of rc11)."""
+    """The hook detects whether its attached runtime provides a vector route."""
     from types import SimpleNamespace
 
     _root, _homes, client, _capture = store
@@ -2320,8 +2391,7 @@ def test_a_hook_knows_whether_its_own_runtime_has_a_vector_search(store):
 
 
 def test_a_request_the_server_cannot_read_is_refused_and_its_name_kept(resident, monkeypatch, past_the_parser):
-    """A payload nested past what the server's parser takes was answered 400, which the hook took for another program
-    on the port, and it removed the server's name (review of rc11)."""
+    """A malformed request is refused without removing the verified server's endpoint registration."""
     import hashlib
     import http.client
 
@@ -2357,7 +2427,7 @@ def test_a_request_the_server_cannot_read_is_refused_and_its_name_kept(resident,
 
 
 def test_a_removed_name_comes_back_within_seconds(resident):
-    """A server that did not prove itself in time, being busy, was left out for 30 s (review of rc11)."""
+    """A responsive server restores a missing endpoint registration after a successful periodic self-check."""
     import time
 
     _root, _client, endpoint = resident
@@ -2369,8 +2439,7 @@ def test_a_removed_name_comes_back_within_seconds(resident):
 
 
 def test_a_first_read_of_the_key_that_raised_does_not_stop_the_server(store, monkeypatch, tmp_path):
-    """Only an OSError or a ValueError was caught at the server's first read of its key: another error kept the
-    endpoint from starting at all (review of rc11)."""
+    """An initial credential-read exception does not prevent endpoint startup."""
     import os
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2400,8 +2469,8 @@ def test_a_first_read_of_the_key_that_raised_does_not_stop_the_server(store, mon
 
 
 def test_a_session_record_line_or_reply_nested_past_the_parser_s_limit_is_passed_over(tmp_path, past_the_parser):
-    """A record line nested past what the parser takes ended every later Stop of the session, and so did a Codex
-    reply of that shape (review of rc11)."""
+    """Transcript lines beyond the parser's nesting limit produce no message; suggestion-reply detection returns
+    ``False`` for equally deep JSON without raising."""
     from scope_recall.adapters.clients import transcript
     from scope_recall.adapters.clients.boundary import is_codex_suggestions_reply
 
@@ -2413,9 +2482,8 @@ def test_a_session_record_line_or_reply_nested_past_the_parser_s_limit_is_passed
 
 
 def test_which_vector_faults_are_the_server_s_own():
-    """A server's own fault makes the hook recall a second time; one the hook meets as well only cost the prompt its
-    time and a second metered call.  The lists missed faults both ways (reviews of rc11).  Since the server keeps its
-    embedding connection and worker between prompts, their failures are its own (review of rc12)."""
+    """Fallback distinguishes server-local vector faults from faults the hook would encounter
+    through the same provider.  Persistent embedding connections and workers can fail locally."""
     from scope_recall.adapters.clients.hook_answer import server_own_vector_fault
 
     for gap in (
@@ -2472,9 +2540,8 @@ def test_which_vector_faults_are_the_server_s_own():
 
 
 def test_a_packet_emptied_because_its_read_did_not_finish_is_incomplete():
-    """Only a packet whose store was unreadable or whose time was gone before the read was taken for incomplete; one
-    whose time ran out later (collecting, compiling, releasing) came back empty as if nothing were found, and a server's
-    such answer was taken over the hook's own (review of rc11)."""
+    """Packets with ``status="unavailable"`` are classified as incomplete; ``ok``, ``partial``, and ``no_match``
+    packets are not classified as incomplete solely because they carry a deadline gap."""
     from scope_recall.adapters.clients.hook_answer import recall_incomplete
 
     assert (
@@ -2492,7 +2559,7 @@ def test_a_packet_emptied_because_its_read_did_not_finish_is_incomplete():
 
 
 def test_a_server_busy_for_less_than_a_hook_s_wait_is_answered(resident, monkeypatch):
-    """At 0.3 s, a server busy with other recalls did not prove itself in time and lost its name (review of rc11)."""
+    """The proof budget admits a responsive server briefly delayed by concurrent recalls."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2511,10 +2578,8 @@ def test_a_server_busy_for_less_than_a_hook_s_wait_is_answered(resident, monkeyp
 
 
 def test_a_server_names_itself_again_only_when_its_check_comes_back_in_time(store, monkeypatch):
-    """Checked from inside the server, a hello slowed by its own busy threads passed, and a server hooks could not
-    reach in time named itself again; held to a hook's 0.5 s, the check kept out a server hooks reached (reviews of
-    rc11).  A check that takes longer than a hook's wait but within its own allowance (0.75 s) names it again; one of
-    0.9 s does not."""
+    """Endpoint registration is restored only when the self-check finishes within its own allowance.
+    That allowance exceeds the hook's proof budget to accommodate contention inside the server."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2525,13 +2590,13 @@ def test_a_server_names_itself_again_only_when_its_check_comes_back_in_time(stor
     real = local_endpoint._hello
 
     def slow(connection, token):
-        time.sleep(0.9)  # over the check's 0.75 s, under the 1 s it was once allowed
+        time.sleep(0.9)  # Exceeds the self-check's 0.75 s allowance.
         return real(connection, token)
 
     connect = local_endpoint.http.client.HTTPConnection.connect
 
     def slow_connect(self):
-        time.sleep(0.9)  # over the check's 0.75 s, under the 1 s it was once allowed
+        time.sleep(0.9)  # Exceeds the self-check's 0.75 s allowance.
         return connect(self)
 
     _root, _homes, client, _capture = store
@@ -2561,7 +2626,7 @@ def test_a_server_names_itself_again_only_when_its_check_comes_back_in_time(stor
 
 
 def test_a_server_s_traceback_keeps_the_frame_that_raised(resident, monkeypatch, capsys):
-    """The server's traceback kept its outer frames and dropped the one that raised (review of rc11)."""
+    """The reported traceback retains the frame that raised the exception."""
     from scope_recall.adapters.clients import local_endpoint
 
     _root, client, endpoint = resident
@@ -2580,7 +2645,7 @@ def test_a_server_s_traceback_keeps_the_frame_that_raised(resident, monkeypatch,
 
 
 def test_a_refused_request_is_not_sent_to_the_next_server(resident, monkeypatch):
-    """A request one server could not read was sent to the next, which reads it no differently (review of rc11)."""
+    """A refused request is not resent to another server."""
     import os
     import threading
     import time
@@ -2659,9 +2724,7 @@ class _KeptFake:
 
 
 def test_a_kept_recaller_uses_one_handler_until_its_files_change():
-    """A server made a handler for each prompt's recall and opened its vector table and embedding worker each time:
-    3.9-4.1 s a recall, two of five without their vector search; kept, 1.6-2.1 s with it (rc12).  It is made anew
-    once the files it was made with change, and the one before is closed."""
+    """The recaller reuses its handler until its input files change, then closes the replaced handler."""
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
 
     _KeptFake.made = []
@@ -2700,9 +2763,8 @@ class _WarmedFake(_KeptFake):
 
 
 def test_a_kept_recaller_searches_its_vector_store_again_after_an_idle_stretch(monkeypatch):
-    """Every search reads the whole index, and left alone the OS gave its pages to other work: the first recall after
-    an idle hour searched past its time (2 of 4 on this machine's Claude Code, 2026-10-02).  The server searches once
-    more after each idle stretch; a recall starts the stretch again, and a closed recaller searches no more."""
+    """The server warms the vector store at startup and after each idle stretch. A recall restarts the idle interval,
+    and closing the recaller stops further warming without creating another handler."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2751,9 +2813,8 @@ def test_a_kept_recaller_that_could_not_make_its_handler_makes_none_to_keep_warm
 
 
 def test_closing_a_recaller_does_not_wait_for_its_keep_warm_search_and_its_handler_is_closed(monkeypatch):
-    """Review of 3.5.0rc2: a keep-warm search holds the kept handler as the start's warming does, up to WARM_SECONDS
-    (a cold index, a helper to start again).  Closing waited CLOSE_WAIT_SECONDS for it, and when the search outlasted
-    that the handler was never closed: the search saw the recaller closed and left it open."""
+    """Closing a recaller does not wait for an active keep-warm search;
+    that search closes its handler when it finishes."""
     import threading
     import time
 
@@ -2784,9 +2845,7 @@ def test_closing_a_recaller_does_not_wait_for_its_keep_warm_search_and_its_handl
 
 
 def test_a_keep_warm_search_that_failed_is_tried_again_at_once(monkeypatch):
-    """Review of 3.5.0rc2: a keep-warm search that found the vector helper gone detaches it and closes the store for
-    the next request to open again (vector/process_store.py).  Counted as a use, it left that next request -- a new
-    helper, the table and the whole index -- to the next prompt's recall, the cold recall it is there to prevent."""
+    """A failed keep-warm search remains due and is retried without waiting for another prompt."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2819,9 +2878,7 @@ def test_a_keep_warm_search_that_failed_is_tried_again_at_once(monkeypatch):
 
 
 def test_a_recall_that_did_not_search_by_meaning_does_not_put_off_the_keep_warm_search(monkeypatch):
-    """Review of 3.5.0rc2: every recall that took the kept handler counted as a search of its index, also one whose
-    query embedding failed (a provider outage, a proxy down) and never reached it.  Prompts all through an outage kept
-    the index from being searched, and the first recall after it found the index cold."""
+    """A recall that performs no vector search does not postpone the keep-warm search."""
     import time
 
     from scope_recall.adapters.clients import local_endpoint
@@ -2878,9 +2935,7 @@ def test_a_recall_while_the_kept_handler_is_busy_is_answered_by_its_own():
 
 
 def test_a_kept_handler_that_raised_or_could_not_attach_its_runtime_is_made_anew():
-    """A handler whose runtime is not attached from a config it could read never attaches again: kept, it recalled
-    every later prompt without its vector search (review of rc12).  One whose recall raised is not trusted with the
-    next."""
+    """A handler is rebuilt after a recall exception or an unsuccessful runtime attachment."""
     import pytest
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
 
@@ -2963,8 +3018,8 @@ def _eventually(check, seconds=5.0):
 
 
 def test_a_server_without_a_runtime_config_makes_a_handler_for_each_recall(resident, monkeypatch):
-    """A handler whose runtime is not ready is not kept, so an entry without a runtime config costs each recall what
-    it did before rc12, and one whose config could not be read at one moment reads it again at the next."""
+    """Without a readable runtime configuration, each recall creates a fresh handler
+    and retries loading the configuration."""
     from scope_recall.adapters.clients import handler as handler_module
 
     _root, _client, endpoint = resident
@@ -2989,8 +3044,7 @@ def test_a_server_without_a_runtime_config_makes_a_handler_for_each_recall(resid
 
 
 def test_a_replaced_kept_handler_is_closed_off_the_request_s_time():
-    """Closing a handler stops its vector helper, which can take seconds; done inside the recall that replaced it,
-    it spent that recall's time and could make the server look stuck (review of rc12)."""
+    """Replaced handlers close outside the request's recall budget."""
     import time
 
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
@@ -3013,8 +3067,7 @@ def test_a_replaced_kept_handler_is_closed_off_the_request_s_time():
 
 
 def test_a_kept_handler_is_made_anew_when_the_entry_s_pointer_or_grants_change(resident):
-    """Before rc12 each prompt read the entry's pointer and the store's record of its grants again; a kept handler
-    watches them, so a re-attach that narrows the grants is taken up at the next prompt (review of rc12)."""
+    """Pointer or grant changes alter the handler's file stamp, causing the handler to be rebuilt on its next recall."""
     import os
 
     from scope_recall.adapters.clients.local_endpoint import entry_files
@@ -3105,14 +3158,14 @@ def _embedding_entry(base, monkeypatch, *, delay=0.0):
 
     root = base / "TEST-shared"
     write_shared_payload(root, new_shared_payload(root, agent_id="TEST-agent"))
-    home = base / "TEST-tianshu-home"
+    home = base / "TEST-agent3-home"
     home.mkdir()
     attach_shared_entry(
         root,
         build_installation_manifest(
             home, agent_id="TEST-agent", user_id="TEST-owner", agent_workspace="TEST-workspace"
         ),
-        entry_id="tianshu",
+        entry_id="agent3",
         display_name="TEST",
         now="2026-09-24T20:00:00Z",
     )
@@ -3170,8 +3223,8 @@ def _embedding_entry(base, monkeypatch, *, delay=0.0):
         entry_id="claude-code",
         display_name="Claude Code",
         runtime_config_from=routes_path,
-        grants_like=("tianshu",),
-        capture_like="tianshu",
+        grants_like=("agent3",),
+        capture_like="agent3",
         now="2026-09-24T20:00:00Z",
     )
     entry_config = client / "scope-recall" / "runtime-config.json"
@@ -3185,10 +3238,7 @@ def _embedding_entry(base, monkeypatch, *, delay=0.0):
 
 
 def test_a_kept_handler_recalls_with_its_vectors_across_a_pause(tmp_path, monkeypatch):
-    """A kept handler's embedding worker sent the next prompt's request on the connection its server had closed while
-    it sat idle, and the recall went without its vector search (review of rc12).  Asked after pauses longer than the
-    server's idle time, each prompt on a thread of its own as a server's are, one handler recalls with its vectors
-    every time, on a new connection after each pause."""
+    """A kept handler reconnects after idle connection expiry and continues to recall with vectors."""
     import threading
     import time
 
@@ -3245,12 +3295,10 @@ def _kept_prompt(kept, index, budget=10.0):
     return diagnostics["recall_vectors"], diagnostics["recall_vector_gap"]
 
 
+@pytest.mark.real_store_time
 def test_a_kept_handler_recalls_with_its_vectors_when_its_provider_and_store_are_slow(tmp_path, monkeypatch):
-    """The query embedding was asked for after the SQLite channels, with three quarters of what they left: on
-    2026-09-29 the work computer's server recalled 4 of 9 prompts by words alone (AuxiliaryModelError:timeout), each
-    on a new connection after a pause.  Here the channels take 2.8 s of a prompt's 4 s and the provider answers in
-    0.8 s; asked for as the recall starts, the embedding is there when the vector channel needs it, after a pause
-    too."""
+    """Query embedding overlaps 2.8 s SQLite channels and a 0.8 s provider reply within the 4 s retrieval budget.
+    The retained handler preserves this behavior after a pause."""
     import time
 
     from scope_recall.adapters.clients.handler import CodexHookHandler
@@ -3259,9 +3307,12 @@ def test_a_kept_handler_recalls_with_its_vectors_when_its_provider_and_store_are
 
     client, entry_config, server, connections = _embedding_entry(tmp_path, monkeypatch, delay=0.8)
     lexical = RetrievalStorage.lexical
+    delays = []
 
     def slow_lexical(self, tx, context, *, limit):
+        started = time.monotonic()
         time.sleep(2.8)
+        delays.append(time.monotonic() - started)
         return lexical(self, tx, context, limit=limit)
 
     monkeypatch.setattr(RetrievalStorage, "lexical", slow_lexical)
@@ -3279,6 +3330,7 @@ def test_a_kept_handler_recalls_with_its_vectors_when_its_provider_and_store_are
         server.shutdown()
         server.server_close()
     assert outcomes == [(True, None)] * 2, outcomes
+    assert delays and min(delays) >= 2.7, delays
 
 
 def test_a_kept_handler_warmed_when_its_server_starts_recalls_its_first_prompt_with_vectors(tmp_path, monkeypatch):
@@ -3333,8 +3385,8 @@ class _WarmedHandler:
 
 
 def test_closing_a_recaller_does_not_wait_for_its_warming():
-    """A warming holds the kept handler for up to a minute; closing waited for it, and a server stopped just after
-    its start hung that long (review of 3.4.1).  The warming sees the recaller closed and closes its handler."""
+    """Closing a recaller does not wait for startup warming;
+    warming closes the handler after observing closure."""
     import time
 
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
@@ -3351,8 +3403,7 @@ def test_closing_a_recaller_does_not_wait_for_its_warming():
 
 
 def test_a_warming_takes_its_stamp_before_its_build():
-    """Taken after the build, a change to the entry's files during the build counted as seen, and the handler made
-    from the old files was kept (review of 3.4.1)."""
+    """Capture the file stamp before building so changes during construction invalidate the resulting handler."""
     from scope_recall.adapters.clients.local_endpoint import KeptRecaller
 
     files = {"stamp": "v1"}
@@ -3393,7 +3444,10 @@ WB_SESSION = "TEST-wb-session"
 
 @pytest.fixture
 def workbuddy(store, tmp_path, monkeypatch):
-    """A WorkBuddy entry beside the store's others, its session records in a projects folder of the test's own."""
+    """A WorkBuddy entry beside the store's others, its session records in a projects folder of the test's own.
+
+    Its hooks use the store's admission clock.
+    """
     from scope_recall.adapters.clients import transcript
 
     root, _homes, _client, _capture = store
@@ -3487,7 +3541,7 @@ def test_workbuddy_stores_the_person_s_last_query_and_recalls_for_it(workbuddy, 
     ``<user_query>`` block; the reminders around it are WorkBuddy's, never stored and never searched for."""
     root, home, _projects = workbuddy
     _root, homes, _client, _capture = store
-    told = _hermes(homes["tianquan"])
+    told = _hermes(homes["agent2"])
     try:
         told.on_turn_start(1, "TEST 白鹭项目的负责人是 KZ-42。", turn_id="TEST-turn-1", session_id="TEST-session-1")
         told.observe_pre_llm(
@@ -3732,7 +3786,7 @@ def test_a_workbuddy_error_shown_in_place_of_a_reply_is_not_stored(workbuddy):
 
     root, home, projects = workbuddy
     at = _wb_ms()
-    question = "TEST 天姬今天出了什么事？"
+    question = "TEST 天一今天出了什么事？"
     record = _wb_record(projects, _wb_line("user", "u1", at(0), f"<user_query>{question}</user_query>"))
     _wb(home, _wb_prompt(question))
     _record(record, _wb_line("assistant", "a1", at(1), WB_NOTICE, status="incomplete", providerData=WB_ERROR))
@@ -3843,11 +3897,18 @@ def test_a_workbuddy_reply_said_again_in_a_new_turn_is_stored_from_the_record(wo
     assert _wb_said(root, "assistant") == [("assistant", "assistant_visible", "TEST 好的。")] * 2
 
 
-def test_a_workbuddy_record_s_own_user_messages_are_not_the_person_s(workbuddy):
+@pytest.mark.parametrize("slow_write", [False, True], ids=["store", "slow_store"])
+def test_a_workbuddy_record_s_own_user_messages_are_not_the_person_s(workbuddy, slow_capture_store, slow_write):
     """WorkBuddy saves what the person sent inside ``<user_query>``.  The user messages it adds itself carry none: a
     local command and its output, a shell command run in bash mode and its output, a teammate's report, and a slash
     command's expansion, which WorkBuddy writes over the typed command before it saves the message (the prompt hook is
-    handed the typed command)."""
+    handed the typed command).
+
+    The slow store delays the next real open after this fixture, the prompt's capture. The typed command is still
+    that source row.
+    """
+    if slow_write:
+        slow_capture_store()
     root, home, projects = workbuddy
     at = _wb_ms()
     skill = (
@@ -3923,40 +3984,36 @@ def test_a_workbuddy_prompt_runs_the_entry_s_budget(workbuddy):
         hook.close()
 
 
-def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_reserve, monkeypatch, capsys):
-    """A WorkBuddy prompt hook that runs past its wait blocks the prompt.  With the entry's server slower than the
-    hook's whole budget, the hook still answers inside the budget, with the prompt stored."""
+def _wb_hook_reads(monkeypatch, text):
+    """The prompt hook's stdin for the next ``hook_entry.main``: WorkBuddy sending ``text``."""
     import io
-    import threading
-    import time
 
-    from scope_recall.adapters.clients import handler as handler_module
+    from scope_recall.adapters.clients import hook_entry
+
+    raw = json.dumps({"session_id": WB_SESSION, "cwd": "C:/TEST/work", **_wb_prompt(text)}).encode()
+    monkeypatch.setattr(hook_entry.sys, "stdin", type("Stdin", (), {"buffer": io.BytesIO(raw)})())
+
+
+def test_a_workbuddy_prompt_whose_server_answers_too_late_is_stored_once(
+    workbuddy, small_reserve, storing_takes_no_hook_time, monkeypatch, capsys
+):
+    """With the entry's server slower than the hook's whole budget, the hook answers without it, says it came late,
+    and has stored the prompt, once: the server's late recall writes nothing."""
+    import threading
+
     from scope_recall.adapters.clients import hook_entry, local_endpoint
     from scope_recall.vector import process_store
 
     monkeypatch.setattr(process_store, "prestart", lambda **kwargs: None)
-    # A real entry's 6 s: on the 2 s default, a slow runner's write of the prompt left no time to ask the server.
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 6.0)
     root, home, _projects = workbuddy
     endpoint = local_endpoint.serve(home, "workbuddy", warm=False)
     assert endpoint is not None
     release, finished = threading.Event(), []
     try:
         calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
-        raw = json.dumps(
-            {
-                "session_id": WB_SESSION,
-                "cwd": "C:/TEST/work",
-                **_wb_prompt("<user_query>TEST 服务答得太慢。</user_query>"),
-            }
-        ).encode()
-        monkeypatch.setattr(hook_entry.sys, "stdin", type("Stdin", (), {"buffer": io.BytesIO(raw)})())
-        started = time.monotonic()
+        _wb_hook_reads(monkeypatch, "<user_query>TEST 服务答得太慢。</user_query>")
         assert hook_entry.main(["--home", str(home), "--host", "workbuddy"]) == 0
-        elapsed = time.monotonic() - started
         captured = capsys.readouterr()
-        # No runtime config names a budget here: the hook's own (``_TOTAL_BUDGET_S``).
-        assert elapsed < 6.0 + 1.0, f"the hook took {elapsed:.1f} s of its 6 s"
         assert not captured.out or "additionalContext" in json.loads(captured.out)["hookSpecificOutput"]
         assert "CODEX_RECALL_RESIDENT:late" in captured.err
         assert len(calls) == 1
@@ -3967,6 +4024,81 @@ def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_rese
         release.set()
         endpoint.stop()
     assert _wb_said(root, "user") == [("user", "human_direct", "TEST 服务答得太慢。")]
+
+
+@pytest.fixture
+def busy_store(monkeypatch, metered_store):
+    """Another process holds the store's writer lease and the store is slow to read: each write a hook makes waits all
+    it may (what it asks, up to its core's write timeout) and fails as a busy store does, and each recall takes all the
+    time it is given.  Those waits move the hook's clock on rather than sleep, and a transaction that does reach the
+    store counts 0.01 s on it (``metered_store``), so a test of the hook's budget reads the time a host waits for it,
+    whatever the runner's store and sleeps take.  The store fixture may already have installed a zero charge; this
+    call replaces it.  The fixture's value is that clock."""
+    from scope_recall.core import MemoryCore
+    from scope_recall.core.writer_lease import TruthWriterBusyError
+
+    clock = metered_store(0.01)
+
+    def busy(self, context, value, *, remaining_seconds=None, **kwargs):
+        timeout = self.config.write_timeout_seconds
+        clock.advance(timeout if remaining_seconds is None else min(timeout, remaining_seconds))
+        raise TruthWriterBusyError(role="truth_connection", scope="other_process")
+
+    def slow(self, context, request, *, deadline_seconds, **kwargs):
+        clock.advance(deadline_seconds)
+        raise ContractError("DEADLINE_EXCEEDED")
+
+    monkeypatch.setattr(MemoryCore, "record_host_event", busy)
+    monkeypatch.setattr(MemoryCore, "record_event", busy)
+    monkeypatch.setattr(MemoryCore, "recall_packet", slow)
+    return clock
+
+
+@pytest.mark.parametrize("configured", [None, 6])
+def test_a_workbuddy_prompt_hook_answers_within_its_budget(
+    workbuddy, small_reserve, busy_store, monkeypatch, capsys, configured
+):
+    """A WorkBuddy prompt hook that runs past its wait blocks the prompt, and what counts is the time the host waits.
+    The prompt's capture waits out a busy store as long as it may (2 s of the 6 s an entry's runtime config may give,
+    1 s of the 2 s default), and the entry's server and the hook's own recall need more than is left: the hook still
+    answers within its budget.  The runtime is not attached here: attaching it takes what it takes, not a share of
+    the hook's time."""
+    import threading
+
+    from scope_recall.adapters.clients import handler as handler_module
+    from scope_recall.adapters.clients import hook_entry, local_endpoint
+    from scope_recall.vector import process_store
+
+    monkeypatch.setattr(process_store, "prestart", lambda **kwargs: None)
+    monkeypatch.setattr(CodexHookHandler, "ensure_runtime", lambda self, audience=None, **kwargs: None)
+    _root, home, _projects = workbuddy
+    if configured is not None:
+        (home / "scope-recall" / "runtime-config.json").write_text(
+            json.dumps({"hook_processing_seconds": configured, "resident_recall_minutes": 0}), encoding="utf-8"
+        )
+    budget = configured or handler_module._TOTAL_BUDGET_S
+    endpoint = local_endpoint.serve(home, "workbuddy", warm=False)
+    assert endpoint is not None
+    release, asked = threading.Event(), []
+
+    def held(request, **kwargs):
+        asked.append(request["payload"].get("prompt"))
+        release.wait(60.0)
+        return {"result": {}, "diagnostics": {}}, (lambda: None)
+
+    monkeypatch.setattr(endpoint, "recall", held)
+    _wb_hook_reads(monkeypatch, "<user_query>TEST 服务答得太慢。</user_query>")
+    clock = busy_store
+    try:
+        started = clock()
+        assert hook_entry.main(["--home", str(home), "--host", "workbuddy"]) == 0
+        elapsed = clock() - started
+    finally:
+        release.set()
+        endpoint.stop()
+    err = capsys.readouterr().err
+    assert '"error_type":"TruthWriterBusyError"' in err and "CODEX_RECALL_RESIDENT:late" in err and len(asked) == 1
+    assert_hook_budget(elapsed, budget)
 
 
 def test_a_workbuddy_hook_with_nothing_to_add_writes_nothing(workbuddy, tmp_path, monkeypatch, capsys):
@@ -4040,9 +4172,10 @@ def _dsh_said(root, role=None):
     return sorted(_rows(root, f"SELECT role, origin, content FROM source_events WHERE entry_id='dsh'{where}"))
 
 
-def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(dsh):
+def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(dsh, slow_capture_store):
     """The plugin runs the prompt hook before a turn's first step: the prompt is the owner's, named by the session and
     dsh's turn number, and the answer is what is remembered, which the plugin appends to the step."""
+    slow_capture_store()
     root, home = dsh
     result, diagnostics = _dsh(
         home, {"hook_event_name": "UserPromptSubmit", "turn_id": "1", "prompt": "TEST 我的猫叫 Mochi，最爱吃金枪鱼。"}
@@ -4061,9 +4194,11 @@ def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(ds
 
 
 def test_a_dsh_stop_stores_the_turn_s_messages_once_and_says_how_many(dsh):
-    """The plugin keeps a turn's messages and sends them with its Stop: the reply under the turn, and from the lines what
-    the model said while it worked and what the person sent meanwhile.  The answer's ``through`` is how many lines are
-    stored; the same lines sent again (an answer lost on the way) store nothing twice."""
+    """The plugin keeps a turn's messages and sends them with its Stop: the reply under the turn, and from the lines
+    what the model said while it worked and what the person sent meanwhile.  The answer's ``through`` is how many
+    lines are stored; the same lines sent again (an answer lost on the way, or the rest of a turn after a Stop that
+    stored part of it) store nothing twice: the reply sent again is the one stored, with nothing left in the inbox
+    for the store's worker to store under a key of its own."""
     root, home = dsh
     at = _dsh_ms()
     _dsh(home, {"hook_event_name": "UserPromptSubmit", "turn_id": "3", "prompt": "TEST 把两个文件改名。"})
@@ -4090,8 +4225,176 @@ def test_a_dsh_stop_stores_the_turn_s_messages_once_and_says_how_many(dsh):
         ]
     )
     assert _dsh_said(root) == expected
-    result, _diagnostics = _dsh(home, stop)
+    result, diagnostics = _dsh(home, stop)
     assert result == {"through": 4} and _dsh_said(root) == expected, "sent again, nothing is stored twice"
+    assert diagnostics.capture_error_detail is None and _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+
+
+def _dsh_kept(root):
+    """The dsh session's rows as (what each was stored as, its words, its moment): ``user:<turn>`` (the prompt hook),
+    ``assistant:<turn>`` (a Stop's reply) or ``record:<id>`` (a line of the turn's messages)."""
+    return sorted(
+        (key.split(f":{DSH_SESSION}:", 1)[1].rsplit("@", 1)[0], content, at)
+        for key, content, at in _rows(
+            root, "SELECT source_event_key, content, occurred_at FROM source_events WHERE entry_id='dsh'"
+        )
+    )
+
+
+def _dsh_resent_cleanly(diagnostics, root):
+    """Nothing refused and nothing left in the inbox, where the store's worker would store it under a key of its own."""
+    return diagnostics.capture_error_detail is None and _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+
+
+def test_a_dsh_reply_whose_line_carries_no_moment_is_stored_once_when_sent_again(dsh):
+    """A line without a moment the store can read shows nothing, so the reply it holds is dated by the hook that first
+    stores it; a later Stop that sends the reply again keeps that moment, and is the reply already stored."""
+    root, home = dsh
+    at = _dsh_ms()
+    stop = {
+        "hook_event_name": "Stop",
+        "turn_id": "4",
+        "last_assistant_message": "TEST 这一行没有时间。",
+        "reply_id": "a1",
+        "record": [
+            {"id": "u1", "role": "user", "text": "TEST 这一行有时间。", "time": at(0)},
+            {"id": "a1", "role": "assistant", "text": "TEST 这一行没有时间。", "time": "TEST 不是时间"},
+        ],
+    }
+    assert _dsh(home, stop)[0] == {"through": 2}
+    stored = _dsh_kept(root)
+    result, diagnostics = _dsh(home, stop)
+    assert result == {"through": 2} and _dsh_resent_cleanly(diagnostics, root)
+    assert _dsh_kept(root) == stored and [key for key, *_rest in stored] == ["assistant:4", "record:u1"]
+
+
+def test_a_dsh_reply_stored_at_another_moment_is_the_one_a_later_stop_sends_again(dsh):
+    """A reply stored under its turn's key at a moment other than its line's (a Stop that names no line for its reply
+    dates it by the hook) is the reply a later Stop sends with its line: it keeps the moment it was stored with, and its
+    line is that reply, not a message of its own."""
+    root, home = dsh
+    at = _dsh_ms()
+    reply = "TEST 先存下的回答。"
+    _dsh(home, {"hook_event_name": "Stop", "turn_id": "5", "last_assistant_message": reply})
+    stored = _dsh_kept(root)
+    record = [{"id": "a1", "role": "assistant", "text": reply, "time": at(0)}]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "5",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 1} and _dsh_resent_cleanly(diagnostics, root)
+    assert _dsh_kept(root) == stored and [key for key, *_rest in stored] == ["assistant:5"]
+
+
+def test_two_dsh_replies_alike_in_one_session_are_two_messages(dsh):
+    """The model said the same words at the end of a turn and again in the next, still running when the first one's
+    Stop was sent.  The Stop's reply is the line the plugin names (``reply_id``), never the last with its words, and
+    that line is held as the reply stored under the turn's key, whatever the moment the reply was stored with: each is
+    stored once, the reply under its turn and the other from its line."""
+    root, home = dsh
+    at = _dsh_ms()
+    reply = "TEST 好的。"
+    _dsh(home, {"hook_event_name": "Stop", "turn_id": "1", "last_assistant_message": reply})
+    record = [
+        {"id": "u1", "role": "user", "text": "TEST 第一轮的问题。", "time": at(0)},
+        {"id": "a1", "role": "assistant", "text": reply, "time": at(1)},
+        {"id": "u2", "role": "user", "text": "TEST 第二轮的问题。", "time": at(25)},
+        {"id": "a2", "role": "assistant", "text": reply, "time": at(28)},
+    ]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "1",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 4} and _dsh_resent_cleanly(diagnostics, root)
+    kept = _dsh_kept(root)
+    assert [(key, words) for key, words, _at in kept] == [
+        ("assistant:1", reply),
+        ("record:a2", reply),
+        ("record:u1", "TEST 第一轮的问题。"),
+        ("record:u2", "TEST 第二轮的问题。"),
+    ]
+
+
+def _dsh_inbox_resolved(home):
+    """What the store's worker does with the dsh session's captures that met another message under their key
+    (``capture_inbox.resolve_conflicted_ingress``)."""
+    from scope_recall.core import capture_inbox
+
+    hook = CodexHookHandler.from_home(str(home), "dsh")
+    try:
+        context = hook.context(hook.audience_of({"cwd": "C:/TEST/work"}), DSH_SESSION, "host_generated")
+        return capture_inbox.resolve_conflicted_ingress(
+            hook.core.storage,
+            hook.core.clock,
+            context,
+            authorize=lambda _scope: context.allowed_scope_ids,
+            remaining_seconds=5,
+        )
+    finally:
+        hook.close()
+
+
+def test_a_dsh_reply_sent_again_when_its_key_cannot_be_read_is_resolved_as_the_one_stored(dsh, monkeypatch):
+    """The Stop reads what its turn's key holds to keep a reply's stored moment.  When that read fails, the reply sent
+    again with a moment of its own is refused and waits in the inbox, and the store's worker resolves it as the reply
+    already stored: one copy, and nothing under a key of its own."""
+    from scope_recall.core import MemoryCore
+
+    root, home = dsh
+    stop = {"hook_event_name": "Stop", "turn_id": "6", "last_assistant_message": "TEST 读不到也只存一次。"}
+    _dsh(home, stop)
+
+    def unreadable(self, *args, **kwargs):
+        raise sqlite3.OperationalError("TEST disk I/O error")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(MemoryCore, "source_by_event_key", unreadable)
+        _result, diagnostics = _dsh(home, stop)
+    assert diagnostics.capture_error_code == "VERSION_CONFLICT"
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(1,)]
+    assert [receipt.disposition for receipt in _dsh_inbox_resolved(home)] == ["duplicate"]
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+    assert [(key, words) for key, words, _at in _dsh_kept(root)] == [("assistant:6", "TEST 读不到也只存一次。")]
+
+
+@pytest.mark.parametrize("reply", ["TEST 改之前的回答。", "TEST 改之后的回答。"])
+def test_an_edited_dsh_reply_is_its_own_line_under_the_id_it_shares(dsh, reply):
+    """dsh sent the model's message again, edited, under the same id.  The Stop's reply is the line with its id and its
+    words, whichever version it is, and is said when that line was; the id is one message, held with its reply, as the
+    read of a record holds every line of an id it holds."""
+    from scope_recall.adapters.clients import transcript
+
+    root, home = dsh
+    at = _dsh_ms()
+    record = [
+        {"id": "a1", "role": "assistant", "text": "TEST 改之前的回答。", "time": at(0)},
+        {"id": "a1", "role": "assistant", "text": "TEST 改之后的回答。", "time": at(3)},
+    ]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "7",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 2} and diagnostics.capture_error_detail is None
+    said = {line.text: line.occurred_at for _end, line in transcript.dsh_lines(record) if line is not None}
+    assert _dsh_kept(root) == [("assistant:7", reply, said[reply])]
 
 
 def test_a_dsh_turn_without_a_reply_stores_what_its_lines_show(dsh):
@@ -4142,9 +4445,7 @@ _NEEDS_NODE = pytest.mark.skipif(not _node_ok(), reason="node 20.6 or later is n
 
 
 def _run_plugin(config: dict, scenario: str = "turn", env: dict | None = None) -> dict:
-    # The plugin ends a prompt hook at 9 s, answered or not.  On a slow Windows runner one outlived that before it
-    # stored the prompt, which the Stop then stored from the turn's messages (``record:u-0``, not ``user:1``); the
-    # plugin takes the answer as soon as it is whole, so the longest wait it allows costs a test nothing.
+    # Use the plugin's maximum prompt wait; a complete answer returns immediately.
     config = {"recallTimeoutMs": 30_000, **config}
     process = subprocess.run(
         [
@@ -4189,8 +4490,45 @@ def _plugin_keys(root):
     )
 
 
+def _received_plugin_rows(root):
+    """Read committed rows and pending events, checking the pending entry and session before replay."""
+    held = []
+    for (payload,) in _rows(root, "SELECT payload_json FROM capture_inbox"):
+        packet = json.loads(payload)
+        assert packet["context"]["entry_id"] == "dsh"
+        assert packet["context"]["session_id"] == "dsh:session-TEST-plugin"
+        held.extend(packet["events"])
+    return _plugin_rows(root), held
+
+
+def _replay_received_plugin_inbox(home):
+    """Commit the plugin session's durable inbox and return the receipts.
+
+    The caller reads the spool, the source rows and the pending payloads first. This writes only what that
+    session already received, on its entry and its authorized scopes.
+    """
+    hook = CodexHookHandler.from_home(str(home), "dsh")
+    try:
+        context = hook.context(hook.audience_of({"cwd": "C:/TEST/work"}), "session-TEST-plugin", "human_direct")
+        return replay_inbox(
+            hook.core.storage,
+            hook.core.clock,
+            context,
+            authorize=lambda scope: context.allowed_scope_ids,
+            admission_policy=hook.core.config.admission_policy,
+            remaining_seconds=10,
+        )
+    finally:
+        hook.close()
+
+
 @_NEEDS_NODE
-def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end(dsh, tmp_path):
+@pytest.mark.parametrize("pace", ["normal", "slow"])
+def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end(dsh, tmp_path, pace):
+    """Recall before a prompt, then materialize each completed turn capture once.
+
+    An accepted reply may wait in the durable inbox after the plugin's spool is empty.
+    """
     root, home = dsh
     _dsh(
         home,
@@ -4206,26 +4544,31 @@ def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end
             "version": "TEST",
             "prompt": "TEST 我的猫叫什么名字？",
             "queued": "TEST 先说一句：我在家。",
-        }
+        },
+        env={"SR_DSH_SLOW_CAPTURE": "TEST 它叫 Mochi。", "SR_DSH_SLOW_CAPTURE_DELAY": "0.6"} if pace == "slow" else {},
     )
     assert result["warnings"] == []
     assert result["decisionKept"], "the step's own messages and flags are passed on"
     assert result["injected"] is not None and "Mochi" in result["injected"]["text"]
     assert (result["injected"]["kind"], result["injected"]["form"]) == ("plugin:scope-recall", "recall")
-    assert result["spool"] == [], "the turn was stored and nothing is left on disk"
+    assert result["spool"] == [], "the turn was accepted and nothing remains in the plugin spool"
     assert result["status"]["lastRecall"]["outcome"] == "recalled"
     assert result["status"]["lastStore"]["error"] is None and result["status"]["backlog"] == 0
-    assert _plugin_rows(root) == sorted(
+    expected = sorted(
         [
             ("user", "human_direct", "TEST 先说一句：我在家。"),
             ("user", "human_direct", "TEST 我的猫叫什么名字？"),
             ("assistant", "assistant_visible", "TEST 我先查一下记忆。"),
             ("assistant", "assistant_visible", "TEST 它叫 Mochi。"),
         ]
-    ), (
-        "the prompt (the step's last message of the person's) and the reply once each, the message taken with the "
-        "prompt and what was said in between from the record, and none of dsh's own context"
     )
+    stored, held = _received_plugin_rows(root)
+    assert sorted(stored + [(event["role"], event["origin"], event["content"]) for event in held]) == expected
+    if pace == "slow":
+        assert any(event["content"] == "TEST 它叫 Mochi。" for event in held)
+    _replay_received_plugin_inbox(home)
+    assert _plugin_rows(root) == expected
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
     assert _plugin_keys(root) == ["assistant:1", "record:a-1", "record:u-1", "user:1"], (
         "the reply is the turn's",
         result["status"],
@@ -4233,56 +4576,115 @@ def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end
 
 
 @_NEEDS_NODE
-def test_a_turn_that_did_not_complete_has_no_reply_and_keeps_what_was_said(dsh, tmp_path):
+@pytest.mark.parametrize("pace", ["normal", "slow"])
+def test_a_turn_that_did_not_complete_has_no_reply_and_keeps_what_was_said(dsh, tmp_path, pace):
     """A turn the person stopped (or that failed) after the model said something has no reply: what was said is stored
-    from the turn's messages, once, and nothing is stored as the turn's reply."""
+    from the turn's messages, once, and nothing is stored as the turn's reply. Its prompt may wait in the inbox."""
     root, home = dsh
+    prompt = "TEST 我的猫叫什么名字？"
     result = _run_plugin(
-        {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "endReason": "aborted"}
+        {
+            "python": sys.executable,
+            "home": str(home),
+            "spool": str(tmp_path / "TEST-spool"),
+            "endReason": "aborted",
+            "prompt": prompt,
+        },
+        env={"SR_DSH_SLOW_CAPTURE": prompt, "SR_DSH_SLOW_CAPTURE_DELAY": "1.1"} if pace == "slow" else {},
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None
+    expected = sorted(
+        [
+            ("user", "human_direct", prompt),
+            ("assistant", "assistant_visible", "TEST 我先查一下记忆。"),
+            ("assistant", "assistant_visible", "TEST 它叫 Mochi。"),
+        ]
+    )
+    stored, held = _received_plugin_rows(root)
+    assert sorted(stored + [(event["role"], event["origin"], event["content"]) for event in held]) == expected
+    if pace == "slow":
+        assert any(event["content"] == prompt and event["source_event_key"].endswith(":user:1@1") for event in held)
+    _replay_received_plugin_inbox(home)
+    assert _plugin_rows(root) == expected
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
     assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
 
 
 @_NEEDS_NODE
-def test_a_message_that_comes_while_a_turn_is_stored_is_kept_and_stored_with_the_next(dsh, tmp_path):
-    """The person's next message, and the next turn, come while the first turn's Stop runs: the store rewrites the spool
-    from what it holds then, not from what it read before, and stores the rest when that turn ends."""
+@pytest.mark.parametrize("pace", ["normal", "slow"])
+def test_a_message_that_comes_while_a_turn_is_stored_is_kept_and_stored_with_the_next(dsh, tmp_path, pace):
+    """The plugin retains messages added during a Stop and sends them when their turn ends.
+
+    An empty spool acknowledges durable receipt. ``slow`` delays the second reply's next real write so that it
+    waits in the inbox. Source rows and pending events together hold the complete turn before authorized replay;
+    afterward five distinct source rows remain, with the reply under its original key.
+    """
     root, home = dsh
-    # Each Stop is a process of its own; on a slow runner the 2 s a test entry's hooks get stored a line or two a Stop,
-    # and the turns' lines outlasted the harness's wait.  The entry's hooks get the 6 s a real entry's have, and no
-    # resident recall server, as without a runtime config: one kept running holds its lock past the test's end.
+    # Use the configured hook budget without a resident recall server; each Stop owns its process and resources.
     (home / "scope-recall" / "runtime-config.json").write_text(
         json.dumps({"hook_processing_seconds": 6, "resident_recall_minutes": 0}), "utf-8"
     )
+    reply = "TEST 第二轮的回答。"
+    env = {"SR_DSH_SLOW_CAPTURE": reply, "SR_DSH_SLOW_CAPTURE_DELAY": "0.6"} if pace == "slow" else {}
     result = _run_plugin(
-        {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "overlap": True}
+        {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "overlap": True},
+        env=env,
     )
     assert result["spool"] == [] and result["warnings"] == []
+    expected = sorted(
+        [
+            ("user", "human_direct", "TEST 我的猫叫什么名字？"),
+            ("assistant", "assistant_visible", "TEST 我先查一下记忆。"),
+            ("assistant", "assistant_visible", "TEST 它叫 Mochi。"),
+            ("user", "human_direct", "TEST 第二轮的问题。"),
+            ("assistant", "assistant_visible", reply),
+        ]
+    )
+    stored, held = _received_plugin_rows(root)
+    assert sorted(stored + [(event["role"], event["origin"], event["content"]) for event in held]) == expected
+    if pace == "slow":
+        assert any(event["content"] == reply and event["source_event_key"].endswith(":assistant:2@1") for event in held)
+    receipts = _replay_received_plugin_inbox(home)
     rows = _plugin_rows(root)
-    assert ("user", "human_direct", "TEST 第二轮的问题。") in rows
-    assert ("assistant", "assistant_visible", "TEST 第二轮的回答。") in rows
+    assert rows == expected
     assert len(rows) == len(set(rows)) == 5
+    assert _plugin_keys(root).count("assistant:2") == 1
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+    assert [receipt.disposition for receipt in receipts] == ["inserted"] * len(held)
+    source_keys = [key for (key,) in _rows(root, "SELECT source_event_key FROM source_events")]
+    assert all(source_keys.count(event["source_event_key"]) == 1 for event in held)
 
 
 @_NEEDS_NODE
-def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_input(dsh, tmp_path):
+@pytest.mark.parametrize("pace", ["normal", "slow"])
+def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_input(dsh, tmp_path, pace):
     """Two model messages of 20,000 CJK characters each (60 KB of UTF-8 apiece): each is clipped to what one Stop can
     carry, they go in Stops of their own under the hook's 64 KiB of input, and the reply, too large to go beside its
-    line, is stored from it."""
+    line, is stored from it. A prompt accepted into the inbox is materialized before checking all three sources."""
     root, home = dsh
+    prompt = "TEST 我的猫叫什么名字？"
     result = _run_plugin(
         {
             "python": sys.executable,
             "home": str(home),
             "spool": str(tmp_path / "TEST-spool"),
             "bigText": {"char": "长", "count": 20_000},
-        }
+            "prompt": prompt,
+        },
+        env={"SR_DSH_SLOW_CAPTURE": prompt, "SR_DSH_SLOW_CAPTURE_DELAY": "1.1"} if pace == "slow" else {},
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None, result["warnings"]
+    stored, held = _received_plugin_rows(root)
+    received = sorted(stored + [(event["role"], event["origin"], event["content"]) for event in held])
+    assert ("user", "human_direct", prompt) in received
+    if pace == "slow":
+        assert any(event["content"] == prompt and event["source_event_key"].endswith(":user:1@1") for event in held)
+    _replay_received_plugin_inbox(home)
+    assert _plugin_rows(root) == received
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
     assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
     stored = [content for role, _origin, content in _plugin_rows(root) if role == "assistant"]
-    assert all(
+    assert len(stored) == 2 and all(
         content.endswith("more characters not kept by Scope Recall]") and len(content.encode("utf-8")) < 36_000
         for content in stored
     )
@@ -4291,7 +4693,8 @@ def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_inpu
 @_NEEDS_NODE
 def test_a_stop_that_stores_part_of_its_lines_is_followed_by_the_next_without_waiting(dsh, tmp_path):
     """A Stop stores what fits in its time; the next one takes the rest at once, so a backlog is not left to the sweep's
-    waits (the stand-in hook stores one line each time)."""
+    waits (the stand-in hook stores one line each time).  The reply goes again with each Stop that carries its line,
+    named by the line's id."""
     _root, home = dsh
     log = tmp_path / "TEST-hook-log.jsonl"
     result = _run_plugin(
@@ -4299,40 +4702,46 @@ def test_a_stop_that_stores_part_of_its_lines_is_followed_by_the_next_without_wa
         env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_LOG": str(log)},
     )
     stops = [
-        len(payload["record"])
+        payload
         for payload in map(json.loads, log.read_text(encoding="utf-8").splitlines())
         if payload["hook_event_name"] == "Stop"
     ]
-    assert stops == [3, 2, 1], "each Stop sends what is left"
+    assert [len(payload["record"]) for payload in stops] == [3, 2, 1], "each Stop sends what is left"
+    assert [
+        (payload.get("turn_id"), payload.get("reply_id"), payload.get("last_assistant_message")) for payload in stops
+    ] == [("1", "a-2", "TEST 它叫 Mochi。")] * 3
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None
     assert result["status"]["retryAfter"] is None
 
 
 @_NEEDS_NODE
-def test_a_hook_that_fails_says_why_in_the_status_and_keeps_the_turn(dsh, tmp_path):
-    """An interpreter that cannot import the package (a venv moved, say) exits 1: the recall's outcome and the store's
-    error say so with the end of its stderr, instead of reading as nothing recalled."""
+def test_a_hook_that_fails_says_why_and_retains_no_unverified_turn(dsh, tmp_path):
+    """An interpreter that cannot import the package reports the recall failure and keeps no unverified words."""
     _root, home = dsh
+    spool = tmp_path / "TEST-spool"
+    spool.mkdir()
+    (spool / "private-rules.json").write_text('{"private_rules":true}', encoding="utf-8")
     result = _run_plugin(
         {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "expectBacklog": True},
         env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_MODE": "broken"},
     )
     assert result["status"]["lastRecall"]["outcome"].startswith("exit 1: ")
     assert "No module named 'scope_recall'" in result["status"]["lastRecall"]["outcome"]
-    assert "exit 1: " in result["status"]["lastStore"]["error"] and result["status"]["backlog"] == 3
+    assert result["status"]["backlog"] == 0 and result["spool"] == []
 
 
 @_NEEDS_NODE
-def test_a_hook_that_cannot_run_keeps_the_turn_on_disk_and_the_step_goes_on(dsh, tmp_path):
+def test_a_hook_that_cannot_run_discards_unverified_words_and_the_step_goes_on(dsh, tmp_path):
     _root, home = dsh
     spool = tmp_path / "TEST-spool"
+    spool.mkdir()
+    (spool / "private-rules.json").write_text('{"private_rules":true}', encoding="utf-8")
     result = _run_plugin(
         {"python": str(tmp_path / "TEST-no-python.exe"), "home": str(home), "spool": str(spool), "expectBacklog": True}
     )
     assert result["injected"] is None and result["decisionKept"], "no recall, and the turn is not failed"
-    assert sorted(result["spool"]) == ["assistant", "assistant", "turn_end", "user"], "kept to store later"
-    assert result["status"]["lastStore"]["error"] and result["status"]["backlog"] == 3
-    assert any("kept to store later" in warning for warning in result["warnings"])
+    assert result["spool"] == []
+    assert result["status"]["backlog"] == 0
 
 
 @_NEEDS_NODE
@@ -4345,10 +4754,10 @@ def test_an_aborted_step_is_passed_on_untouched(dsh, tmp_path):
 
 @_NEEDS_NODE
 def test_the_plugin_stores_what_a_dsh_that_is_gone_left_and_leaves_a_running_one_s_file(dsh, tmp_path):
-    """A dsh that ended before its store did leaves its spool file; another dsh's plugin takes it, once it is idle and its
-    process is gone, and stores it.  That turn ended minutes ago, so its reply is stored from the record alone, once (sent
-    as the reply too, it would be stored again: the store compares moments 120 s apart at most).  A message older than
-    14 days is dropped and said; the file of a process that still runs is left to it."""
+    """A dsh that ended before its store did leaves its spool file; another dsh's plugin takes it, once it is idle and
+    its process is gone, and stores it.  That turn ended minutes ago, so its reply is stored from the record alone,
+    once (the plugin sends a reply with its Stop only while a store that dates it by the hook's moment would still
+    know it).  A message older than 14 days is dropped and said; the file of a process that still runs is left to it."""
     root, home = dsh
     spool = tmp_path / "TEST-spool"
     spool.mkdir()
@@ -4420,9 +4829,11 @@ def test_the_plugin_stores_what_a_dsh_that_is_gone_left_and_leaves_a_running_one
 
 @_NEEDS_NODE
 def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp_path):
-    """Two dsh processes that are gone left a file each.  The store cannot be reached (here: no interpreter), so the pass
-    stops at the first session it tried, keeps that one's messages, leaves the other file as it was and says when it
-    tries again: a backlog after an outage is not sent to the store all at once, nor every minute."""
+    """Core permits the records but their content store fails: recovery stops at the first session and backs off.
+
+    Public messages verified before a content failure stay queued; an unavailable
+    privacy check is covered by the refusal cases rather than this store outage.
+    """
     _root, home = dsh
     spool = tmp_path / "TEST-spool"
     spool.mkdir()
@@ -4457,7 +4868,7 @@ def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp
         names.append(name)
     result = _run_plugin(
         {
-            "python": str(tmp_path / "TEST-no-python.exe"),
+            "python": sys.executable,
             "home": str(home),
             "spool": str(spool),
             "expectBacklog": True,
@@ -4465,6 +4876,7 @@ def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp
             "waitStatus": "retryAfter",
         },
         "sweep",
+        env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_MODE": "store-broken"},
     )
     untouched = [name for name in names if name in result["files"]]
     taken = [name for name in result["files"] if name not in names]

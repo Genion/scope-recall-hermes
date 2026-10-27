@@ -32,6 +32,7 @@ from ..vector.lance_native import helper_start_failure
 from ..vector.process_store import NativeVectorPathError
 from ..vector.store import build_vector_store
 from .auxiliary import build_auxiliary_runtime
+from .backup_upkeep import mirror_if_due
 from .codex_cli import CodexCliConsolidationAdapter
 from .embedding_retry import embed_with_one_retry
 from .instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
@@ -55,14 +56,11 @@ QUERY_EMBEDDING_SHARE = 0.7
 class _QueryEmbedding:
     """A recall's query embeddings, asked for when it starts instead of after the SQLite channels.
 
-    Behind the exact, lexical, claim and recent channels the embedding had three quarters of what they left, about
-    2.2 s of a prompt's 4 s window: enough on a warm connection, not for the new one a prompt more than 30 s after the
-    last needs (the proxy's tunnel, TLS, then the provider): measured, a remote client's server recalled 4 of 9
-    prompts by words alone that way (``AuxiliaryModelError:timeout``).  Asked for as the recall starts, it runs beside
-    those channels with its share of the whole window.
+    Query embeddings start alongside SQLite retrieval so connection setup shares the full recall window rather
+    than only the time left after the exact, lexical, claim and recent channels.
 
     ``queries`` is the question and the other ways recall reads it (``core/owner_view.py``), embedded in one request:
-    one after the other, the second waited for the first on the one persistent connection.
+    one round trip on one pooled query connection, which leaves the other connections to recalls running alongside.
     """
 
     def __init__(self, queries: tuple[str, ...], deadline: float) -> None:
@@ -135,6 +133,13 @@ class _LazyVectorPort:
         adapter = self._embedding_adapter()
         return None if adapter is None else adapter._embed_query
 
+    def _checked_query(self, context, route, texts, seconds):
+        """Check the current conversation at each actual query embedding request."""
+        from ..core.private import using_outbound_check
+
+        with using_outbound_check(lambda: self._instance.core.private_mode(context.trusted_context) == "full"):
+            return route(texts, seconds)
+
     def prefetch_query(self, context: SearchContext, *, also: tuple[str, ...] = ()) -> _QueryEmbedding | None:
         """Ask for the query's embedding now, beside the SQLite channels; ``search`` takes it from there.  ``also``
         are other ways the recall reads the question, embedded in the same request where the route can send several;
@@ -154,8 +159,13 @@ class _LazyVectorPort:
             queries = queries[:1]
             one = adapter._embed_query
             many = lambda texts, seconds: (one(texts[0], seconds),)  # noqa: E731
+        route = many
+
+        def checked(texts, seconds):
+            return self._checked_query(context, route, texts, seconds)
+
         pending = _QueryEmbedding(queries, now + window * QUERY_EMBEDDING_SHARE)
-        threading.Thread(target=pending.run, args=(many,), name="scope-recall-query-embedding", daemon=True).start()
+        threading.Thread(target=pending.run, args=(checked,), name="scope-recall-query-embedding", daemon=True).start()
         return pending
 
     def search(
@@ -180,9 +190,10 @@ class _LazyVectorPort:
         failed: list[Exception] = []
 
         def embed_while_opening() -> bool | None:
-            # The embedding's failure is this recall's to report.  Raised inside the open, it closed the helper as
-            # well, and the next prompt opened the table cold again; reported as False, the open is taken if it has
-            # come and parked for the next request if not, so a fast failure does not wait for the table either.
+            # The embedding's failure is this recall's to report.  Raised inside the open, it would close the
+            # helper as well, and the next prompt would open the table cold again; reported as False, the open is
+            # taken if it has come and parked for the next request if not, so a fast failure does not wait for the
+            # table either.
             try:
                 if prefetched is not None:
                     prepared.append((context.query, _taken(prefetched, effective_deadline, context.query)))
@@ -193,11 +204,12 @@ class _LazyVectorPort:
                 embedding_remaining = deadline.remaining()
                 if embedding_remaining <= 0:
                     raise TimeoutError("query embedding stage deadline exhausted")
+
                 prepared.append(
                     (
                         context.query,
                         embed_with_one_retry(
-                            lambda seconds: embed(context.query, seconds),
+                            lambda seconds: self._checked_query(context, embed, context.query, seconds),
                             budget_seconds=embedding_remaining,
                             remaining=deadline.remaining,
                         ),
@@ -218,8 +230,8 @@ class _LazyVectorPort:
                 raise failed[0]
             if deadline.remaining() <= 0.0:
                 # The helper is still opening the table: its answer waits for the next request, which a hook's
-                # process never makes.  Returned as nothing, this recall looked as if the search had found nothing
-                # and reported no gap; Claude Code and Codex lost their vector search this way unseen.
+                # process never makes.  Returned as nothing, this recall would look as if the search had found nothing
+                # and report no gap, and a client would lose its vector search this way unseen.
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
                 prepared.append((context.query, _taken(prefetched, effective_deadline, context.query)))
@@ -277,6 +289,8 @@ def _helper_start_failure(deadline: float) -> str | None:
 
 @dataclass
 class RuntimeInstance:
+    """Own runtime ports and release their resources when the instance closes."""
+
     config: RuntimeInstanceConfig
     core: MemoryCore
     auxiliary: Any
@@ -287,7 +301,9 @@ class RuntimeInstance:
     _default_purge: Any = None
     _ingress_authorizer: Callable[[object], frozenset[str]] | None = None
     _owned_resources: list[Any] = field(default_factory=list)
+    _vector_openers: dict[int, int] = field(default_factory=dict, init=False, repr=False, compare=False)
     _closed: bool = False
+    _state_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     background_gaps: tuple[str, ...] = ()
     #: Why this drain's vector helper could not start, one line, or ``None`` (``_open_vector_for_drain``).
     vector_helper_error: str | None = None
@@ -302,6 +318,8 @@ class RuntimeInstance:
     embed_backfill: dict | None = None
     #: Receipt of the page of a re-embed run this drain reopened (``respace_if_due``), or ``None`` without a run.
     embed_respace: dict | None = None
+    #: Snapshot or mirror outcome from this drain, independent of model budgets.
+    backup_upkeep: dict | None = None
     #: Work types this drain left alone, each with the held model and when its
     #: hold ends (runtime/model_budget.py ``provider_holds``).
     provider_holds: dict = field(default_factory=dict)
@@ -313,38 +331,89 @@ class RuntimeInstance:
     def _ensure_vector_port(
         self, *, allow_create: bool = False, deadline: float | None = None, during_open=None
     ) -> Any:
-        """Open the companion store once and compose the Core ports over it.
+        """Open the companion store and compose the Core ports over it.
 
         Query paths pass ``allow_create=False`` and may only open an existing
         index; explicit background maintenance is the sole path allowed to
         create one.  Injected VectorPort values stay untouched for
         deterministic tests and alternate backends.
         """
-        self._ensure_open()
-        if self._vector_store is not None:
-            if getattr(self._vector_store, "requires_reopen", False):
-                _open_store(self._vector_store, allow_create=allow_create, deadline=deadline, during_open=during_open)
-            return self._vector_port
-        if self.config.vector is None or self._vector_factory is None:
-            return None
-        resource = self._vector_factory(self.config.vector)
-        self._owned_resources.append(resource)
+        with self._state_lock:
+            self._ensure_open()
+            resource = self._vector_store
+            factory, config = self._vector_factory, self.config.vector
+        new_resource = resource is None
+        if new_resource:
+            if config is None or factory is None:
+                return None
+            resource = factory(config)
+        registered = False
         try:
-            _open_store(resource, allow_create=allow_create, deadline=deadline, during_open=during_open)
-        except Exception:
-            self._owned_resources.pop()
-            _close_quietly(resource)
+            if new_resource:
+                with self._state_lock:
+                    self._ensure_open()
+                    if not any(owned is resource for owned in self._owned_resources):
+                        self._owned_resources.append(resource)
+                    identity = id(resource)
+                    self._vector_openers[identity] = self._vector_openers.get(identity, 0) + 1
+                    registered = True
+            # Registration and publication share the shutdown lock; native I/O
+            # stays outside it so one slow open cannot serialize recalls.
+            if new_resource or getattr(resource, "requires_reopen", False):
+                _open_store(resource, allow_create=allow_create, deadline=deadline, during_open=during_open)
+            with self._state_lock:
+                self._ensure_open()
+                if registered:
+                    self._finish_vector_open(resource)
+                    registered = False
+                redundant = (
+                    new_resource
+                    and self._vector_store is not None
+                    and self._vector_store is not resource
+                    and id(resource) not in self._vector_openers
+                )
+                if redundant:
+                    # Only the first completed open owns the published ports.
+                    # Detach the redundant helper before closing it outside the lock.
+                    self._owned_resources[:] = [owned for owned in self._owned_resources if owned is not resource]
+                elif new_resource and self._vector_store is None:
+                    self._compose_ports(resource)
+                port = self._vector_port
+        except BaseException:
+            with self._state_lock:
+                if registered:
+                    self._finish_vector_open(resource)
+                # A factory may lend the same object to overlapping opens. A
+                # failed call must not close a published or still-opening peer.
+                shared = self._vector_store is resource or id(resource) in self._vector_openers
+                close_resource = self._closed or (new_resource and not shared)
+                if close_resource:
+                    self._owned_resources[:] = [owned for owned in self._owned_resources if owned is not resource]
+            # An open may finish after shutdown's first close, creating a late
+            # handle. Release it again before propagating the original error.
+            if close_resource:
+                _close_quietly(resource)
             raise
-        self._compose_ports(resource)
-        return self._vector_port
+        if redundant:
+            _close_quietly(resource)
+        return port
+
+    def _finish_vector_open(self, resource: Any) -> None:
+        """Release one open's identity claim while the caller holds the state lock."""
+        identity = id(resource)
+        remaining = self._vector_openers[identity] - 1
+        if remaining:
+            self._vector_openers[identity] = remaining
+        else:
+            del self._vector_openers[identity]
 
     def warm_vector_store(self, seconds: float) -> bool:
         """Open the existing companion store and search it once, off any prompt's time.
 
-        A recall handler kept across prompts (adapters/clients/local_endpoint.KeptRecaller) was made at its first
-        prompt: that prompt's recall started the helper, opened the table and read the index, and it recalled by
-        words alone (``helper_request_deadline``) after every start of its server, which for Claude Code is every
-        session.  Warmed when the server starts, the first prompt finds them ready.  It writes nothing.
+        Made at its first prompt, a recall handler kept across prompts (adapters/clients/local_endpoint.KeptRecaller)
+        would start the helper, open the table and read the index inside that prompt's recall, and that recall would
+        answer by words alone (``helper_request_deadline``) after every start of its server, which for Claude Code is
+        every session.  Warmed when the server starts, the first prompt finds them ready.  It writes nothing.
         """
         self._ensure_open()
         if self.config.vector is None or self._vector_factory is None:
@@ -362,7 +431,7 @@ class RuntimeInstance:
             # Every partition a recall of this runtime filters on (``lance_port._partition_hits``).  The first
             # search of an index reads all of it into the helper's cache whatever the filter; after that a search
             # touches only the codes of the rows its filter keeps.  Filtered on the first scope's partition, which
-            # held no rows for any entry of the shared store, the search touched 26 MB of the 306 MB the next recall
+            # held no rows for any entry of a shared store, the search touched 26 MB of the 306 MB the next recall
             # paged back in once the helper's memory was trimmed.  What it finds is not looked at.
             search_scopes(
                 [1.0] + [0.0] * (self.config.vector.dimensions - 1),
@@ -375,10 +444,9 @@ class RuntimeInstance:
         """Ask the query embedding route for one vector, off any prompt's time: a server's start, for its embedding
         worker and its connection.
 
-        Warming the vector store alone left them to the first recall: a WorkBuddy entry's server, started cold, lost
-        the vector search of its first two recalls to the embedding's time (``AuxiliaryModelError:timeout``, measured)
-        and answered with it from the third, 12.7 s after its start.  The text is fixed and nothing of what
-        comes back is kept; it writes nothing."""
+        Warm the query embedding worker and connection outside the prompt's time budget using fixed text.
+        The returned vector is discarded and no memory content is stored, but the embedding request still reserves
+        and settles usage in the auxiliary budget ledger."""
         self._ensure_open()
         if self.config.vector is None:
             return False
@@ -388,8 +456,19 @@ class RuntimeInstance:
         now = time.monotonic()
         deadline = RequestDeadline.from_absolute(now + float(seconds), now=now)
         with using_request_deadline(deadline):
+            from ..core.private import outbound_blocked, using_outbound_check
+
+            if outbound_blocked(self.core.storage, self.core.clock, self.config.context()):
+                return False
+
+            def checked(budget):
+                with using_outbound_check(
+                    lambda: outbound_blocked(self.core.storage, self.core.clock, self.config.context())
+                ):
+                    return embed("scope recall warm-up", budget)
+
             embed_with_one_retry(
-                lambda budget: embed("scope recall warm-up", budget),
+                checked,
                 budget_seconds=deadline.remaining(),
                 remaining=deadline.remaining,
             )
@@ -433,11 +512,10 @@ class RuntimeInstance:
     def memory_epoch(self) -> int:
         """Read the authority fence without counting the backlog.
 
-        A pass used to call ``status()`` to prove its database was the bound
-        one, which cost six whole-store aggregates and a JSON scan of every
-        source -- measured at 4.4 seconds on an instance with 150,000 queued
-        items, for a value that was discarded.  The epoch read proves the same
-        binding from one indexed row.
+        Calling ``status()`` also aggregates work and source counts and, when
+        admission diagnostics are enabled, scans source metadata within the
+        caller's authorized context.  Reading the epoch avoids those diagnostics
+        while checking the same binding and fetching the singleton metadata row.
         """
         self._ensure_open()
         return self.core.memory_epoch(self.config.context())
@@ -464,6 +542,7 @@ class RuntimeInstance:
         budget = self.config.drain_seconds if remaining_seconds is None else remaining_seconds
         strict_float("remaining_seconds", budget, minimum=0.001, maximum=self.config.drain_seconds)
         deadline = time.monotonic() + budget
+        self.backup_upkeep = mirror_if_due(self.core.storage, self.config, available_seconds=budget)
         ingress_gaps = self._replay_ingress(budget)
         vector_gaps = self._open_vector_for_drain(deadline, budget)
         self.background_gaps = (*ingress_gaps, *vector_gaps)
@@ -495,6 +574,11 @@ class RuntimeInstance:
                 available_seconds=max(0.0, deadline - time.monotonic()),
             )
         )
+        if (self.backup_upkeep or {}).get("outcome") == "failed":
+            self.background_gaps = (
+                *self.background_gaps,
+                f"deletion_mirror_failed:{(self.backup_upkeep or {}).get('error', 'unknown')}",
+            )
         from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)
@@ -588,7 +672,7 @@ class RuntimeInstance:
         # A key-collided capture is invisible to the first replay, which only
         # retries failures that might clear by themselves; without the second
         # it stays in the inbox forever, captured but never stored.  Each runs
-        # whatever the other met: one that raised skipped the other.
+        # whatever the other met: one that raised would skip the other.
         pending = False
         for replay in (replay_inbox, resolve_conflicted_ingress):
             try:
@@ -689,16 +773,21 @@ class RuntimeInstance:
             )
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for resource in reversed(self._owned_resources):
-            _close_quietly(resource)
-        self._owned_resources.clear()
-        self._vector_store = None
-        self._vector_port = None
-        self._default_embed = None
-        self._default_purge = None
+        """Detach owned resources atomically, then close them without holding the state lock."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            resources, self._owned_resources = self._owned_resources, []
+            self._vector_store = None
+            self._vector_port = None
+            self._default_embed = None
+            self._default_purge = None
+        seen: set[int] = set()
+        for resource in reversed(resources):
+            if id(resource) not in seen:
+                seen.add(id(resource))
+                _close_quietly(resource)
 
 
 def default_vector_factory(config: VectorRuntimeConfig) -> Any:

@@ -18,30 +18,28 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
 
 from ..contracts import ContractError, TrustedContext
 from ..core.failure_retry import retry_class
 from ..core.file_lock import advisory_file_lock
+from ..core.storage import SQLiteStorage
 from ..core.writer_lease import TruthWriterBusyError
 from ..vector.process_store import NativeVectorPathError, ProcessLanceVectorStore
+from .backup_primitives import BackupError, backup_deadline
+from .backup_upkeep import BACKUP_JOB_SECONDS, backup_if_due, record_backup_job_failure
 from .instance import build_runtime_instance
 from .instance_config import RuntimeInstanceConfig
 from .model_budget import pre_request_refusals, provider_refusals
-from .validation import strict_float, utc_now
+from .validation import DAILY_COUNTER_MAX, strict_float, utc_now
 
 #: Worker metadata files are small JSON documents; anything larger is not one.
 METADATA_LIMIT_BYTES = 65536
 #: Seconds a watchdog-owned pass stops short of the deadline it was handed, so
 #: its refund, status file and receipt land before the owner kills the tree.
 FINALIZE_MARGIN_SECONDS = 2.0
-#: The largest ``used`` a valid day counter holds, for the worker that reserves
-#: against it and the supervisor that plans from it.  It rejects a corrupt file;
-#: it is not a daily cap: ``daily_work_limit`` goes to 1,000,000 and the uncapped
-#: default still counts what every pass keeps.  A smaller planner-only bound
-#: stopped supervision and autostart for the rest of a busy UTC day.
-DAILY_COUNTER_MAX = 100_000_000
 
 
 def load_config(path: str | Path) -> RuntimeInstanceConfig:
@@ -149,8 +147,8 @@ def _receipt_payload(config: RuntimeInstanceConfig, receipt: Any, capability_gap
     ]
     idle = bool(getattr(receipt, "idle", False))
     # A run that met only by-design terminal outcomes did its job; counting
-    # them as degraded made the worker disagree with the doctor, which uses
-    # the same classification.
+    # them as degraded would make the worker disagree with the doctor, which
+    # uses the same classification.
     degraded = (
         bool(capability_gaps)
         or int(getattr(receipt, "retried", 0)) > 0
@@ -200,8 +198,8 @@ def worker_metadata_path(config: RuntimeInstanceConfig, name: str) -> Path:
 #: On Windows a file cannot be opened for the instant ``os.replace`` swaps it
 #: in, and cannot be replaced while a reader holds it open; either side gets
 #: ``PermissionError``.  The supervisor reads its control file beside the wake
-#: that rewrites it, outside the control lock, so the refusal ended a
-#: supervisor now and then (and a nightly CI run, which is how it was seen).
+#: that rewrites it, outside the control lock, so the refusal would end a
+#: supervisor now and then.
 #: The window is well under a millisecond, so both sides simply try again; a
 #: file that is really forbidden still fails, a fifth of a second later.
 _SHARING_RETRIES = 20
@@ -541,6 +539,73 @@ def _owner_timeout(sink: TextIO, config: RuntimeInstanceConfig | None, *, starte
     return _report(sink, config, payload, started_at=started_at, exit_code=124, best_effort=True)
 
 
+def backup_pause_check(config: RuntimeInstanceConfig, paused: Callable[[Any], bool] | None) -> Callable[[], bool]:
+    """Check the operator switch at most once a second between backup chunks."""
+    next_poll = 0.0
+    stopped = False
+
+    def check() -> bool:
+        nonlocal next_poll, stopped
+        now = time.monotonic()
+        if paused is not None and now >= next_poll:
+            next_poll = now + 1.0
+            stopped = paused(config)
+        return stopped
+
+    return check
+
+
+def run_backup_worker(
+    config_path: str | Path,
+    *,
+    output: TextIO | None = None,
+    deadline_epoch: float | None = None,
+    paused: Callable[[Any], bool] | None = None,
+) -> int:
+    """Run only local backup I/O, with no model runtime or queue reservation.
+
+    The store-wide lock covers both its due-time check and publication state,
+    so supervisors of separate audiences cannot publish duplicate daily jobs.
+    The watchdog supplies the independent job's deadline and owns hard cleanup.
+    """
+    sink = sys.stdout if output is None else output
+    config = None
+    try:
+        config = load_config(config_path)
+        now = time.monotonic()
+        deadline = now + BACKUP_JOB_SECONDS
+        if deadline_epoch is not None:
+            handed = strict_float("backup_deadline_epoch", deadline_epoch, minimum=0.0, maximum=math.inf)
+            deadline = min(deadline, now + handed - time.time() - FINALIZE_MARGIN_SECONDS)
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise BackupError("backup deadline exceeded")
+        with (
+            advisory_file_lock(config.binding.data_directory / "runtime-backup.lock", timeout_seconds=0),
+            backup_deadline(deadline, cancelled=backup_pause_check(config, paused)),
+        ):
+            receipt = backup_if_due(SQLiteStorage(config.binding), config, available_seconds=budget)
+        outcome = (receipt or {}).get("outcome", "skipped_not_due")
+        payload = _minimal_payload(config, "degraded" if outcome == "failed" else "ok", "backup_failed")
+        payload.update(job_kind="backup", backup_outcome=outcome)
+        if outcome != "failed":
+            payload["capability_gaps"] = []
+        _write(sink, payload)
+        return 0
+    except TimeoutError:
+        payload = _minimal_payload(config, "busy", "backup_already_running")
+        code = 75
+    except (OSError, ValueError, TypeError, sqlite3.Error, RuntimeError) as exc:
+        error = str(exc) if isinstance(exc, BackupError) else f"backup job failed: {type(exc).__name__}"
+        if config is not None:
+            record_backup_job_failure(config.binding.data_directory, error)
+        payload = _minimal_payload(config, "degraded", "backup_job_failed")
+        code = 124 if error == "backup deadline exceeded" else 1
+    payload["job_kind"] = "backup"
+    _write(sink, payload)
+    return code
+
+
 def run_worker(config_path: str | Path, *, output: TextIO | None = None, deadline_epoch: float | None = None) -> int:
     sink: TextIO = sys.stdout if output is None else output
     config: RuntimeInstanceConfig | None = None
@@ -690,10 +755,11 @@ def run_retry_failed(
 def load_credential_environment(config_path: str | Path, env_file: str | Path) -> int:
     """Put the credential names this instance's config declares into this process.
 
-    A pass started by hand reaches every provider with nothing: the scheduled wake
-    carries the environment, and this entry point had no way to be given it.  So the
-    pass refused each item with ``credential_missing``, stood the work types down, and
-    exited 0 -- an operator watching a receipt saw a success that had done nothing.
+    Without this, a pass started by hand would reach every provider with nothing: the
+    scheduled wake carries the environment, and this entry point has no other way to
+    be given it.  The pass would refuse each item with ``credential_missing``, stand
+    the work types down, and exit 0 -- an operator watching a receipt would see a
+    success that had done nothing.
 
     Reads under the same contract as the autostart wake and the Codex hook: only the
     names the trusted runtime config declares, never an interpolated dotenv, and never

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 
 import pytest
@@ -14,14 +15,29 @@ from scope_recall.adapters.hermes import (
 )
 from scope_recall.adapters.hermes.hooks import unsupported_host_fields
 from scope_recall.adapters.hermes.identity import switch_hermes_identity
-from scope_recall.adapters.hermes.provider import public_signatures_match
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
+
+#: What Hermes calls on a memory provider by name, besides its ``name`` property.
+PUBLIC_PROVIDER_METHODS = (
+    "is_available",
+    "initialize",
+    "prefetch",
+    "queue_prefetch",
+    "sync_turn",
+    "on_session_end",
+    "on_session_switch",
+    "on_pre_compress",
+    "shutdown",
+    "get_tool_schemas",
+    "handle_tool_call",
+)
 
 
 def test_public_memory_provider_signatures_match(adapter, initialize_kwargs):
     provider, _clock = adapter
-    assert public_signatures_match(provider)
+    assert isinstance(type(provider).name, property)
+    assert [m for m in PUBLIC_PROVIDER_METHODS if not callable(getattr(provider, m, None))] == []
     params = inspect.signature(provider.initialize).parameters
     assert "session_id" in params
     assert "kwargs" in params or any(p.kind.name == "VAR_KEYWORD" for p in params.values())
@@ -34,7 +50,8 @@ def test_initialize_binds_hermes_home_and_trusted_context(adapter, initialize_kw
     assert identity.binding.data_directory == (hermes_home / "scope-recall").resolve()
     ctx = identity.trusted_context()
     assert ctx.session_id == "TEST-session-1"
-    assert ctx.binding.installation_id == provider.installation_token
+    status = json.loads(provider.handle_tool_call("status", {}))
+    assert ctx.binding.installation_id == status["result"]["installation_id"]
     assert identity.owner_private_scope_id in ctx.allowed_scope_ids
 
 
@@ -117,8 +134,8 @@ def test_missing_identity_fails_closed(initialize_kwargs, hermes_home):
 
 
 def test_an_alternate_user_id_is_the_same_sender_not_a_conflict(initialize_kwargs, hermes_home):
-    """#116: Feishu sends open_id as user_id and union_id as user_id_alt on every session.
-    Refusing the pair failed every Feishu session closed; the principal stays user_id."""
+    """Feishu sends open_id as user_id and union_id as user_id_alt on every session.
+    The pair is not refused, which would fail every Feishu session closed; the principal stays user_id."""
     install_hermes_scope_recall(
         hermes_home,
         agent_id=initialize_kwargs["agent_identity"],
@@ -198,11 +215,11 @@ def test_the_name_a_gateway_passes_for_the_person_rides_on_reads_only(initialize
     """Recall reads a question that names the person as their own (``core/owner_view.py``).  A capture never carries
     the name, so a stored message does not change with the name its sender goes by."""
     dm = _telegram_dm(initialize_kwargs, hermes_home)
-    identity = bind_hermes_identity("TEST-session-1", **dict(dm, user_name=" Joy\tJoy "))
-    assert identity.user_name == "Joy Joy"
-    assert identity.trusted_context().source_principal.display_name == "Joy Joy"
+    identity = bind_hermes_identity("TEST-session-1", **dict(dm, user_name=" NameOne\tSurnameOne "))
+    assert identity.user_name == "NameOne SurnameOne"
+    assert identity.trusted_context().source_principal.display_name == "NameOne SurnameOne"
     assert identity.trusted_context(mutation=True).source_principal.display_name is None
-    for unreadable in ("x" * 121, "Joy\x00Joy", 7, None):
+    for unreadable in ("x" * 121, "NameOne\x00SurnameOne", 7, None):
         assert bind_hermes_identity("TEST-session-2", **dict(dm, user_name=unreadable)).user_name == "", unreadable
 
 
@@ -210,8 +227,11 @@ def test_a_session_switch_keeps_the_name_while_the_person_is_the_same(initialize
     """Hermes switches sessions (a compression, /new) with ids alone: the person and their name stay.  A name passed
     with the switch is the person's now; a person named again without one has none."""
     identity = bind_hermes_identity(
-        "TEST-session-1", **dict(_telegram_dm(initialize_kwargs, hermes_home), user_name="Joy")
+        "TEST-session-1", **dict(_telegram_dm(initialize_kwargs, hermes_home), user_name="NameOne")
     )
-    assert switch_hermes_identity(identity, "TEST-session-2").user_name == "Joy"
-    assert switch_hermes_identity(identity, "TEST-session-3", user_name="Joy Joy").user_name == "Joy Joy"
+    assert switch_hermes_identity(identity, "TEST-session-2").user_name == "NameOne"
+    assert (
+        switch_hermes_identity(identity, "TEST-session-3", user_name="NameOne SurnameOne").user_name
+        == "NameOne SurnameOne"
+    )
     assert switch_hermes_identity(identity, "TEST-session-4", user_id=initialize_kwargs["user_id"]).user_name == ""

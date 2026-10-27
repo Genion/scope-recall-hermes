@@ -50,6 +50,22 @@ def proposal(page, quote, *, value="蓝色", predicate="配色"):
     )
 
 
+def test_a_page_that_cannot_end_at_a_sentence_ends_between_runs():
+    """On a long line with no sentence end, a page cut inside a word could carry the first letters of a value the
+    request guard judges whole (``credential_env: nul`` of ``null``, ``<your api`` of ``<your api key>``), and be
+    refused every time it is asked.  The offsets put the cut at every position within the repeated words, whatever
+    the input budget."""
+    from scope_recall.core.consolidation_chunks import source_chunk
+    from scope_recall.runtime.consolidation_models import validate_chat_messages
+    from test_candidate_evidence_window import _source
+
+    words = " ".join(f"TEST{index} api_key: <your api key> credential_env: null" for index in range(1500))
+    for offset in range(60):
+        page, window = source_chunk(_source("a" * offset + " " + words), 0, formatter=consolidation_messages)
+        assert window.end < window.total and page.event["content"][-1] == " ", offset
+        validate_chat_messages(consolidation_messages([page]))
+
+
 def test_existing_1105_source_upgrades_explicitly_and_resumes_to_exact_end(worker_app):
     core, ctx, clock = worker_app
     padding = ("这是一段归档资料；" * 8000)[: 65536 - len(FIRST) - len(LAST) - 2]
@@ -64,8 +80,8 @@ def test_existing_1105_source_upgrades_explicitly_and_resumes_to_exact_end(worke
         assert db.execute("PRAGMA user_version").fetchone()[0] == 1105
         assert "consolidation_offset" not in {r[1] for r in db.execute("PRAGMA table_info(work_items)")}
     # ...and the bound store is brought forward through every step by its first open.
-    assert core.status(ctx).schema_version == SCHEMA_VERSION == 1110
-    assert core.initialize().schema_version == SCHEMA_VERSION == 1110
+    assert core.status(ctx).schema_version == SCHEMA_VERSION
+    assert core.initialize().schema_version == SCHEMA_VERSION
     windows, contents = [], []
 
     def build(sources, **kwargs):

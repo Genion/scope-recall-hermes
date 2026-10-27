@@ -19,6 +19,7 @@ import pytest
 import scope_recall.core.storage as storage_module
 from scope_recall.contracts import ContractError, InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.deadline import RequestDeadline, using_request_deadline
 from scope_recall.core.schema import SCHEMA_VERSION
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.core.writer_lease import truth_writer_process_snapshot
@@ -42,6 +43,40 @@ def put(tx, key="TEST-source/1", **values):
 def snapshot(storage, ctx):
     with storage.read(ctx) as tx:
         return tx.status()
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+@pytest.mark.parametrize("remaining", [None, 0.001, 1.0])
+def test_expired_request_opens_no_store_connection(store, monkeypatch, operation, remaining):
+    storage, ctx = store
+    _actual, opened = inject(monkeypatch)
+    deadline = RequestDeadline.from_budget(0)
+    with using_request_deadline(deadline), pytest.raises(ContractError, match="DEADLINE_EXCEEDED"):
+        with getattr(storage, operation)(ctx, remaining_seconds=remaining):
+            pytest.fail("expired request entered SQLite")
+    assert opened == []
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_expired_request_finishes_started_transaction_but_refuses_another(store, monkeypatch, fails):
+    storage, ctx = store
+    _actual, opened = inject(monkeypatch)
+    current = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: current[0])
+    with using_request_deadline(RequestDeadline.from_budget(1)):
+        try:
+            with storage.write(ctx) as tx:
+                put(tx)
+                current[0] += 2
+                if fails:
+                    raise InjectedFailure("TEST abort")
+        except InjectedFailure:
+            assert fails
+        with pytest.raises(ContractError, match="DEADLINE_EXCEEDED"), storage.write(ctx):
+            pytest.fail("expired request opened another transaction")
+    assert opened[0].closed
+    assert ("ROLLBACK" if fails else "COMMIT") in opened[0].trace
+    assert snapshot(storage, ctx).sources == (0 if fails else 1)
 
 
 class InjectedFailure(RuntimeError):
@@ -74,6 +109,10 @@ class FaultConnection:
 
     def executemany(self, sql, parameters):
         return self.conn.executemany(sql, parameters)
+
+    def set_authorizer(self, callback):
+        """Keep tombstone observation active on the real connection during fault injection."""
+        return self.conn.set_authorizer(callback)
 
     def commit(self):
         self.trace.append("COMMIT")
@@ -426,13 +465,13 @@ def test_every_store_connection_reads_through_the_memory_map_the_store_sets(stor
     """Each operation opens its own connection and, on a shared store, another process writes between any two recalls,
     so SQLite's own page cache never carries over.  Through a memory map a recall's pages come from the system's file
     cache without a read call each (``STORE_MMAP_BYTES``).  A size no build has as its default shows that the store set
-    it: a build whose default map is its limit reports that limit with no pragma at all (review of 3.5.0rc3)."""
+    it: a build whose default map is its limit reports that limit with no pragma at all."""
     storage, ctx = store
     with closing(sqlite3.connect(storage.path)) as probe:
         limit = probe.execute(f"PRAGMA mmap_size={1 << 40}").fetchone()[0]
     if not limit:
         pytest.skip("this SQLite build maps nothing")
-    # The store asks for as much as the build allows, at least the 2 GB a recall of the shared store was measured with.
+    # The requested mapping is bounded by this SQLite build's supported limit.
     assert min(storage_module.STORE_MMAP_BYTES, limit) >= min(limit, 2 << 30)
     distinctive = 3 << 20
     monkeypatch.setattr(storage_module, "STORE_MMAP_BYTES", distinctive)
@@ -480,9 +519,9 @@ def test_a_failed_pragma_whose_close_fails_keeps_the_connection_for_the_next_ope
     "statement,writable", [("PRAGMA user_version", True), ("PRAGMA user_version", False), ("PRAGMA journal_mode", True)]
 )
 def test_a_failure_right_after_open_closes_the_connection_and_its_writer_lease(store, monkeypatch, statement, writable):
-    """A transaction read the store's version, and switched a writer to WAL, before the block that closes its
-    connection.  A failure there left the connection open, and a writer's lease held until the process ended: every
-    other process's writes failed (review of 3.5.0rc3).  A busy store can answer the first statement with "database is
+    """A transaction reads the store's version, and switches a writer to WAL, before the block that closes its
+    connection.  A failure there must not leave the connection open and a writer's lease held until the process
+    ends, with every other process's writes failing.  A busy store can answer the first statement with "database is
     locked"."""
     storage, ctx = store
     actual, opened = inject(monkeypatch, operation=statement)

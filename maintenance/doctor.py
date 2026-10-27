@@ -2,7 +2,8 @@
 
 ``run_doctor`` drives a sequence of named checks. Each check records its own
 ``checks`` row and capability gaps on the report; the driver only decides how
-far into the instance the checks can get. Nothing here writes to the instance.
+far into the instance the checks can get. Checks leave stored data and
+configuration untouched; SQLite may create coordination sidecars for reads.
 """
 
 from __future__ import annotations
@@ -20,7 +21,10 @@ from typing import Any
 import scope_recall
 from scope_recall._version import __version__
 from scope_recall.adapters.clients.config import load_codex_config, load_shared_client
+from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
+from scope_recall.adapters.hermes.identity import unbound_session_hint
 from scope_recall.adapters.hermes.shared_entries import read_attachment
+from scope_recall.adapters.hermes.unbound_sessions import owner_sessions_unbound
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.model_budget import budget_totals, budget_window, pre_request_refusals, provider_refusals
 from scope_recall.runtime.running_code import live_records, stale_records
@@ -30,6 +34,7 @@ from .doctor_report import DoctorReport, HostChoice, record_check
 from .doctor_store import (
     check_backlog,
     check_candidates,
+    check_deletion_mirror,
     check_embedding_health,
     check_embedding_respace,
     check_footprint,
@@ -41,6 +46,7 @@ from .doctor_store import (
     check_schema,
     check_storage,
     check_unreached,
+    check_vector_store,
 )
 from .install_common import RUNTIME_CONFIG_LIMIT
 
@@ -114,9 +120,10 @@ def _installed_version(names: list[str], distribution: str) -> str | None:
 
 
 def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeInstanceConfig | None) -> None:
-    """What a Hermes that builds its own environment really runs: the core there, and the vector dependencies
-    there.  After the official Hermes update of 2026-10-11 every recall of one installation ran without vectors for
-    two days, on a core two releases old, while the venv every check read held the right ones."""
+    """Check the package version and vector dependencies in the environment Hermes manages.
+
+    The inspecting interpreter can differ from that environment. An unreadable environment is reported without
+    inferring whether its packages match the installation."""
     if report.host != "hermes":
         return
     environment = _hermes_runtime_environment(instance)
@@ -151,13 +158,9 @@ def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeI
 def _check_vector_dependencies(
     report: DoctorReport, probe: dict[str, Any], config: RuntimeInstanceConfig | None
 ) -> None:
-    """The runtime config names a LanceDB store, and the interpreter that recalls has no ``lancedb`` or ``pyarrow``.
+    """Report missing vector packages only for a configured LanceDB store.
 
-    The extra is optional, so its absence is no drift; with a LanceDB store configured it is every recall by words
-    alone, said only in the recall's own gaps (``lance_not_installed``) while the doctor named the threshold instead.
-    A Hermes that builds its own environment is read there (``_check_hermes_runtime``); a probe from an older core
-    has no answer, which is no finding.
-    """
+    Hermes-managed environments are checked separately. A probe without dependency metadata supplies no finding."""
     vector = config.vector if config is not None else None
     if report.hermes_runtime is not None or vector is None or vector.backend != "lancedb":
         return
@@ -286,10 +289,14 @@ def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
 #: ``audience_owner_unverified`` is an owner grant whose user is no owner
 #: principal: it grants nothing until the owner approves that user, and only
 #: the owner knows whether to.
+#: ``local_session_unbound`` is the owner's sessions on a local surface binding
+#: no scope: approving the surface gives its memory to everyone who reaches it
+#: without logging in, which only the owner can judge.
 _NON_ACTIONABLE_GAPS = frozenset(
     {
         "audience_owner_unverified",
         "due_work_unreached",
+        "local_session_unbound",
         "owner_words_from_host_request",
         "owner_words_unchecked",
         "owner_words_with_client_reminder",
@@ -527,15 +534,46 @@ def _check_audiences(report: DoctorReport, instance: Path) -> None:
         if row.get("kind") == "owner_private" and (row["platform"], row["user_id"]) not in owners:
             unverified[row["platform"]] = unverified.get(row["platform"], 0) + 1
     if unverified:
+        # An entry of a shared store keeps its grants in the store's manifest, which apply-install refuses to write.
+        approve = (
+            "add the owner's own login as an owner principal with scope-recall grants"
+            if manifest.entry_id is not None
+            else "approve the owner's own desktop or tui login (apply-install --owner-login)"
+        )
         report.capability_gaps.append("audience_owner_unverified")
         record_check(
             report,
             "audiences",
             "owner_unverified",
             ",".join(f"{platform}={count}" for platform, count in sorted(unverified.items()))
-            + ": owner_private rows whose user is no owner principal grant nothing; approve the owner's own "
-            "desktop or tui login (apply-install --owner-login) or remove the rows",
+            + f": owner_private rows whose user is no owner principal grant nothing; {approve} or remove the rows",
         )
+
+
+def _check_local_sessions(report: DoctorReport, data_directory: Path) -> None:
+    """The owner's local sessions a live Hermes process bound to no scope (``adapters/hermes/unbound_sessions``).
+
+    Such a session captures and recalls nothing, and the host shows no one the line the adapter writes in its log.
+    Named by surface, never by who spoke.
+    """
+    if report.host != "hermes":
+        return
+    entry = report.shared_store.get("entry_id", "")
+    unbound = owner_sessions_unbound(data_directory, entry_id=entry)
+    if not unbound:
+        return
+    report.capability_gaps.append("local_session_unbound")
+    record_check(
+        report,
+        "local_sessions",
+        "unbound",
+        "; ".join(
+            f"{item['platform']}: the owner's sessions there bind no memory scope since {item['since']} "
+            f"({', '.join(item['gaps'])}): "
+            + unbound_session_hint(item["platform"], LOCAL_USER_ID, shared_entry=bool(entry))
+            for item in unbound
+        ),
+    )
 
 
 def _serves(worker, binding) -> bool:
@@ -573,13 +611,58 @@ def _check_worker_status(report: DoctorReport, binding, data_directory: Path) ->
         report.capability_gaps.append("worker_status_unreadable")
         return
     report.worker_status = {key: value for key, value in status.items() if key in _WORKER_STATUS_KEYS}
-    # A pass that yielded failed nothing: another writer held the store, or another pass the worker lock, and the
-    # supervisor tries again after a pause (runtime/worker_entry.py, exit 75 with status busy).  It was reported as
-    # a failed exit (yuheng's audit of 3.4.2); its status says busy, and only other exits are failures.
+    # Exit 75 with status busy indicates contention: another writer holds the store or another pass holds the
+    # worker lock.  The supervisor retries after a pause; only other nonzero exits count as worker failures.
     if status.get("exit_code", 0) != 0 and not (status.get("exit_code") == 75 and status.get("status") == "busy"):
         report.capability_gaps.append("worker_last_exit_failed")
     if report.pending_work and status.get("unavailable_work_types"):
         report.capability_gaps.append("worker_capability_unavailable")
+
+
+#: Passes in a row that may leave a work type the config enables unavailable before the doctor says so.  One
+#: pass can miss its port for a passing reason; three with the work still queued are a pattern.
+UNAVAILABLE_PASSES_REPORTED = 3
+
+
+def _check_unavailable_work(report: DoctorReport, path: Path, control: dict[str, Any]) -> None:
+    """Each work type one audience's supervisor recorded as unavailable for ``UNAVAILABLE_PASSES_REPORTED`` passes
+    in a row or more (``runtime/scheduling.py`` ``_unavailable_streaks``).
+
+    The audience is named by its control file's key, because its scope ids carry chat and account ids.  Raises
+    ``ValueError`` for a record that is not the shape the supervisor writes.
+    """
+    streaks = control.get("unavailable_streaks", {})
+    if not isinstance(streaks, dict):
+        raise ValueError("supervisor_streaks_invalid")
+    key = path.stem.removeprefix("runtime-supervisor-")
+    for kind, entry in streaks.items():
+        if not isinstance(entry, dict) or type(entry.get("passes")) is not int:
+            raise ValueError("supervisor_streak_invalid")
+        if entry["passes"] < UNAVAILABLE_PASSES_REPORTED:
+            continue
+        detail = _unavailable_detail(entry)
+        gap = f"work_type_unavailable:{kind}"
+        if gap not in report.capability_gaps:
+            report.capability_gaps.append(gap)
+        record_check(report, "unavailable_work", "stalled", f"supervisor {key}: {kind} {detail}")
+
+
+def _unavailable_detail(entry: dict[str, Any]) -> str:
+    """The run of passes one entry records, in one bounded line.
+
+    Raises ``ValueError`` for a field of another shape: the record is the supervisor's, and what else a file at its
+    name holds is not reported as if the supervisor had written it.
+    """
+    since, last_at, worker_error = entry.get("since"), entry.get("last_at"), entry.get("worker_error", "")
+    gaps, codes = entry.get("capability_gaps", []), entry.get("error_codes", [])
+    lists_ok = all(isinstance(values, list) and all(isinstance(v, str) for v in values) for values in (gaps, codes))
+    if not (lists_ok and isinstance(since, str) and isinstance(last_at, str) and isinstance(worker_error, str)):
+        raise ValueError("supervisor_streak_invalid")
+    reasons = [reason[:200] for reason in (*gaps[:16], *codes[:4], *([worker_error] if worker_error else []))]
+    return (
+        f"could not run in {entry['passes']} passes in a row, from {since[:40]} to {last_at[:40]}; "
+        f"last pass: {', '.join(reasons) or 'no reason recorded'}"
+    )
 
 
 def _check_supervisor(report: DoctorReport, data_directory: Path) -> None:
@@ -588,12 +671,25 @@ def _check_supervisor(report: DoctorReport, data_directory: Path) -> None:
     A supervisor stands down after consecutive hard worker failures, not one, and
     stays down until the next autostart wake; nothing else says so, and a stopped
     loop leaves its queue waiting.  Either state is reported here: a loop that stood down
-    is a finding, and so is one that is limping.
+    is a finding, and so is one that is limping.  The state is the newest supervisor's; the
+    work each audience's passes kept leaving unavailable is read from every file, and one
+    file that cannot be read does not hide the others.
     """
     newest: dict[str, Any] | None = None
     try:
         for path in sorted(data_directory.glob("runtime-supervisor-*.json")):
-            control = _read_control_file(path)
+            try:
+                control = _read_control_file(path)
+            except (OSError, ValueError):
+                if "supervisor_state_unreadable" not in report.capability_gaps:
+                    report.capability_gaps.append("supervisor_state_unreadable")
+                continue
+            if control is not None:
+                try:
+                    _check_unavailable_work(report, path, control)
+                except (ValueError, TypeError):
+                    if "supervisor_state_unreadable" not in report.capability_gaps:
+                        report.capability_gaps.append("supervisor_state_unreadable")
             if control is None or control.get("finished_at") is not None and control.get("state") == "paused":
                 continue  # An operator pause is not a failure.
             if newest is None or str(control.get("started_at") or "") > str(newest.get("started_at") or ""):
@@ -753,6 +849,7 @@ def run_doctor(
         return report
     binding, data_directory = bound
     _check_audiences(report, instance)
+    _check_local_sessions(report, data_directory)
     _check_running_code(report, data_directory)
     package_health.apply_package_health(report, instance, probe)
     check_runtime_config_present(report, data_directory)
@@ -763,6 +860,7 @@ def run_doctor(
     entry_config = _entry_runtime_config(instance, data_directory)
     _check_hermes_runtime(report, instance, entry_config)
     _check_vector_dependencies(report, probe, entry_config)
+    check_vector_store(report, entry_config, binding)
     check_footprint(report, data_directory, config)
     if readable:
         _check_worker_status(report, binding, data_directory)
@@ -777,6 +875,7 @@ def run_doctor(
         check_model_output(report)
         check_ledger(report)
         check_owner_words(report, host, data_directory, report.shared_store.get("entry_id"))
+        check_deletion_mirror(report, data_directory)
         _classify_status(report)
     check_index(report, data_directory, store_readable=readable, config=config)
     return report

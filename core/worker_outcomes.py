@@ -23,6 +23,8 @@ _NON_RETRYABLE_MODEL_ERRORS = frozenset(
         "budget_unavailable",
         # The request guard refused secret-like text; the payload will not change.
         "sensitive_request",
+        # The provider's policy refused or stopped the answer; asking again sends the same request to the same policy.
+        "model_refused",
     }
 )
 
@@ -87,6 +89,26 @@ def deadline_result(storage, context, item) -> tuple[str, str, str]:
         return "skipped", "DEADLINE_EXCEEDED", tx.work.read_state(item.work_id) or "stale"
 
 
+def hold_for_private_mode(
+    storage, clock, context, item, *, started: float, budget: float, seconds: float = 300
+) -> tuple[str, str | None, str]:
+    """Release a private item without spending an attempt or asking any provider.
+
+    The item stays pending and is looked at again after a short hold, when the
+    operator may have closed the interval.  Nothing about the source leaves SQLite.
+    """
+    if budget_left(started, clock, budget) <= 0:
+        return deadline_result(storage, context, item)
+    with storage.write(context, remaining_seconds=max(0.001, budget_left(started, clock, budget))) as tx:
+        now = clock.utc_now()
+        if not tx.work._verify_lease(*item.lease, now=now):
+            return stale_result(tx, item)
+        return work_result(
+            tx.work.defer_without_attempt(*item.lease, now=now, error_code="private_mode", seconds=seconds),
+            error_code="private_mode",
+        )
+
+
 def mark_obsolete(tx, item, now: str) -> tuple[str, str | None, str]:
     return work_result(tx.work.mark_obsolete(*item.lease, now=now), error_code="authority_revoked")
 
@@ -107,14 +129,12 @@ def epoch_changed(tx, item, now: str) -> tuple[str, str | None, str]:
 #
 # ``memory_epoch`` moves on every source insert and every claim, resume,
 # reference, artifact and deletion write anywhere in the instance.  It stays
-# the read-side release fence.  Worker derivations used to compare it across
-# their paid model or vector call, so every chat message or tool call captured
-# meanwhile discarded results that never depended on it.  A derivation now
-# records what it depends on before the call and re-reads exactly that in the
-# transaction that would record its result.  Clocks play no part: deletion
-# operations are dated by the epoch they create, and claim versions by the
-# rowid order of an append-only table, both assigned under SQLite's single
-# writer lock and therefore comparable across processes.
+# the read-side release fence.  Derivations instead record their dependencies
+# before external model or vector calls and revalidate them when storing the
+# result, so unrelated captures do not discard paid work.  Deletions are ordered
+# by the epochs they create and claim versions by append-only row order; neither
+# check depends on wall-clock timestamps.  Both orders are assigned under
+# SQLite's single writer lock and therefore comparable across processes.
 
 
 @dataclass(frozen=True)

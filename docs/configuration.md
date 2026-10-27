@@ -7,9 +7,6 @@ for Hermes, `<instance-root>\codex-installation.json` for Codex. The
 behaviour: budgets, the vector companion, and the external model routes. This
 document is a reference for the second file.
 
-The former 2.x `config.json` key reference lived here until the 2.x engine was
-removed; it remains in repository history at tag `v2.0.1`.
-
 ## Where the file goes
 
 `runtime-config.json` belongs in the Core data directory, beside `memory.sqlite3`:
@@ -133,7 +130,7 @@ defaults a standalone worker pass uses.
 | `max_auto_recoveries` | int | `2` | 0–4 | Automatic retries a recoverable failure gets. `0` disables automatic recovery; the failure then waits for `retry-failures`. |
 | `auto_recall_seconds` | number | `5.0` | 0.001–5.0 | Deadline for *automatic* recall on the read path. On timeout, recall degrades to lexical. |
 | `hook_processing_seconds` | number | `6.0` | 0.001–6.0 | Total budget a trusted-host hook has to answer. Must be at least `auto_recall_seconds`, so the hook can cover a full automatic recall; a smaller value fails the file with `hook_processing_seconds_must_cover_auto_recall`. |
-| `resident_recall_minutes` | int | unset | 0–1440 | For a client attached to a shared store (from 3.6.0): minutes its resident recall server stays up after the last prompt's recall and the last of the client's running MCP servers. Unset, the client's default applies: 120 for WorkBuddy, which runs the entry's MCP server only with a conversation's process, 120 for dsh, whose plugin runs each hook as a process of its own and whose headless runs are one process each, and none for Claude Code and Codex, whose server runs as long as the client. An entry with no runtime config file keeps none. **`0` keeps none**: a running server reads the value every 30 s and ends at 0. Each of the client's MCP servers decides at its own start whether it answers the hooks itself (0) or keeps the resident server, so a change reaches that side when the client starts it again: for Claude Code, Codex and dsh at the client's restart, for WorkBuddy with each conversation's process. While it runs the server holds a vector helper, about 1 GB. Under WorkBuddy it also ends with the conversation's agent process that started it, since that process ends every process it started. Read from the entry's own runtime config; a value outside the bounds or of another type (`true`, `"60"`, `2.0`) fails the whole runtime config, as any field's does. See [install.md](install.md), sections 12 and 13. |
+| `resident_recall_minutes` | int | unset | 0–1440 | For a client attached to a shared store: minutes its resident recall server stays up after the last prompt's recall and the last of the client's running MCP servers. Unset, the client's default applies: 120 for WorkBuddy, which runs the entry's MCP server only with a conversation's process, 120 for dsh, whose plugin runs each hook as a process of its own and whose headless runs are one process each, and none for Claude Code and Codex, whose server runs as long as the client. An entry with no runtime config file keeps none. **`0` keeps none**: a running server reads the value every 30 s and ends at 0. Each of the client's MCP servers decides at its own start whether it answers the hooks itself (0) or keeps the resident server, so a change reaches that side when the client starts it again: for Claude Code, Codex and dsh at the client's restart, for WorkBuddy with each conversation's process. While it runs the server holds a vector helper, about 1 GB. Under WorkBuddy it also ends with the conversation's agent process that started it, since that process ends every process it started. Read from the entry's own runtime config; a value outside the bounds or of another type (`true`, `"60"`, `2.0`) fails the whole runtime config, as any field's does. See [install.md](install.md), sections 12 and 13. |
 
 A running supervisor reads the file again before each pass, so an edited setting takes effect at
 its next pass. Only a file that names another store ends it, as `suspended` with the reason
@@ -141,10 +138,8 @@ its next pass. Only a file that names another store ends it, as `suspended` with
 
 `daily_work_limit` is not the spend guard. Money, calls and tokens are enforced
 per request by the auxiliary ledger (`runtime/model_budget.py`), which cannot see
-this counter, and this counter cannot see cost. A limit set below the rate at
-which work arrives is not thrift, it is a permanent backlog: the comment on the
-field records an instance where roughly fifteen work items arrived per captured
-source, so the old default of 256 could never drain one day's own output.
+this counter, and this counter cannot see cost. A daily limit below the incoming
+work rate causes a growing backlog.
 
 The maxima above are protections, not recommendations. `request_seconds` at
 45 seconds and `drain_seconds` at 120 seconds are the contract ceilings; a
@@ -160,7 +155,7 @@ The block is a mapping:
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `backend` | `"lancedb"` or `"sqlite-bruteforce"` | `"lancedb"` | `lancedb` needs the `lancedb` extra installed. `sqlite-bruteforce` is dependency-free and scans; it is meant for hosts where LanceDB or PyArrow is unsafe, and for small to medium memory sets. Any other value, including `"pgvector"`, is refused. |
+| `backend` | `"lancedb"` or `"sqlite-bruteforce"` | `"lancedb"` | `lancedb` needs the `lancedb` extra installed. Both backends serve recall while the worker writes. `sqlite-bruteforce` is dependency-free and scans; it is meant for hosts where LanceDB or PyArrow is unsafe, and for small to medium memory sets. Recall reads through SQLite's write-ahead log and sees each embedding as soon as the worker commits it; a read needs `vector.sqlite3-wal` and `vector.sqlite3-shm` beside the file, or permission to create them there, as the worker has. A reader that closes last leaves them behind; a writer removes them when it is the last connection and closes cleanly. Any other value, including `"pgvector"`, is refused. |
 | `storage_dir` | absolute path | required | Must be exactly `<data_directory>/vectors/<embedding space id>`, or the file is refused with `VECTOR_STORAGE_OUTSIDE_BINDING`. The backend creates its own store below it: a `lancedb/` directory, or a `vector.sqlite3` file. |
 | `table_name` | string, non-blank, ≤ 240 chars | required | Table or collection name inside the store. |
 | `dimensions` | int | required, 1–8192 | Must equal the active embedding space's width, or the file is refused with `VECTOR_DIMENSIONS_MISMATCH`. The shipped space is 3072. |
@@ -184,7 +179,43 @@ resulting native path is too long the worker reports
 A top-level field: the lowest cosine similarity, from `-1.0` to `1.0`, at which a
 vector hit is admitted into recall. It is compared with a `1e-6` float tolerance.
 
-It has no default and no installer writes it. Without it, recall refuses every
+Automatic recall also applies three top-level policy fields. Explicit tool
+lookups, including those requesting `mode: auto`, and history and as-of reads
+keep their admission thresholds and do not skip conversational queries.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `auto_lexical_min_coverage` | `0.20` | Minimum share of the query's meaningful terms a lexical candidate matches, from `0.0` to `1.0`. |
+| `auto_lexical_min_terms` | `2` | Minimum matched terms for queries with at least this many terms; an integer of at least `2`. Shorter queries must match every term. |
+| `auto_vector_threshold` | `0.30` | Minimum cosine similarity for automatic vector hits, from `-1.0` to `1.0`; `vector_threshold` must also be met. |
+
+Calibrate lexical coverage and vector similarity independently on synthetic or
+copied data for the configured embedding space. Reciprocal rank fusion orders
+candidates that clear their channel's floor; it cannot admit a weak match.
+For a long Chinese prompt with multiple substantive clauses, a clause that
+meets the core lexical-specificity rule can clear the same coverage floor on
+its own. An attachment cannot dilute an independently matched question.
+The vector default preserves the synthetic word-hashing benchmark's admission
+floor. A store configured with `vector_threshold: 0.70` still requires at least
+`0.70`; set `auto_vector_threshold` higher to tighten automatic injection alone.
+Exact references pass directly. A relation-expanded item inherits a passing
+seed's admission. A named day's scoped conversation is selected by its day and
+entry. Packet gaps report rejected candidate counts per channel as
+`auto_relevance_below_floor:<channel>:<count>`, without their contents.
+
+Automatic packets contain zero to six items. Preferences, constraints and the
+current task accompany query evidence only when at least one item passed. A
+resume request can still receive its grounded current task without query hits.
+Every host uses the core's prompt decision: blank input and slash commands skip
+recall; acknowledgments, approvals, thanks, praise, bare continuation requests
+and questions about this session's execution state skip it after an earlier
+human prompt in the same entry's stored session. The captured current prompt does
+not count as an earlier message. First prompts retain resume behavior, and
+questions about the owner, a named topic or the past still search. A skipped
+prompt starts neither search nor query embedding; diagnostics record
+`auto_recall_skipped:<reason>`.
+
+`vector_threshold` has no default and no installer writes it. Without it, recall refuses every
 vector hit with `vector_threshold_unconfigured` and answers degrade to lexical,
 while sources and queries are still embedded and metered. `doctor` reports that
 state as the gap `vector_threshold_unconfigured` when a `vector` store and an
@@ -203,66 +234,55 @@ unset and let recall stay lexical; a guessed threshold either admits noise as
 evidence or admits nothing at all.
 
 On a shared store (`docs/shared-store.md`) in the shipped space, the accepted
-value admits too much: the store holds every entry's memories. Measured on a copy
-of a store of nine entries (2026-09-30, on 3.4.5), two agents' sets of 20
-questions that have no answer were each given an unrelated memory for 12 of them
-at `0.653`, and for 2 of them from `0.68` up, as by words alone. At `0.653` the
-best memory the vector search offered such a question scored from 0.653 to
-0.691 (an offer is not always delivered), and the replies it found for the
-owner's questions asked again scored 0.722 or more. Over all 428 questions measured, `0.70`
-answered 23 more than `0.653` and one fewer, and two more than `0.68` and one
-fewer; `0.72` answered four more than `0.70` and two fewer, one of them a fact
-an agent had been told. So on a shared store in the shipped space whose runtime
-configs hold `0.653`, set `0.70` in each entry's runtime config. A store in
+value admits too much: the store holds every entry's memories, so a question
+with no answer meets far more unrelated memories just above `0.653`, while the
+replies that do answer the owner's questions score well above `0.70`. On a
+shared store in the shipped space whose runtime configs hold `0.653`, set `0.70`
+in each entry's runtime config. A store in
 another space, or one whose threshold was calibrated on it, keeps its own.
 `attach` copies the attached instance's value as it is.
 
 ## `owner_names`
 
 A top-level list of the names the store's owner goes by, at most eight, each 2 to
-64 printable characters with no space at either end: `"owner_names": ["Joy", "乔伊"]`.
+64 printable characters with no space at either end: `"owner_names": ["NameOne", "名字一"]`.
 Optional; no installer writes it.
 
-An agent asks its memory about the owner by name ("Joy 对动画的运镜有什么要求？",
-"What does Joy prefer?"), while the owner's own messages say "I" and never their
-name. Such a question is searched by meaning twice: as asked, which finds what
+An agent may ask about the owner by name, for example "What does NameOne prefer?",
+while relevant messages from the owner use the first person and omit the name.
+Such a question is searched by meaning twice: as asked, which finds what
 names the owner, and as the owner would ask it ("我对动画的运镜有什么要求？",
 "What does I prefer?"), which finds their own words, each search with the vector
-channel's slots. Both are embedded in one request where the embedding route takes
-several texts in one (the Gemini and OpenAI-compatible routes do): measured on the
-shipped route, one text took 420 ms at the median, both together 488 ms, and two
-requests one after the other 818 ms, too long for a recall tool's 2 s. By its
-words, a candidate is admitted by the question as asked or by the question without
-the name, so a short question's other words are enough for an answer in the
-owner's own words. A question that names no listed name, or asks nothing besides
-the name ("Joy 是谁？"), is recalled as asked.
+channel's slots. When the embedding route supports multiple texts per request,
+both forms are embedded together to avoid serial network requests consuming the
+recall budget. The Gemini and OpenAI-compatible routes support this batching. By its words,
+a candidate is admitted by the question as asked or by the question without the
+name, so a short question's other words are enough for an answer in the owner's
+own words. A question that names no listed name, or asks nothing besides the name
+("NameOne 是谁？"), is recalled as asked.
 
 Besides this list, recall reads the name a host attests for the person asking, in
 reads only, never in a capture: a Hermes gateway passes the user's name for a
-verified person (Telegram's first and last name, `Joy Joy`), which gives the whole
-name and, when it has several words, the first: a middle name or a surname is as
+verified person (Telegram's first and last name, such as `NameOne SurnameOne`), which gives
+the whole name and, when it has several words, the first: a middle name or a surname is as
 often someone else's. A name that looks like an account id (12 or more letters and
 digits with a digit among them) is not taken. Claude Code, Codex, WorkBuddy, dsh
 and the remote clients attest no name: list it here in each of their runtime
 configs.
 
 A Latin-letter name is matched as a word of its own and with its case, so
-`Joyce`, `joy-hub`, `/opt/Joy`, `C:\Joy` and the word "joy" are not the name, nor
-is the first word of another person's name (`Joy Smith`, `Joy SMITH`) unless the
-next word is a listed name too. Chinese runs words together, so a Chinese name is
-matched where what follows it goes on with a question about the person (a
+`NameOneville`, `nameone-hub`, `/opt/NameOne`, `C:\NameOne` and the word "nameone" are not
+the name, nor is the first word of another person's name (`NameOne SurnameTwo`,
+`NameOne SURNAMETWO`) unless the next word is a listed name too. Chinese runs words
+together, so a Chinese name is matched where what follows it goes on with a question about the person (a
 particle, a preposition, a common verb or adverb, a time: `王芳对…`, `王芳喜欢…`,
 `王芳的…`), and not where more characters run it on into someone's longer name
 (`王芳芳`, `王芳林`); a name followed by a word outside that list is recalled as
 asked. List the name as it is written. A name of one character is never matched.
 
-Measured on a copy of a shared store of nine entries (2026-10-11, against 3.9.7):
-of 52 questions agents ask about the owner by name, each answered by one of the
-owner's own messages, 16 came back in the top five before and 27 after, none
-lost; asked as the recall tool asks them, 16 and 24 of the 48 that both runs
-searched by meaning; the same questions about a configured Chinese name (`王芳`),
-19 and 24 of 45. The owner's own 173 questions, which name no one, came back
-exactly as before.
+The second search brings more of the owner's own messages into the top results
+for questions that name the owner, and loses none; questions that name no one
+are recalled as they would be without it.
 
 ## `auxiliary`
 
@@ -304,7 +324,7 @@ Omitted, the policy is deliberately fail-closed: `cap_micro_usd`,
 | `total_input_cap` | int ≥ 0 or `null` | `0` | Selected-period input-token cap. Same `0` versus `null` distinction. |
 | `total_output_cap` | int ≥ 0 or `null` | `0` | Selected-period output-token cap. Same distinction. |
 | `total_call_cap` | int ≥ 0 or `null` | `0` | Selected-period request-count cap. Same distinction. |
-| `max_request_bytes` | int ≥ 1 | `128000` | Largest request body the ledger lets out, counted after JSON encoding. A candidate evaluation's messages may hold 64,000 bytes, and the request escapes their quotes, backslashes and line breaks again: measured at the full budget, about 66,000 bytes for prose and 85,000 for code or JSON, and at most twice the messages. A cap below that refuses such evaluations: the item fails as `request_too_large` (before 3.10.3 it waited forever as `budget_unavailable`) and `retry-failures` re-opens it once the cap is raised. |
+| `max_request_bytes` | int ≥ 1 | `128000` | Largest request body the ledger lets out, counted after JSON encoding. A candidate evaluation's messages may hold 64,000 bytes, and the request escapes their quotes, backslashes and line breaks again: measured at the full budget, about 66,000 bytes for prose and 85,000 for code or JSON, and at most twice the messages. A cap below that refuses such evaluations: the item fails as `request_too_large` and `retry-failures` re-opens it once the cap is raised. |
 | `default_reserve_input` | int ≥ 1 | `32768` | Input tokens reserved before usage is known. |
 | `default_reserve_output` | int ≥ 1 | `4096` | Output tokens reserved before usage is known. |
 | `model_reserve_output` | mapping of model to int ≥ 1 | one shipped entry | Per-model override of the output reservation. |
@@ -380,6 +400,26 @@ The default kind is an OpenAI-compatible chat-completions route
 | `headers` | mapping or absent | absent | Extra request headers, validated before use. A second `Authorization` cannot be smuggled in this way. |
 | `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, as in `auxiliary.embedding`. **What is consolidated, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust.** A model server on a loopback host needs no opt-in, and a quoted `"true"` is refused. |
 
+A chat answer is the text of the one choice's assistant message. One cut off at
+the output limit (`finish_reason: "length"`) fails as `DERIVATION_INVALID` on
+`model_output_truncated`. One the provider's policy stopped
+(`finish_reason: "content_filter"`, whatever text the message holds), or that
+the model refused (a `refusal` beside a `content` with no answer text: absent,
+blank, or a list of parts without text), fails as `model_refused`: no output
+limit is involved, so the item is not asked again. It is a terminal failure
+(`retry-failures` in [install.md](install.md)), and `--include-terminal` runs
+it again once the model, the route or the provider's policy has changed. One
+the provider ended without finishing
+(`finish_reason: "insufficient_system_resource"` or `"aborted"`, whatever text
+the message holds) fails as `model_output_interrupted`: a transient fault, not
+a failure by design. A consolidation is asked again as after a timeout and
+re-opened by the automatic recovery (`max_auto_recoveries`); a candidate
+evaluation, which is asked once, fails at once. A plain `retry-failures` run
+re-opens what is left. A pass that meets an interrupted answer stops asking
+for that kind of work for the rest of the pass, as after a 429, so an outage
+costs one request a pass; unlike a refusal, it was a billed answer, and counts
+as an attempt of its item.
+
 Setting `"kind": "openai_responses"` selects a Responses-API route instead of
 chat completions. It targets the documented contract of DeepSeek
 `POST https://api.deepseek.com/responses`; nothing about it is claimed for
@@ -396,9 +436,10 @@ another provider, and streaming is not implemented:
 | `stream` | boolean | `false` | Must stay `false`; streaming is refused. |
 | `kind` | `"openai_responses"` | required | Selects this route. |
 | `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, as in `auxiliary.embedding`. **What is consolidated, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust.** A model server on a loopback host needs no opt-in, and a quoted `"true"` is refused. |
+
 Unknown keys in this block are rejected (`consolidation_unknown_config`) rather
-than ignored, the way the `codex_cli` block already behaves: this dialect is new
-and has no legacy key to stay compatible with.
+than ignored, as in the `codex_cli` block: this dialect has no legacy key to stay
+compatible with.
 
 The request explicitly carries `store: false`. DeepSeek documents this parameter
 as unsupported/ignored and its API as stateless; this flag is not a substitute
@@ -408,16 +449,19 @@ including interleaved `system` messages. Text parts use `input_text` for `system
 and `user`, and `output_text` for `assistant`. A `tool` message is refused
 (`input_invalid`): function-call item pairs are not implemented by this adapter.
 
-Only a response whose own `status` is `completed` is an answer. `incomplete`
-currently fails as `DERIVATION_INVALID` on
-`model_output_truncated`, exactly like a chat answer cut off at the output
-limit (the diagnostic does not yet distinguish content filtering from the
-token limit); `failed` fails as `response_status_failed`. From a completed response the
+Only a response whose own `status` is `completed` is an answer. An `incomplete`
+one says why in `incomplete_details.reason`: `max_output_tokens`, or no reason
+at all, fails as `DERIVATION_INVALID` on `model_output_truncated`, exactly like
+a chat answer cut off at the output limit; `content_filter` fails as
+`model_refused`, like a chat answer the provider's policy stopped; any other
+reason fails as `unsupported_response_shape`. `failed` fails as
+`response_status_failed`, a transient fault recovered like a timeout: asked
+again, then re-opened by the automatic recovery (`max_auto_recoveries`). From a completed response the
 adapter reads only the `output_text` parts of `assistant` message items —
 `reasoning` items and `reasoning_text` parts are never treated as an answer, a
 refusal part fails as `model_refused`, and an answer with no text fails as
-`empty_output`. The text is handed to the existing proposal validator
-unchanged, with no JSON repair.
+`empty_output`. The text is handed to the proposal validator unchanged, with
+no JSON repair.
 
 Usage is read as `input_tokens`/`output_tokens`, with
 `input_tokens_details.cached_tokens` recorded for observation.
@@ -628,6 +672,45 @@ or changes `vector_threshold`.
 
 ### Hermes hooks and the host's timeout
 
+Host capture budgets cover successive store operations, including first-seen
+lookups, inbox writes and source commits. SQLite refuses a transaction entered
+with no caller time remaining. An admitted transaction finishes its commit or
+rollback and releases its connection and writer lease; those operations preserve
+atomicity and cannot be abandoned at the deadline. A statement already running
+can exceed its budget. Each following stage uses the time left and the preceding
+store operation's duration to decide whether to defer.
+
+Client hooks use a 2 s default total budget and 1 s per capture. A capture already
+written to the durable inbox stays there when its source commit cannot fit.
+Runtime attachment and worker start wait only for the hook's remaining time;
+with less than 0.3 s for attachment or 0.1 s for worker start they are skipped.
+The next session start, captured turn end, session end or queued prompt with time
+remaining wakes the worker. A shared store's scheduled worker also replays its
+inbox. A runtime finishing after its hook returns has its resources closed by
+its owning background call.
+
+Hermes compression and session-end retries and steers share a 2 s capture pass.
+Unwritten steers stay in the retry buffer for its next pass. A finished turn
+writes its own captures before retrying older buffered captures. Shutdown's last
+retry pass takes at most 2 s of store work, apart from an already-running
+transaction and the filesystem work needed to keep its remaining captures.
+Its diagnostic pending count is skipped when another read cannot fit.
+
+Unstored captures at shutdown, captures past the retry window, and buffer
+overflow are kept under `kept-captures/` beside `memory.sqlite3`. These files
+hold sanitized, unadmitted capture envelopes, with their original session,
+actor, scope and occurrence time. The next adapter start loads them and wakes
+the retry thread; replay checks the installation and current grants before
+SQLite admits them. A file is removed only after persistence, durable inbox
+acceptance or a terminal refusal, including revoked authorization. Unreadable
+files remain for inspection and produce a warning. Shutdown reports captures it
+could not persist with `pending_capture_status` `unpersisted` and
+`pending_capture_durability` `memory_only`. Those in-memory copies cannot be
+recovered after the process exits. Include this directory when
+backing up pending host captures; SQLite remains the authority for admitted
+memory. The spool holds at most 256 files, each with at most 256 KiB of event
+data plus 64 KiB of envelope metadata.
+
 Hermes abandons a plugin's hook call after its own `plugins.hook_callback_timeout`
 (30 s by default) and, on Hermes 0.21.5, skips that callback for the next 60 s.
 Scope Recall registers one callback per hook for the whole gateway, so that skip
@@ -638,7 +721,7 @@ state, and recalls without holding it. With a timeout of 0 or less, which Hermes
 reads as none, a hook waits at most 10 s. A finished turn is written one capture
 at a time, so the next turn's hooks get in between; its message and reply are
 dated when its writing began, and a shutdown waits for it. A tool result is written
-without holding its session (from 3.5.1), so a step's parallel tool calls do not
+without holding its session, so a step's parallel tool calls do not
 wait for one another's writes; those still take turns at the store's one writer,
 each within its own budget. After its write a tool hook takes its session back once
 more, which can wait behind a message being captured. A shutdown waits up to 10 s

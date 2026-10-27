@@ -105,8 +105,8 @@ def test_a_stamp_from_another_release_does_not_block():
 
 
 def test_a_schema_generation_stamp_never_blocks_a_release():
-    """#233: rows re-opened under schema 1110 before a fix kept a stamp that blocked every later release keeping the
-    schema, the one that fixed their validation included.  The code is one of the two items reported there."""
+    """A schema-generation stamp does not count as a retry by the current release, even when the schema is unchanged.
+    Reopening terminal work replaces that stamp while preserving its other failure marks."""
     code = (
         "retried:1110|derivation_retry:1|retried:1109|auto_retry:2|timeout|timeout|"
         "DERIVATION_INVALID|DERIVATION_INVALID|DERIVATION_INVALID"
@@ -138,10 +138,8 @@ def test_a_new_stamp_replaces_the_earlier_one_and_keeps_the_rest():
 
 
 def test_a_code_past_the_bound_keeps_its_marks_and_its_kind():
-    """A release stamp longer than the schema's pushed a full code past the bound, and the cut took the end of the
-    failure kind (``derivation_inval``: no class, no doctor count; audit of 3.10.1).  Past the bound the history
-    between the marks and the kind gives way, and every budget mark stays, the automatic count among them: cut in
-    the middle, a count there was lost and its budget began again (audit of 3.10.1)."""
+    """Truncating an oversized error code preserves its failure kind and every retry-budget marker,
+    including the automatic retry count; history between the markers and kind gives way first."""
     from scope_recall.core.work_storage import CODE_BOUND, _auto_count, _operator_retry_ids, _within
 
     code = "retried:1110|derivation_retry:1|" + "timeout|" * 120 + "network_error|derivation_invalid"
@@ -152,7 +150,7 @@ def test_a_code_past_the_bound_keeps_its_marks_and_its_kind():
     assert _within(deferred) == "operator_retry:TEST-op|interrupted_retry:1|auto_retry:3|http_402"
     assert (_auto_count(_within(deferred)), _operator_retry_ids(_within(deferred))) == (3, ("TEST-op",))
     assert _within("short|code") == "short|code"
-    # A kind longer than any the worker writes no longer pushes the marks out (audit of 3.10.1).
+    # Oversized failure kinds preserve the retry markers.
     assert _within("operator_retry:TEST-op|prior:" + "x" * CODE_BOUND) == "operator_retry:TEST-op|" + "x" * 128
     # The one repair of an old oversized consolidation is a budget too: kept, it is not given again.
     repaired = "chunk_upgrade:1106|INPUT_INVALID|" + "http_402|" * 120 + "http_402"
@@ -160,8 +158,8 @@ def test_a_code_past_the_bound_keeps_its_marks_and_its_kind():
 
 
 def test_a_stamp_kept_behind_an_explicit_retry_still_counts():
-    """An explicit retry of one item keeps the code it found behind ``prior:``; the release's stamp there was not
-    seen, and a second run of the same release re-opened the row again (audit of 3.10.1)."""
+    """Release retry stamps remain effective when nested behind an explicit retry marker
+    (``prior:``), preventing a second reopening in the same release."""
     from scope_recall.core.work_storage import _budget_marks, _preserve_retry_history
 
     code = "operator_retry:TEST-op|prior:retried:3.10.1|http_400|http_400"
@@ -279,13 +277,63 @@ def test_a_terminal_failure_is_left_alone_without_the_flag(app):
     assert not _states(core)[0].get("failed")
 
 
+def test_a_refusal_by_the_providers_policy_is_asked_once_and_re_run_only_on_request(worker_app):
+    """Asking again would send the same request to the same policy: the item fails on its first refusal, the status
+    counts it as by design, and only a run that includes the terminal failures re-opens it."""
+    core, ctx, clock = worker_app
+    source = long_source(core, ctx, "TEST 内容策略拒绝了这一条。")
+    asked = []
+
+    class Refusing:
+        def propose(self, sources, *, episode_ref=None, remaining_seconds=1.0, validation_feedback=None):
+            asked.append(sources)
+            raise AuxiliaryModelError("model_refused")
+
+    for minute in range(1, 5):
+        clock.advance(seconds=65.0, iso=f"2026-09-06T12:{minute:02d}:30Z")
+        core.drain_worker(ctx, consolidation=Refusing(), max_items=2, remaining_seconds=5)
+    assert len(asked) == 1 and row(core, source) == ("failed", 0, 1)
+    status = core.status(ctx)
+    assert (status.failed_work, status.terminal_failed_work) == (1, 1)
+    assert core.operations.retry_failed_work(ctx, limit=64, dry_run=True)["retried"] == 0
+    every = core.operations.retry_failed_work(ctx, limit=64, include_terminal=True, dry_run=True)
+    assert (every["retried"], every["by_kind"]) == (1, {"model_refused": 1})
+
+
+def test_a_candidate_pass_stops_at_the_first_interrupted_answer_and_a_plain_run_re_opens_the_one_it_failed(app):
+    """The provider that interrupted one answer interrupts the next, so the pass asks once and the other evaluation
+    waits for the next pass untouched.  A candidate evaluation is asked once: the one asked is left failed, and a
+    plain run moves its three tables back together."""
+    asked = []
+
+    class Interrupted:
+        def evaluate_candidate(self, candidate, sources, *, remaining_seconds):
+            asked.append(candidate)
+            raise AuxiliaryModelError("model_output_interrupted")
+
+    core, ctx = app
+    _candidate(core, ctx, key="TEST-cand/1")
+    _candidate(core, ctx, key="TEST-cand/2", value="红色")
+    _finish_source_work(core)
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Interrupted())
+    assert len(asked) == 1
+    assert list(_codes(core).values()) == ["model_output_interrupted"]
+    work, evaluations = _states(core)
+    assert (work.get("failed"), evaluations.get("failed")) == (1, 1)
+    preview = core.operations.retry_failed_work(ctx, limit=64, dry_run=True)
+    assert (preview["retried"], preview["by_kind"]) == (1, {"model_output_interrupted": 1})
+    assert core.operations.retry_failed_work(ctx, limit=64, dry_run=False)["retried"] == 1
+    work, evaluations = _states(core)
+    assert not work.get("failed") and not evaluations.get("failed")
+
+
 def _codes(core):
     with sqlite3.connect(core.storage.path) as conn:
         return dict(conn.execute("SELECT work_id,last_error_code FROM work_items WHERE last_error_code IS NOT NULL"))
 
 
 def test_a_row_re_opened_under_the_schema_stamp_is_re_opened_by_this_release(app):
-    """#233: its re-look spent before the fix, a row stayed failed through every release that kept the schema."""
+    """A schema-stamped retry marker does not prevent an operator from reopening failed work."""
     core, ctx = app
     _fail_one(core, ctx, "retried:1110|derivation_retry:1|derivation_invalid")
     report = core.operations.retry_failed_work(ctx, limit=64, include_terminal=True, dry_run=False)
@@ -342,8 +390,7 @@ def _claim_and(core, ctx, *, error_code, recoverable):
 
 
 def test_a_row_this_release_re_opened_keeps_its_stamp_through_its_next_failure(app):
-    """A re-opened ``http_400`` that failed again had its code replaced, stamp and all, and each later run of the same
-    release re-opened it again, as often as anyone ran it (audit of 3.10.1)."""
+    """A subsequent failure preserves the release retry stamp and prevents another reopening in the same release."""
     core, ctx = app
     _fail_one(core, ctx, "http_400")
     assert core.operations.retry_failed_work(ctx, limit=64, dry_run=False)["retried"] == 1
@@ -437,8 +484,8 @@ def test_a_lost_lease_keeps_every_budget_mark_within_the_bound(app):
 
 
 def test_a_long_message_refused_on_a_later_page_resumes_there_once_re_opened(worker_app):
-    """#233's items: a consolidation refused on its second page, its re-look spent under the schema stamp, resumes on
-    that page when this release re-opens it, keeps the page it had accepted, and finishes."""
+    """Reopened consolidation resumes at the refused page, preserves the accepted page and finishes after a
+    schema-generation retry has been spent."""
     core, ctx, _clock = worker_app
     source = long_source(core, ctx, FIRST + "\n" + "这是一段归档资料；" * 700 + "\n" + LAST)
 
@@ -656,8 +703,7 @@ def test_every_by_design_terminal_failure_counts_as_terminal(app, code):
 
 
 def test_status_counts_each_failure_kind_once(app):
-    """Retry history and case used to split one kind across several rows, so
-    an operator saw ``derivation_invalid`` three times with different counts."""
+    """Failure counts group one kind across retry-history decorations and letter case."""
     core, ctx = app
     _fail_one(core, ctx, "timeout")
     codes = ("auto_retry:1|derivation_invalid", "DERIVATION_INVALID", "derivation_retry:1|derivation_invalid")
@@ -719,6 +765,8 @@ def test_every_transient_failure_the_worker_knows_is_operator_actionable():
     [
         "model_unavailable",
         "model_timeout",
+        "model_output_interrupted",
+        "response_status_failed",
         "network_error",
         "http_protocol",
         "http_429",
@@ -727,9 +775,10 @@ def test_every_transient_failure_the_worker_knows_is_operator_actionable():
         "rate_limited",
     ],
 )
-def test_a_transient_model_failure_can_be_cleared(code):
+def test_a_transient_model_failure_is_cleared_by_a_run_and_by_the_automatic_recovery(code):
     assert retry_class(code) == "actionable"
     assert selects(code, include_terminal=False, generation=RETRY_GENERATION) is True
+    assert code in AUTO_RECOVERABLE_ERRORS
 
 
 @pytest.mark.parametrize(
@@ -799,8 +848,7 @@ def test_a_refused_evaluation_clears_through_real_storage(app):
 
 
 def test_a_transport_failure_mid_reply_clears_through_real_storage(app):
-    """#201: a model served over plain HTTP failed candidate evaluations with ``http_protocol``, and no operator
-    command could take them up again."""
+    """Operator retry reopens stored work whose model reply failed with ``http_protocol``."""
     core, ctx = app
     _fail_one(core, ctx, "http_protocol")
     assert _states(core)[0].get("failed")
@@ -994,12 +1042,14 @@ def test_consecutive_refusals_space_the_retries_out(app):
 
 
 def test_the_two_rate_limit_sets_cannot_drift_apart():
-    """They said the same thing about 429 and 503 while disagreeing about 502
-    and 504 -- which is how a pair of hand-kept sets always ends up."""
+    """Two hand-kept sets said the same thing about 429 and 503 while disagreeing about 502 and 504, which is how a
+    pair always ends up.  The pass stands a work type down for every capacity refusal, taken from that set and not
+    copied from it, and for an interrupted answer, which was billed and is no refusal."""
     from scope_recall.core.work_storage import CAPACITY_REFUSALS
     from scope_recall.core.worker import _RATE_LIMITED_ERRORS
 
-    assert _RATE_LIMITED_ERRORS is CAPACITY_REFUSALS
+    assert CAPACITY_REFUSALS <= _RATE_LIMITED_ERRORS
+    assert _RATE_LIMITED_ERRORS - CAPACITY_REFUSALS == {"model_output_interrupted"}
 
 
 @pytest.mark.parametrize("legacy", [False, True])

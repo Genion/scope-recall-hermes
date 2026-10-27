@@ -1,41 +1,16 @@
-"""When a candidate's evidence has settled enough to be worth judging.
+"""When a candidate's evidence has settled enough to be judged.
 
-The measured problem: every source that mentions a candidate adds evidence,
-every addition changes the evidence fingerprint, and every new fingerprint
-queued a fresh evaluation while superseding the ones still waiting.  In one store
-that produced 11,158 evaluations of which **7,802 were retired before anyone
-judged them** -- 69.9%, nearly all ``superseded_by_new_evidence`` -- and exactly
-**2** ever reached ``resolved / fact_active``.  The queue could not outrun its
-own input.
+The default 900-second quiet window coalesces evidence arrivals before an
+evaluation.  The 3,600-second deferral limit, measured from the last evaluation
+or creation, makes the candidate eligible despite continued arrivals.  Allowing
+only one queued evaluation per candidate avoids repeatedly superseding pending
+work.
 
-Replaying the real arrival times of all 11,667 evidence rows across 402
-candidates says what a quiet window is worth:
+Evidence arriving while an evaluation waits remains available for the next
+evaluation; an unchanged evidence fingerprint does not queue a duplicate.
 
-    inter-arrival within one candidate   p25 286s   p50 510s   p90 2,127s
-    quiet window   60s ->  11,234 evaluations   (98% of today; useless)
-    quiet window  300s ->   8,664               (76%; the obvious guess, too short)
-    quiet window  900s ->   3,736               (33%)
-    quiet window 1800s ->   1,966               (17%, but p50 verdict latency 30 min)
-
-Hence ``QUIET_SECONDS = 900``.  Five minutes -- the intuitive choice -- sits
-below the median gap between two pieces of evidence for the same candidate and
-would have absorbed almost nothing.
-
-The window alone still leaves a tail: at 900s the wait for a verdict is p50
-900s but p99 3.2 hours, because a candidate that keeps attracting evidence
-never settles.  ``MAX_DEFERRAL_SECONDS`` caps that: after an hour of
-accumulating, judge it on what is there.
-
-The second rule matters more than the window: **at most one queued evaluation
-per candidate**.  That is what actually removes the supersede loop, because a
-second one can no longer be created to retire the first.  Evidence that arrives
-meanwhile is not lost -- it lands in ``candidate_evidence`` and joins the next
-evaluation, whose fingerprint then differs; an unchanged evidence set collides
-on that fingerprint and schedules nothing, so this cannot spin.
-
-Not responsible for: reading or writing any of these timestamps
-(``core/candidate_intake.py`` and ``core/candidate_sweeps.py`` own the SQL), or
-for choosing the evidence set.
+Timestamp storage belongs to ``core/candidate_intake.py`` and
+``core/candidate_sweeps.py``; choosing the evidence set belongs to the caller.
 """
 
 from __future__ import annotations
@@ -49,11 +24,11 @@ QUIET_SECONDS = 900
 MAX_DEFERRAL_SECONDS = 3600
 
 #: Questions put to the evaluator about one candidate version, none of which settled it, after which it is put to the
-#: evaluator at most once a day (``slowed_until``).  A candidate that keeps drawing evidence was asked again each time
-#: some came, about once an hour.  Over the week to 2026-10-10 on the shared store: 26,909 questions, 91% of them
-#: answered "not enough evidence yet" and 112 with a fact; of the 306 candidates ever resolved, 80% were resolved within
-#: their first five questions, while 556 had been asked twenty times or more.  A day's pace after five questions would
-#: have spared 42% of that week's questions and delayed, by at most a day, the fifth of resolutions that needed more.
+#: evaluator at most once a day (``slowed_until``).  Without it a candidate that keeps drawing evidence is asked again
+#: each time some comes, about once an hour.  Over one week on a shared store: 26,909 questions, 91% of them answered
+#: "not enough evidence yet" and 112 with a fact; of the 306 candidates ever resolved, 80% were resolved within their
+#: first five questions, while 556 had been asked twenty times or more.  A day's pace after five questions would have
+#: spared 42% of that week's questions and delayed, by at most a day, the fifth of resolutions that needed more.
 SLOW_AFTER_QUESTIONS = 5
 SLOW_INTERVAL_SECONDS = 86400
 

@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from scope_recall.adapters.clients import CodexHookHandler, install_codex_scope_recall
+from scope_recall.adapters.clients.handler import SystemHookClock
 
 
 @pytest.fixture(scope="session")
 def past_the_parser():
     """``past_the_parser(prefix, suffix)``: a payload with a list nested past what this interpreter's JSON parser
     takes between them.  Where the parser gives up depends on the interpreter: 1,000 levels on Python 3.11, 3,000 on
-    3.12 for Windows, 10,000 elsewhere, the stack itself on 3.14.  Nested 1,200 levels, a payload was refused only on
-    3.11 and parsed elsewhere, so CI (3.12) never reached the refusal it tested (rc11)."""
+    3.12 for Windows, 10,000 elsewhere, the stack itself on 3.14.  Nested 1,200 levels, a payload is refused only on
+    3.11 and parsed elsewhere, so CI (3.12) would never reach the refusal it tests."""
     depth = 1000
     while True:
         try:
@@ -45,6 +47,24 @@ class FixedClock:
 
 
 @pytest.fixture
+def storing_takes_no_hook_time(monkeypatch):
+    """A hook's clock stands still while the hook stores what it was sent, and runs otherwise: for a test of what a
+    hook does with the entry's server once it has stored, not of how long a host waits for it."""
+    stored = [0.0]
+    capture = CodexHookHandler.capture
+
+    def timed(self, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return capture(self, *args, **kwargs)
+        finally:
+            stored[0] += time.monotonic() - started
+
+    monkeypatch.setattr(CodexHookHandler, "capture", timed)
+    monkeypatch.setattr(SystemHookClock, "monotonic", lambda _clock: time.monotonic() - stored[0])
+
+
+@pytest.fixture
 def project_root(tmp_path) -> Path:
     root = tmp_path / "TEST-project"
     root.mkdir()
@@ -53,6 +73,7 @@ def project_root(tmp_path) -> Path:
 
 @pytest.fixture
 def installed(project_root, tmp_path):
+    """Build an install whose hook deadline accepts explicit FixedClock advances."""
     clock = FixedClock()
     config, core = install_codex_scope_recall(tmp_path / "install", project_root=project_root, clock=clock)
     return config, core, clock, project_root

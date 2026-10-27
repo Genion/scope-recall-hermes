@@ -3,6 +3,7 @@ text and usage, and the adapters that send them through the metered transport (`
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -15,6 +16,7 @@ from typing import Any
 
 from ..contracts import ContractError
 from ..core.endpoint_policy import endpoint_scheme_allowed
+from ..core.secret_patterns import structure_contains_secret_like_text
 from .model_budget import AuxiliaryBudgetLedger, BudgetPolicy
 from .models import (
     MAX_CHAT_RESPONSE_BYTES,
@@ -55,18 +57,68 @@ _CHAT_ROLES = frozenset({"system", "user", "assistant", "tool"})
 def _reject_secrets_outside_contents(build_body: Callable[[list[dict]], bytes], messages: list[dict]) -> None:
     """The body gate: everything a request carries besides its message contents.
 
-    ``validate_chat_messages`` has already scanned every content as it was
-    written.  Scanning the serialised body scanned each of them again through
+    ``validate_chat_messages`` has already scanned every text the contents carry,
+    as written.  Scanning the serialised body would scan each of them again through
     one more layer of escaping, where a line break inside a content reads
     ``\\\\n``: the scanner's break rule restored the break and left a backslash
     behind it, which an empty credential slot ("AppSecret:" and nothing after
     it) then took as its value: 124 of 124 candidate evaluations in one store
-    passed the contents gate and were refused here, none holding a secret.
+    passed the contents gate and were refused that way, none holding a secret.
     The same builder is run on the same messages with their contents blanked,
     so the model, the route's fields and the message roles are still scanned,
     and each text is scanned once.
     """
     reject_secrets(build_body([dict(message, content="") for message in messages]).decode("utf-8"))
+
+
+def _json_content(content: str) -> Any:
+    """The structure a content that is JSON encodes, as ``{label: value}`` when a label and ``=`` lead it
+    (``candidate=``); None for any other text, nesting too deep to read included.  Every member of an object is kept
+    as an object of its own, a repeated key's too: the request carries them all."""
+    label, separator, rest = content.partition("=")
+    forms = [("", content)]
+    if separator and label.isidentifier():
+        forms.append((label, rest))
+    for prefix, payload in forms:
+        if payload[:1] in ("{", "["):
+            try:
+                value = json.loads(payload, object_pairs_hook=_json_object)
+            except (ValueError, RecursionError):
+                continue
+            return {prefix: value} if prefix else value
+    return None
+
+
+def _json_object(pairs):
+    """Keep related fields together and retain every value of repeated keys for scanning."""
+    # Empty credential slots are placeholders; bookkeeping wrappers must not populate them.
+    if not pairs:
+        return {}
+    grouped = {}
+    for key, value in pairs:
+        grouped.setdefault(key, []).append(value)
+    result = {key: values[0] for key, values in grouped.items()}
+    # Duplicate predicates and values form assignments too; none may hide behind the last occurrence.
+    assignments = []
+    if "predicate" in grouped and "value_text" in grouped:
+        assignments = [{str(label): value} for label in grouped["predicate"] for value in grouped["value_text"]]
+    return [result, *assignments, *({key: value} for key, values in grouped.items() for value in values[1:])]
+
+
+def _reject_secrets_in_content(content: str) -> None:
+    """Refuse a message content that carries secret-like text, each of its texts read as written.
+
+    A consolidation or candidate request carries its sources, and a candidate after ``candidate=``, as JSON
+    (``core/consolidate.py``), and such a content is read as the structure it encodes
+    (``structure_contains_secret_like_text``), a label as the key of what follows it.  Read in its encoding, a source
+    that capture admitted could read as a credential: ``api_key: null`` at its end, followed by the next field, or
+    ``api_key: "<your-api-key>"`` anywhere in it, its quotes escaped.  Any other content is one text.
+    """
+    structure = _json_content(content)
+    if structure is None:
+        reject_secrets(content)
+    elif structure_contains_secret_like_text(structure):
+        raise AuxiliaryModelError("sensitive_request")
 
 
 def validate_chat_messages(messages: object, *, roles: frozenset[str] = _CHAT_ROLES) -> None:
@@ -86,7 +138,26 @@ def validate_chat_messages(messages: object, *, roles: frozenset[str] = _CHAT_RO
             or type(message["content"]) is not str
         ):
             raise AuxiliaryModelError("input_invalid")
-        reject_secrets(message["content"])
+        _reject_secrets_in_content(message["content"])
+
+
+#: ``finish_reason`` values with which DeepSeek ends a generation it did not finish, for lack of capacity or by
+#: interruption.
+_CHAT_INTERRUPTIONS = ("insufficient_system_resource", "aborted")
+
+
+def _without_answer_text(content: object) -> bool:
+    """Whether a chat message's ``content`` is known to hold no answer text: absent or empty, a blank string, or a
+    list of parts none of which has text.  Content of any other shape may hold an answer this route does not read."""
+    if not content:
+        return True
+    if type(content) is str:
+        return not content.strip()
+    if isinstance(content, list):
+        return not any(
+            isinstance(part, dict) and type(part.get("text")) is str and part["text"].strip() for part in content
+        )
+    return False
 
 
 def _extract_chat_content(payload: Mapping[str, Any]) -> str:
@@ -96,24 +167,46 @@ def _extract_chat_content(payload: Mapping[str, Any]) -> str:
     choice = choices[0]
     if not isinstance(choice, dict):
         raise AuxiliaryModelError("unsupported_response_shape")
+    finish_reason = choice.get("finish_reason")
+    # A stop reason is text; a gateway that sends none leaves it absent or null.  Any other type is a route that does
+    # not say why it stopped, which cannot be told from one that finished.
+    if finish_reason is not None and type(finish_reason) is not str:
+        raise AuxiliaryModelError("unsupported_response_shape")
+    # "content_filter" means the provider's policy ended the answer, whatever
+    # the message still holds: the text left, if any, is incomplete.  It is
+    # named as a refusal instead of reaching the decoder as anonymous invalid
+    # JSON.
+    if finish_reason == "content_filter":
+        raise AuxiliaryModelError("model_refused")
+    # An interrupted generation is the provider's transient fault, whatever
+    # the message still holds: the text left, if any, is incomplete.  It is
+    # not an invalid derivation, which is a failure by design.
+    if finish_reason in _CHAT_INTERRUPTIONS:
+        raise AuxiliaryModelError("model_output_interrupted")
     message = choice.get("message")
     if not isinstance(message, dict):
         raise AuxiliaryModelError("unsupported_response_shape")
     if message.get("role") != "assistant":
         raise AuxiliaryModelError("unsupported_response_shape")
-    # OpenAI-compatible gateways may attach reasoning/refusal/annotation
-    # metadata to an assistant message.  It is not answer content and must be
-    # ignored; a tool request is a different protocol and cannot be silently
-    # treated as a text proposal.
+    # OpenAI-compatible gateways may attach reasoning, annotation and refusal
+    # fields to an assistant message; beside answer text they are not answer
+    # content and are ignored.  A tool request is a different protocol and
+    # cannot be silently treated as a text proposal.
     if message.get("tool_calls") or message.get("function_call"):
         raise AuxiliaryModelError("unsupported_response_shape")
     content = message.get("content")
+    # A model that declines puts its refusal where the answer belongs, so no
+    # answer text stands beside it: none in a blank string, and none in a list
+    # of parts without a text part.  A blank refusal declines nothing.
+    refusal = message.get("refusal")
+    if type(refusal) is str and refusal.strip() and _without_answer_text(content):
+        raise AuxiliaryModelError("model_refused")
     if type(content) is not str:
         raise AuxiliaryModelError("unsupported_response_shape")
     # "length" means the provider stopped at the output limit: the text is a
     # prefix, not an answer.  Otherwise it reaches the decoder as anonymous
     # invalid JSON and the one guided retry cannot tell the model what failed.
-    if choice.get("finish_reason") == "length":
+    if finish_reason == "length":
         raise ContractError("DERIVATION_INVALID", "model_output_truncated")
     return content
 
@@ -288,7 +381,7 @@ class ConsolidationRouteConfig:
     stream: bool = False
     n: int = 1
     headers: Mapping[str, str] | None = None
-    #: Permission for plaintext HTTP beyond this machine, as the embedding route has it (#244).
+    #: Permission for plaintext HTTP beyond this machine, as the embedding route has it.
     allow_insecure_endpoint: bool = False
 
     def __post_init__(self) -> None:
@@ -322,7 +415,7 @@ def _validate_route_target(
     The endpoint follows the embedding route's rule (``core.endpoint_policy``), the one the transport that sends holds
     too: HTTPS to any host, plain HTTP to a model server on this machine, and to another host only with the literal
     opt-in.  Plain HTTP never carries the key.  Required HTTPS here alone, a local model server could embed and not
-    consolidate (#244)."""
+    consolidate."""
     if type(model) is not str or not model:
         raise ValueError("model")
     if type(allow_insecure_endpoint) is not bool:
@@ -474,7 +567,7 @@ def _responses_usage(payload: Mapping[str, Any]) -> dict[str, int] | None:
     ``max_output_tokens`` bounds), so reasoning is never billed a second time --
     the anomaly guard that charges output outside ``completion_tokens`` on the
     chat route does not apply here.  An absent or malformed block returns
-    ``None`` and the caller keeps the reserved charge, exactly as before.
+    ``None`` and the caller keeps the reserved charge.
     """
     candidate = payload.get("usage")
     if not isinstance(candidate, dict):
@@ -489,24 +582,46 @@ def _responses_usage(payload: Mapping[str, Any]) -> dict[str, int] | None:
     return usage
 
 
+def _require_completed(payload: Mapping[str, Any]) -> None:
+    """Return for a ``completed`` response; any other status raises the outcome it names.
+
+    ``incomplete`` says why in ``incomplete_details.reason``.  ``max_output_tokens`` leaves a prefix cut off at the
+    output limit (the same named derivation failure the chat route raises for ``finish_reason: "length"``);
+    ``content_filter`` is the provider's policy stopping the answer, which no output limit changes.  The details are
+    nullable, and an ``incomplete`` that gives none is read as cut off at the limit; any other reason is a response
+    this route does not understand.  ``failed`` produced nothing usable.
+    """
+    status = payload.get("status")
+    if status == "completed":
+        return
+    if status == "incomplete":
+        details = payload.get("incomplete_details")
+        if details is not None and not isinstance(details, dict):
+            raise AuxiliaryModelError("unsupported_response_shape")
+        reason = (details or {}).get("reason")
+        if reason == "content_filter":
+            raise AuxiliaryModelError("model_refused")
+        if reason not in (None, "max_output_tokens"):
+            raise AuxiliaryModelError("unsupported_response_shape")
+        # An ``incomplete`` that gives no reason is read as cut off at the output limit.  The details and the reason
+        # are optional in the API and no provider document gives their absence another meaning, so a response that
+        # says nothing keeps the name under which the doctor advises on the output limit.
+        raise ContractError("DERIVATION_INVALID", "model_output_truncated")
+    if status == "failed":
+        raise AuxiliaryModelError("response_status_failed")
+    raise AuxiliaryModelError("unsupported_response_shape")
+
+
 def _responses_output_text(payload: Mapping[str, Any]) -> str:
     """The completed assistant answer, and nothing else.
 
-    Only a ``response`` whose own ``status`` is ``completed`` is an answer:
-    ``incomplete`` is a prefix cut off at the output limit (the same named
-    derivation failure the chat route raises for ``finish_reason: "length"``),
-    and ``failed`` produced nothing usable.  Reasoning items and
-    ``reasoning_text`` parts are never answer text, a refusal part is a refusal
-    rather than an empty proposal, and a tool-call item is a different protocol
-    that cannot be silently read as one.
+    Only a ``response`` whose own ``status`` is ``completed`` is an answer
+    (``_require_completed`` names the outcome of any other).  Reasoning items
+    and ``reasoning_text`` parts are never answer text, a refusal part is a
+    refusal rather than an empty proposal, and a tool-call item is a different
+    protocol that cannot be silently read as one.
     """
-    status = payload.get("status")
-    if status != "completed":
-        if status == "incomplete":
-            raise ContractError("DERIVATION_INVALID", "model_output_truncated")
-        if status == "failed":
-            raise AuxiliaryModelError("response_status_failed")
-        raise AuxiliaryModelError("unsupported_response_shape")
+    _require_completed(payload)
     output = payload.get("output")
     if not isinstance(output, list):
         raise AuxiliaryModelError("unsupported_response_shape")

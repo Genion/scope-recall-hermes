@@ -25,7 +25,7 @@ from .events import (
     withheld_tool_output,
 )
 from .inbox_rules import REKEY_MARKER, deleted_forms, deleted_text, holds_events, waiting
-from .source_records import SourceWrite, StoredSource
+from .source_records import PROJECT_IDENTITY_KEY, SourceWrite, StoredSource
 from .visibility import allowed
 
 
@@ -180,8 +180,8 @@ class Sources:
         """A source restating a suppressed claim (subject, predicate, value and every
         condition literally present) is suppressed with it.
 
-        The suppressed claims are picked first.  Subject and predicate are in the scope's index, so SQLite searched the
-        content for those of every claim in the scope before it read whether one was suppressed: 8,995 claims, 11 of
+        The suppressed claims are picked first.  Subject and predicate are in the scope's index, so SQLite would search
+        the content for those of every claim in the scope before it read whether one was suppressed: 8,995 claims, 11 of
         them suppressed, held the writer lease 1 s for a tool output of 51,283 characters.
         """
         return (
@@ -293,17 +293,18 @@ class Sources:
     def refuse_under_a_deleted_key(self, events, *, scope_id: str) -> None:
         """Refuse a message under a deleted message's key or source group, or tell another message from it.
 
-        The deletion contract's least unit is a source group, with its later versions and missing parts: a revision
-        the deleted group never stored, and a part sent without the message's first, are refused.  A whole message is
-        compared with the deleted one, all its parts together (a first part changed by one character had let the
-        second through, word for word): a part with a deleted part's digest; while the deleted words are kept, all of
-        them held or a near copy, as a delete compares waiting captures (``inbox_rules.holds_events``); after the
-        purge, the same words spaced, cased or punctuated otherwise (``inbox_rules.deleted_forms``).  A copy is
-        refused (``source_unavailable``).  Anything else is a key collision (``VERSION_CONFLICT``), which the capture
-        inbox stores under a key of its own: a restarted Hermes gateway numbers its turns from 1 again, and a delete
-        removes its own command's key, so the next message at that turn would otherwise be refused.  After the
-        purge, a copy with words added is not known by anything kept, and is stored as another message.  A key with
-        nothing stored left to compare with (a restored absence) refuses whatever comes."""
+        The deletion contract's least unit is a source group, with its later versions and missing parts: a revision the
+        deleted group never stored, and a part sent without the message's first, are refused.  A whole message is
+        checked before any part is stored, its parts together (by its first part alone, a first part changed by one
+        character would let the second through, word for word).  It is a copy when any part has a deleted part's digest;
+        while the deleted words are kept, when its parts together hold all of them or a near copy, as a delete compares
+        waiting captures (``inbox_rules.holds_events``); after the purge, when its parts together have a form the purge
+        kept, the same words spaced, cased or punctuated otherwise (``inbox_rules.deleted_forms``).  A copy is refused
+        (``source_unavailable``).  Anything else is a key collision (``VERSION_CONFLICT``), which the capture inbox
+        stores under a key of its own: a restarted Hermes gateway numbers its turns from 1 again, and a delete removes
+        its own command's key, so the next message at that turn would otherwise be refused.  After the purge, a copy
+        with words added is not known by anything kept, and is stored as another message.  A key with nothing stored
+        left to compare with (a restored absence) refuses whatever comes."""
         if not events:
             return
         conn = self._tx._check()
@@ -319,8 +320,8 @@ class Sources:
         if not hidden and not (block is not None and block["read_blocked"]):
             return
         # The deleted message's rows: under the refs this message's parts would take, under its key's own, and under its
-        # group key, before the purge or as the purge left it.  A long message an older release purged had its group
-        # key hashed once for each part and is under none of these: with nothing to compare, it refuses.
+        # group key, before the purge or as the purge left it.  A long message whose group key was hashed once for each
+        # part when it was purged is under none of these: with nothing to compare, it refuses.
         refs = sorted({*hidden, self._source_ref(group_key)})
         rows = conn.execute(
             f"""SELECT source_revision,segment_index,content,content_sha256,extra_json,
@@ -412,12 +413,16 @@ class Sources:
             for k, v in event.items()
             if k not in {*columns, "protocol_version", "source_revision", "source_original_origin", "dataset_id"}
         }
+        if self._tx.context.project_identity != "local":
+            extras[PROJECT_IDENTITY_KEY] = self._tx.context.project_identity
         conn.execute(
             """INSERT INTO source_events(event_id,source_revision,scope_id,session_id,project_id,branch_id,
             source_event_key,origin,role,content,occurred_at,recorded_at,time_precision,capture_state,
             content_sha256,event_sha256,persisted_at,source_original_origin,dataset_id,extra_json,
-            source_group_key,segment_index,segment_total,capture_gaps_json,import_provenance_sha256,entry_id,source_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(source_id),0)+1 FROM source_events))""",
+            source_group_key,segment_index,segment_total,capture_gaps_json,import_provenance_sha256,entry_id,source_id,
+            project_root)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+            (SELECT COALESCE(MAX(source_id),0)+1 FROM source_events),?)""",
             (
                 ref,
                 revision,
@@ -438,6 +443,7 @@ class Sources:
                 canonical(capture_gaps),
                 provenance_hash,
                 self._tx.context.entry_id or "local",
+                self._tx.context.project_root,
             ),
         )
         if (
@@ -459,8 +465,8 @@ class Sources:
         identity = lexical_index.source_id(conn, ref, revision)
         terms = indexed_terms(source.event)
         if withheld_tool_output(source.event):
-            # A withheld output's placeholder is indexed by its error text alone; what an older release gave it
-            # beyond that goes.
+            # A withheld output's placeholder is indexed by its error text alone; any posting it holds beyond that
+            # goes.
             lexical_index.unindex_beyond(conn, identity, terms)
         lexical_index.index_terms(conn, identity, terms)
 
@@ -487,19 +493,6 @@ class Sources:
             }[work[0]]
         )
         return lexical, semantic
-
-    def source_authorization(self, ref: str, revision: int) -> dict | None:
-        """The scope authorization a migrated source was admitted under, or ``None``."""
-        row = (
-            self._tx._check()
-            .execute(
-                """SELECT p.payload FROM source_authorizations a JOIN authorization_payloads p ON p.authorization_id=a.authorization_id
-               WHERE a.event_id=? AND a.source_revision=?""",
-                (ref, revision),
-            )
-            .fetchone()
-        )
-        return None if row is None else json.loads(row[0])
 
     def search_sources(
         self, query: str, *, limit: int = 20, history: bool = False, automatic: bool = False
@@ -567,8 +560,8 @@ class Sources:
         # Named messages first, so the same words said again cannot take the copy a named message owns.
         named = {host_key for *_said, host_key in items if host_key is not None}
         # A message over 65,536 characters is stored in segments under keys of their own, grouped under the host's
-        # key: looked up by the host's key alone, it was never found, and the Stop's read of the session record
-        # stored a long prompt a second time.  A message stored whole is its own group.
+        # key: looked up by the host's key alone, it would never be found, and the Stop's read of the session record
+        # would store a long prompt a second time.  A message stored whole is its own group.
         # A named message that was deleted counts as said as well: once the delete is purged its rows no longer
         # carry the key, and a record read would store the words again under a key of the record's.
 
@@ -619,7 +612,7 @@ class Sources:
                 copies[role, digest] = list(unique.values())
             unnamed.setdefault((role, digest), []).append((index, occurred_at))
         # The closest message and copy are paired first: taken in the order asked, a message with no copy of its own
-        # took the copy of one said alike a moment after it, and that one was stored again.
+        # would take the copy of one said alike a moment after it, and that one would be stored again.
         for group, said in unnamed.items():
             pairs = sorted(
                 (distance, index, position)

@@ -60,8 +60,8 @@ def dropped(value):
 
 
 def test_prior_page_items_are_dropped_while_only_an_accepted_goal_can_carry_forward():
-    """What the page does not ground never enters the result; the page is no longer refused for it, so its claims,
-    checked on their own, stay."""
+    """Resume and reference proposals not grounded in the current page are dropped; only a goal already accepted
+    on an earlier page can carry forward."""
     goal = {"text": 'TEST 整理 "报告"', "basis": "explicit"}
     prior, page = 'TEST 已完成 "第一项"。', 'TEST 等待 "第二项"。'
     fence = SimpleNamespace(work_id=1, chunk=SimpleNamespace(start=len(prior), end=len(prior + page)))
@@ -166,10 +166,9 @@ def test_worker_preserves_distinct_page_goals_and_finishes_offset(worker_app, en
 
 
 def test_a_page_whose_summary_is_not_its_own_words_keeps_its_claims_and_the_rest_of_the_message(worker_app):
-    """Long messages failed for good on a page whose resume proposal put a decision in the model's own words
-    (``fragment_resume``): the page's claims were lost with it and no later page was read.  Re-run on 3.10.1, about
-    half of 24 such items on the shared store failed again the same way.  The summary is dropped, named in the work's
-    details and in its outcome; the claims stay and the message is read to its end."""
+    """A long message must not fail for good on a page whose resume proposal puts a decision in the model's own words
+    (``fragment_resume``), losing the page's claims with it and leaving no later page read.  The summary is dropped,
+    named in the work's details and in its outcome; the claims stay and the message is read to its end."""
     core, ctx, _clock = worker_app
     first, last = "TEST-project 配色 蓝色。", "TEST-project 主题 深色。"
     source = long_source(core, ctx, first + "\n" + "这是一段归档资料；" * 700 + "\n" + last)

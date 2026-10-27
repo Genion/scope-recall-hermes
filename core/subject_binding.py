@@ -1,55 +1,18 @@
-r"""Where a claim's subject is allowed to be found, verbatim, in its evidence.
+"""Where a claim's subject may appear verbatim in its evidence.
 
-The gate requires a subject to appear literally in what was quoted, which is
-what stops a model from inventing one.  Measured over 92 live
-``subject_not_bound`` head versions of one store, that is refusing three
-different things at once:
+The first rung applies the literal identifier rule to the quote.  The second
+inspects source windows starting one sentence before each quote occurrence and
+ending at the first sentence terminator after the quote, or at the end of the
+source.  If the quote already includes its sentence terminator, this also
+includes the following sentence.
 
-    37  the subject appears nowhere in the source at all -- "memory
-        configuration", "memory provider", "skills directory".  Invented; these
-        must keep failing, and they do.
-    48  the subject appears verbatim in the source, but in a neighbouring
-        sentence rather than inside the quoted span.
-     7  other (present but not bound by the identifier rule, or no subject).
+Only the second rung requires a subject that names an entity: bare pointers
+such as "you" and "the user", and subjects beginning with a subordinator,
+are refused there.  Passing the first rung remains sufficient.
 
-The 48 are the mismatch.  A source says "此测试项目的名称为 SRLIVE-… 。… 不要写
-业务文件"; the constraint quotes the directive clause, while its subject was
-established a sentence earlier in the same message.  Nothing was inferred and
-nothing was invented -- the evidence simply spans two sentences, and the check
-looked at one.
-
-Widening all the way to "anywhere in the source" would be wrong, and the same
-measurement says so.  Sorted by distance between the subject and its quote, the
-48 split cleanly:
-
-    <= 246 chars   39 cases   "Kimi K3" / its spec line, "windows-ocr.ps1" /
-                              its description, "此测试项目" / "唯一标识为 MEM-…"
-    >= 524 chars    9 cases   "you", "the agent", "The user", "skill update" --
-                              all pronouns lifted out of one 10 KB instruction
-                              document and pinned to unrelated quotes in it
-
-So the second rung is one sentence of context, not a whole document: the
-quote's own sentence plus the one immediately before it.  A sentence is the
-unit ``evidence_context`` already uses, and it is the unit in which a subject
-and its predicate are actually stated together.
-
-The second half is a guard on what may be a subject at all.  "you", "the
-agent", "the user" are not entities, they are pointers, and in a long
-instruction document they occur often enough to land inside almost any window.
-Neither is a clause: replaying the corpus turned up one subject reading "If the
-session ran smoothly with no corrections and produced no new technique", which
-sat verbatim right beside its quote and would have passed on distance alone.
-Nothing can ever be recalled *about* either of those, so both are refused at
-any distance.
-
-Monotone, like ``evidence_quote``: rung one is exactly today's rule, so nothing
-that passes now can begin to fail, and rung two returns a real slice of the
-stored source rather than anything derived.
-
-Replaying ``qualify`` over all 92 on a shadow of the live database: 41 now get
-past the subject gate, 51 still do not, and 2 reach ``active``.  The other 39
-stop at the next gate -- 27 of them at ``fact_entailment_unproved``.  That is
-the real bottleneck, and it is a different repair.
+Like ``evidence_quote``, the check is monotone: a subject bound by the literal
+rule continues to pass.  The second rung inspects source sentences rather than
+inferred or generated text.
 """
 
 from __future__ import annotations
@@ -119,11 +82,7 @@ DEICTIC_SUBJECTS = frozenset(
 )
 
 
-#: A subject that opens with a subordinator is a clause, not a thing.  The live
-#: corpus produced exactly one: "If the session ran smoothly with no corrections
-#: and produced no new technique" -- verbatim and adjacent to its quote, so the
-#: distance rule alone would admit it, but nothing can ever be recalled *about*
-#: it and it would only add noise to the entity space.
+#: A subject beginning with a subordinator is a clause rather than an entity, even when it is adjacent to its quote.
 _SUBORDINATOR = re.compile(
     r"^\s*(?:if|when|whenever|unless|while|because|since|although|though|after|before|"
     r"in\s+case|as\s+long\s+as|provided\s+that)\b|^\s*(?:如果|若|倘若|假如|除非|当|每当|因为|由于|虽然|尽管)",
@@ -177,8 +136,8 @@ def quote_neighbourhood(content: object, quote: object) -> str:
 def subject_binding(subject: object, *, quote: object, content: object) -> str | None:
     """Which rung binds this subject, or ``None`` if none does.
 
-    ``"quote"`` is today's rule.  ``"neighbourhood"`` is the widened one, and is
-    only ever reached for a subject that names something.
+    ``"quote"`` is the literal rule.  ``"neighbourhood"`` is the widened one, and
+    is only ever reached for a subject that names something.
     """
     if type(subject) is not str or not subject:
         return None
@@ -196,8 +155,8 @@ def neighbourhood_binds(subject: object, pairs) -> bool:
     """True when the second rung alone binds the subject for some cited span.
 
     ``pairs`` yields ``(quote, stored_content)`` for the spans a proposal cites.
-    Kept separate from rung one so the caller's first rung stays literally the
-    rule it has today -- the widened rule can only ever be reached as an
+    Kept separate from rung one so the caller's first rung stays exactly the
+    literal rule -- the widened rule can only ever be reached as an
     additional ``or``, never as a replacement.
     """
     for quote, content in pairs:

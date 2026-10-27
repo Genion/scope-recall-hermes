@@ -1,4 +1,4 @@
-"""New synthetic backup/rollback roots, including actual Windows junctions."""
+"""New synthetic backup and migration roots, including actual Windows junctions."""
 
 import os
 import sqlite3
@@ -8,7 +8,6 @@ import pytest
 
 from maintenance.backup import BackupError, backup_sqlite
 from maintenance.migrate_v2 import MigrationError, build_legacy_catalog, migrate_legacy
-from maintenance.rollback import RollbackError, rollback_to_verified_snapshot
 
 
 def database(path):
@@ -34,7 +33,7 @@ def junction(tmp_path):
         link.rmdir()
 
 
-def test_backup_and_rollback_reject_junction_source_and_destination(tmp_path, junction):
+def test_backup_and_migration_reject_junction_source_and_destination(tmp_path, junction):
     alias, outside = junction
     source = database(tmp_path / "TEST-source.sqlite3")
     remote = database(outside / "TEST-remote.sqlite3")
@@ -43,10 +42,6 @@ def test_backup_and_rollback_reject_junction_source_and_destination(tmp_path, ju
         backup_sqlite(alias / remote.name, tmp_path / "TEST-rejected.sqlite3")
     with pytest.raises(BackupError, match="reparse"):
         backup_sqlite(source, alias / "TEST-rejected.sqlite3")
-    with pytest.raises(RollbackError, match="reparse"):
-        rollback_to_verified_snapshot(source, alias / remote.name)
-    with pytest.raises(RollbackError, match="reparse"):
-        rollback_to_verified_snapshot(source, remote, destination=alias / "TEST-rollback.sqlite3")
     with pytest.raises(MigrationError, match="reparse"):
         build_legacy_catalog(alias / remote.name)
     with pytest.raises(MigrationError, match="reparse"):
@@ -69,14 +64,16 @@ def test_backup_output_creation_race_never_overwrites_an_existing_file(tmp_path,
 
     source = database(tmp_path / "TEST-source.sqlite3")
     output = tmp_path / "TEST-raced.sqlite3"
-    actual_open = backup.os.open
+    from scope_recall.runtime import backup_primitives
+
+    actual_open = backup_primitives.os.open
 
     def raced_open(path, flags, mode=0o777, **kwargs):
         if Path(path) == output:
             output.write_bytes(b"TEST preserve concurrently created file")
         return actual_open(path, flags, mode, **kwargs)
 
-    monkeypatch.setattr(backup.os, "open", raced_open)
+    monkeypatch.setattr(backup_primitives.os, "open", raced_open)
     with pytest.raises(BackupError, match="overwrite"):
         backup_sqlite(source, output)
     assert output.read_bytes() == b"TEST preserve concurrently created file"
@@ -88,11 +85,8 @@ def test_uri_reserved_filename_roundtrip_and_originals_remain_unchanged(tmp_path
     snapshot = tmp_path / "TEST-snapshot#2.sqlite3"
     receipt = backup_sqlite(source, snapshot, manifest=tmp_path / "TEST-backup.json")
     assert receipt["quick_check"] == "ok"
-    snapshot_before = snapshot.read_bytes()
-    rollback = rollback_to_verified_snapshot(source, snapshot, destination=tmp_path / "TEST-copy.sqlite3")
-    assert rollback["restored"] is True
-    assert source.read_bytes() == before and snapshot.read_bytes() == snapshot_before
-    with sqlite3.connect(rollback["rollback_output"]) as conn:
+    assert source.read_bytes() == before
+    with sqlite3.connect(snapshot) as conn:
         assert conn.execute("SELECT value FROM fixture").fetchone()[0] == "TEST isolated source"
 
 

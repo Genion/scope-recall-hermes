@@ -15,6 +15,8 @@ from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_herme
 from scope_recall.adapters.hermes.identity import host_scope_payload
 from scope_recall.core import capture_inbox
 
+from tests.store_clock import assert_hook_budget
+
 _NOTICE = "[IMPORTANT: Background process TEST-proc finished (exit code 0).\nCommand: TEST make build]"
 _SUMMARY = "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. TEST 摘要"
 
@@ -81,8 +83,7 @@ def telegram(hermes_home, initialize_kwargs):
 
 
 def test_a_steer_before_a_notice_or_a_summary_is_still_the_person_s(telegram, hermes_home):
-    """Hermes puts a finished process's notice and a compression's summary after a steer, as user rows; reading
-    the turn back from its end stopped at the first of them."""
+    """A process notice or compression summary after a steer does not hide the person's message."""
     telegram.on_turn_start(1, "TEST 整理 QX-21", turn_id="turn-1")
     history = [
         {"role": "user", "content": "TEST 整理 QX-21"},
@@ -498,15 +499,21 @@ def test_a_steer_without_a_time_carried_into_the_next_session_is_stored_once(ada
     assert said.count("TEST 继续") == 1
 
 
-def test_a_hook_spends_a_bounded_time_on_steers_when_the_store_is_busy(telegram, hermes_home, monkeypatch):
+def test_a_hook_spends_a_bounded_time_on_steers_when_the_store_is_busy(
+    telegram, hermes_home, monkeypatch, metered_store
+):
     """On a busy store each write waits its full time.  A compression hook's retry pass and its steers share one
     budget: once it is spent the hook stops waiting, and keeps each steer it could not write to retry rather than
-    drop it."""
+    drop it.  The hook's clock moves on by what each write waits, and by 0.01 s for each read of the store however long
+    the runner's store takes; everything else the hook does counts as long as it takes."""
+    from scope_recall.adapters.hermes import turn_capture
+
+    clock = metered_store(0.01)
     real, budgets = telegram._core.record_host_event, []
 
     def held(context, event, **kwargs):
         budgets.append(kwargs["remaining_seconds"])
-        time.sleep(kwargs["remaining_seconds"])
+        clock.advance(kwargs["remaining_seconds"])
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(telegram._core, "record_host_event", held)
@@ -515,18 +522,20 @@ def test_a_hook_spends_a_bounded_time_on_steers_when_the_store_is_busy(telegram,
     assert telegram._retry.captures, "a capture the busy store refused is kept to retry"
     budgets.clear()
     rows = [_row(_steer(f"TEST 第{n}条", message_id=str(300 + n))) for n in range(8)]
-    started = time.monotonic()
+    started = clock()
     telegram.on_pre_compress([dict(row) for row in rows])
     # The retry pass and the steers wait the hook's two seconds between them at most, beside the next to nothing a
-    # write is given once they are spent: a slow runner only shortens what is left.
-    assert sum(budgets) <= 2.0 + 0.001 * len(budgets) + 0.01, budgets
-    assert time.monotonic() - started < 10
+    # write is given once they are spent, and the hook ends soon after: its reads of the store and its own work.
+    assert sum(budgets) <= turn_capture._STEERS_SECONDS + 0.001 * len(budgets) + 0.01, budgets
+    assert_hook_budget(clock() - started, turn_capture._STEERS_SECONDS)
     monkeypatch.setattr(telegram._core, "record_host_event", real)
     wanted = {f"TEST 第{n}条" for n in range(8)} | {"TEST 先前没写成的"}
-    deadline = time.monotonic() + 10
-    while not wanted <= {content for _role, content, _origin in _stored(hermes_home)} and time.monotonic() < deadline:
+    # Each pass of the retry buffer writes what its second allows, and at least the first capture it holds: on a store
+    # whose writes take seconds that is one a pass, so the passes are counted, not the time.
+    for _ in range(2 * len(wanted)):
+        if wanted <= {content for _role, content, _origin in _stored(hermes_home)}:
+            break
         telegram._retry.write_buffered()
-        time.sleep(0.05)
     assert wanted <= {content for _role, content, _origin in _stored(hermes_home)}
 
 
@@ -584,16 +593,19 @@ def test_compression_retries_keep_the_hook_deadline(telegram, hermes_home, monke
     )
     assert token is not None
     began, finished = threading.Event(), threading.Event()
-    budgets, errors = [], []
+    budgets, errors, deadlines = [], [], []
 
     def deadline():
-        value = time.monotonic() + 0.05
+        deadlines.append(time.monotonic() + 0.05)
         began.set()
-        return value
+        return deadlines[-1]
 
     def replay(*_args, **kwargs):
         budgets.append(("inbox", kwargs["remaining_seconds"]))
-        time.sleep(kwargs["remaining_seconds"] + 0.01)
+        # Past the hook's deadline as the hook's clock reads it: time.monotonic moves in 15.6 ms ticks on Windows before
+        # Python 3.13 (GetTickCount64), and could show a sleep of the budget and a little more as still within it.
+        while time.monotonic() <= deadlines[-1]:
+            time.sleep(0.005)
         return ()
 
     def write(*_args, **kwargs):
@@ -657,7 +669,7 @@ def _put_back(now: float) -> list[dict]:
 
 def test_messages_a_restarted_gateway_put_back_are_stored_once_whichever_hook_reads_them(telegram, hermes_home):
     """A gateway that stops while the person's messages wait for a busy agent puts them back when it starts and opens no
-    turn for them; their next message opens one after them (tianshu, 2026-10-05: two of the owner's lost)."""
+    turn for them; their next message opens one after them."""
     telegram.on_turn_start(6, "TEST 继续啊", turn_id="turn-6")
     history = _put_back(1790000200.0)
     telegram.on_pre_compress([dict(message) for message in history])
@@ -675,9 +687,18 @@ def test_messages_a_restarted_gateway_put_back_are_stored_once_whichever_hook_re
     assert len(keys) == 1 and ":unanswered:" in keys[0]
 
 
-def test_a_turn_s_own_message_a_stopped_gateway_left_unanswered_is_not_stored_again(telegram, hermes_home):
+@pytest.mark.parametrize("slow_write", [False, True], ids=["store", "slow_store"])
+def test_a_turn_s_own_message_a_stopped_gateway_left_unanswered_is_not_stored_again(
+    telegram, hermes_home, slow_capture_store, slow_write
+):
     """The turn opened, pre_llm_call stored its message, and the gateway stopped before any reply: the message stands
-    unanswered before the next one, and is found stored by its words and moment."""
+    unanswered before the next one, and is found stored by its words and moment.
+
+    The slow store delays the next real open after this fixture, that pre-llm capture. The message is still the one
+    source row.
+    """
+    if slow_write:
+        slow_capture_store()
     telegram.on_turn_start(7, "TEST 查一下进度", turn_id="turn-7")
     telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-7", user_message="TEST 查一下进度")
     telegram.on_turn_start(8, "TEST 怎么样了", turn_id="turn-8")
@@ -692,8 +713,7 @@ def test_a_turn_s_own_message_a_stopped_gateway_left_unanswered_is_not_stored_ag
 
 
 def test_a_message_put_back_is_not_taken_for_an_earlier_one_said_alike(telegram, hermes_home):
-    """The person said "继续" and was answered, then said it again while the agent was busy, and a restarted gateway
-    put that back.  Looked up by words and moment, the first one's copy answered for it, and it was never stored."""
+    """A restored message stays distinct from an identical message in an earlier answered turn."""
     telegram.on_turn_start(10, "TEST 继续", turn_id="turn-10")
     telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-10", user_message="TEST 继续")
     now = time.time()
@@ -715,16 +735,14 @@ def _iso(moment: float) -> str:
 
 
 def test_messages_said_alike_each_take_their_own_copy(telegram, hermes_home, monkeypatch):
-    """Three "继续" in a row: one a turn answered, two whose turns pre_llm_call stored before the gateway stopped.
-    Looked up one by one, each with the answered one before it, the answered one's copy was looked up again for the
-    third and took its copy, and the third was stored a second time."""
+    """Identical messages restored after restart reuse their own source events without duplication."""
     t0 = time.time() - 600
-    for offset, turn in ((0, 20), (30, 21), (60, 22)):
-        stamp = _iso(t0 + offset)
-        monkeypatch.setattr(telegram, "_utc_now", lambda moment=stamp: moment)
-        telegram.on_turn_start(turn, "TEST 继续", turn_id=f"turn-{turn}")
-        telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id=f"turn-{turn}", user_message="TEST 继续")
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        for offset, turn in ((0, 20), (30, 21), (60, 22)):
+            stamp = _iso(t0 + offset)
+            patched.setattr(telegram, "_utc_now", lambda moment=stamp: moment)
+            telegram.on_turn_start(turn, "TEST 继续", turn_id=f"turn-{turn}")
+            telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id=f"turn-{turn}", user_message="TEST 继续")
     history = [
         {"role": "user", "content": "TEST 继续", "timestamp": t0},
         {"role": "assistant", "content": "TEST 好。"},
@@ -763,14 +781,13 @@ def test_a_message_put_back_and_stored_keeps_its_copy_from_a_later_one_said_alik
 
 
 def test_a_message_put_back_does_not_take_the_copy_of_one_said_alike_after_it(telegram, hermes_home, monkeypatch):
-    """A "继续" put back by a restarted gateway, never stored, and half a minute later the same words opened a turn,
-    which pre_llm_call stored.  Looked up in the order said, the first took the second's copy and was never stored."""
+    """An unstored restored message stays distinct from identical words captured in a later turn."""
     t0 = time.time() - 600
     stamp = _iso(t0 + 30)
-    monkeypatch.setattr(telegram, "_utc_now", lambda: stamp)
-    telegram.on_turn_start(40, "TEST 继续", turn_id="turn-40")
-    telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-40", user_message="TEST 继续")
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        patched.setattr(telegram, "_utc_now", lambda: stamp)
+        telegram.on_turn_start(40, "TEST 继续", turn_id="turn-40")
+        telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-40", user_message="TEST 继续")
     history = [
         {"role": "user", "content": "TEST 继续", "timestamp": t0},
         {"role": "user", "content": "TEST 继续", "timestamp": t0 + 30},
@@ -785,8 +802,7 @@ def test_a_message_put_back_does_not_take_the_copy_of_one_said_alike_after_it(te
 
 
 def test_a_message_put_back_read_by_two_hooks_is_looked_up_once(telegram, hermes_home):
-    """A turn's message pre_llm_call stored before the gateway stopped is in the conversation both post_llm_call and
-    sync_turn read: read twice, only the second read was found stored, and the first was written again."""
+    """A restored message seen by both post-LLM and sync-turn hooks is captured once."""
     telegram.on_turn_start(50, "TEST 查一下", turn_id="turn-50")
     telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-50", user_message="TEST 查一下")
     history = [
@@ -809,10 +825,10 @@ def test_two_hooks_reading_different_stretches_know_what_either_read_alike(teleg
     put back is in the second only.  Kept as the first read it, the message put back took that one's copy."""
     t0 = time.time() - 600
     stamp = _iso(t0)
-    monkeypatch.setattr(telegram, "_utc_now", lambda: stamp)
-    telegram.on_turn_start(60, "TEST 继续", turn_id="turn-60")
-    telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-60", user_message="TEST 继续")
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        patched.setattr(telegram, "_utc_now", lambda: stamp)
+        telegram.on_turn_start(60, "TEST 继续", turn_id="turn-60")
+        telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="turn-60", user_message="TEST 继续")
     later = [
         {"role": "user", "content": "TEST 继续", "timestamp": t0 + 30},
         {"role": "user", "content": "TEST 好了吗"},
